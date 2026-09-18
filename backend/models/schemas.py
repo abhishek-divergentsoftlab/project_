@@ -12,7 +12,10 @@ class TokenData(BaseModel):
 class UserCreate(BaseModel):
     email: EmailStr
     password: str
-    role: str # "buyer" or "seller"
+    name: str
+    region: str
+    phone: str
+    role: str = "member"
 
 class UserInDB(UserCreate):
     hashed_password: str
@@ -20,6 +23,9 @@ class UserInDB(UserCreate):
 class UserResponse(BaseModel):
     id: str
     email: EmailStr
+    name: str
+    region: str
+    phone: str
     role: str
 
 class RFQBase(BaseModel):

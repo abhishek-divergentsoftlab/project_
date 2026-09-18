@@ -13,6 +13,17 @@
   --radius-lg: 24px;
 }
 
+[data-theme='light'] {
+  --bg-color: #f8fafc;
+  --surface-color: rgba(0, 0, 0, 0.03);
+  --surface-color-hover: rgba(0, 0, 0, 0.06);
+  --border-color: rgba(0, 0, 0, 0.1);
+  --text-primary: #0f172a;
+  --text-secondary: #475569;
+  --accent-primary: #2563eb;
+  --accent-glow: rgba(37, 99, 235, 0.3);
+}
+
 body {
   margin: 0;
   font-family: 'Inter', system-ui, -apple-system, sans-serif;

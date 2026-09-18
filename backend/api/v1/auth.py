@@ -3,6 +3,8 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from typing import Any
 from models.schemas import UserCreate, UserResponse, Token, UserInDB
 from core.security import get_password_hash, verify_password, create_access_token, create_refresh_token
+from core.config import settings
+import jwt
 import uuid
 
 router = APIRouter()
@@ -12,8 +14,23 @@ fake_users_db = {}
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/v1/auth/login")
 
 def get_current_user(token: str = Depends(oauth2_scheme)):
-    # Very simplified for mocking
-    return {"id": "1", "email": "test@example.com", "role": "buyer"}
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None:
+            raise credentials_exception
+    except jwt.PyJWTError:
+        raise credentials_exception
+        
+    user = fake_users_db.get(email)
+    if user is None:
+        raise credentials_exception
+    return user
 
 @router.post("/signup", response_model=UserResponse)
 def signup(user: UserCreate) -> Any:
@@ -25,7 +42,7 @@ def signup(user: UserCreate) -> Any:
     db_user = UserInDB(**user.model_dump(), hashed_password=hashed_password)
     fake_users_db[user.email] = {"id": user_id, **db_user.model_dump()}
     
-    return UserResponse(id=user_id, email=user.email, role=user.role)
+    return UserResponse(id=user_id, email=user.email, name=user.name, region=user.region, phone=user.phone, role=user.role)
 
 @router.post("/login", response_model=Token)
 def login(form_data: OAuth2PasswordRequestForm = Depends()) -> Any:
@@ -50,4 +67,4 @@ def logout() -> Any:
 
 @router.get("/me", response_model=UserResponse)
 def read_users_me(current_user: dict = Depends(get_current_user)) -> Any:
-    return UserResponse(id=current_user["id"], email=current_user["email"], role=current_user["role"])
+    return UserResponse(**current_user)
