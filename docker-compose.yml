@@ -1,0 +1,57 @@
+# Backing services for local development.
+#   docker compose up -d
+# The API and frontend are run directly on the host during development so that
+# reloads stay fast; only stateful services live here.
+
+name: marketplace
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: marketplace
+      POSTGRES_PASSWORD: marketplace
+      POSTGRES_DB: marketplace
+    ports:
+      # 5433 on the host: a system postgres already owns 5432 on this machine,
+      # and this project must not collide with it.
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U marketplace -d marketplace"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Not used until phase 4; running it from the start keeps the compose file
+  # honest and lets the embedding pipeline be wired without re-provisioning.
+  qdrant:
+    image: qdrant/qdrant:latest
+    restart: unless-stopped
+    ports:
+      - "6333:6333"   # REST
+      - "6334:6334"   # gRPC
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  # Reserved for sessions, rate limiting, search state and job queues.
+  redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres_data:
+  qdrant_data:
+  redis_data:

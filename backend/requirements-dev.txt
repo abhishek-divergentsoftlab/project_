@@ -1,0 +1,11 @@
+# Test-only dependencies. Not needed to run the API.
+#
+#   .venv/bin/pip install -r requirements.txt -r requirements-dev.txt
+#   .venv/bin/python -m pytest
+#
+# httpx is already pulled in by qdrant-client, but the suite imports it
+# directly, so it is pinned here rather than relied on transitively.
+
+pytest==9.1.1
+pytest-asyncio==1.4.0
+httpx==0.28.1

@@ -1,11 +1,23 @@
-fastapi[standard]
-uvicorn
-langchain
-langgraph
-langchain-community
-qdrant-client
-pydantic
-pydantic-settings
-pyjwt
-passlib[bcrypt]
-python-multipart
+# Pinned to what actually resolved on 2026-09-19 (Python 3.13).
+# Regenerate with: .venv/bin/python -m pip freeze
+
+# --- Web framework -----------------------------------------------------------
+fastapi==0.141.1
+uvicorn[standard]==0.53.0
+python-multipart==0.0.32
+
+# --- Database ----------------------------------------------------------------
+sqlalchemy[asyncio]==2.0.54
+asyncpg==0.31.0
+alembic==1.20.0
+
+# --- Validation / settings ---------------------------------------------------
+pydantic[email]==2.13.5
+pydantic-settings==2.15.0
+
+# --- Vector search -----------------------------------------------------------
+qdrant-client==1.19.1
+
+# --- Auth --------------------------------------------------------------------
+pyjwt==2.14.0
+argon2-cffi==25.1.0

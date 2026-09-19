@@ -1,112 +1,126 @@
-import React, { useState } from 'react';
-import { useNavigate, Link } from 'react-router-dom';
-import { UserPlus } from 'lucide-react';
-import '../App.css';
+import { useState, type FormEvent } from "react";
+import { Link, Navigate, useNavigate } from "react-router-dom";
 
-export const Signup = () => {
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
-  const [name, setName] = useState('');
-  const [region, setRegion] = useState('');
-  const [phone, setPhone] = useState('');
-  const [error, setError] = useState('');
+import { errorMessage } from "@/api/client";
+import { useAuth } from "@/context/useAuth";
+import type { UserRole } from "@/types";
+
+const MIN_PASSWORD_LENGTH = 8;
+
+export function Signup() {
+  const { user, loading, signup } = useAuth();
   const navigate = useNavigate();
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setError('');
-    
+  const [form, setForm] = useState({
+    email: "",
+    password: "",
+    name: "",
+    company_name: "",
+    phone: "",
+    city: "",
+    role: "buyer" as UserRole,
+  });
+  const [error, setError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+
+  if (loading) return <div className="centered muted">Loading...</div>;
+  if (user) return <Navigate to="/rfqs" replace />;
+
+  function update<K extends keyof typeof form>(key: K, value: (typeof form)[K]) {
+    setForm((current) => ({ ...current, [key]: value }));
+  }
+
+  async function handleSubmit(event: FormEvent) {
+    event.preventDefault();
+    setError(null);
+    setSubmitting(true);
     try {
-      const res = await fetch('http://localhost:8000/api/v1/auth/signup', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ email, password, name, region, phone })
+      await signup({
+        email: form.email,
+        password: form.password,
+        name: form.name,
+        role: form.role,
+        // Empty optional strings are dropped rather than sent as "".
+        company_name: form.company_name || undefined,
+        phone: form.phone || undefined,
+        city: form.city || undefined,
       });
-
-      if (!res.ok) {
-        const data = await res.json();
-        throw new Error(data.detail || 'Signup failed');
-      }
-
-      navigate('/login');
-    } catch (err: any) {
-      setError(err.message);
+      navigate("/rfqs", { replace: true });
+    } catch (err) {
+      setError(errorMessage(err, "Could not create the account"));
+    } finally {
+      setSubmitting(false);
     }
-  };
+  }
 
   return (
-    <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '100vh', padding: '2rem' }}>
-      <div className="glass-panel" style={{ width: '100%', maxWidth: '400px', padding: '2.5rem' }}>
-        <div style={{ textAlign: 'center', marginBottom: '2rem' }}>
-          <UserPlus size={40} className="logo" style={{ marginBottom: '1rem' }} />
-          <h2>Create Account</h2>
-          <p style={{ color: 'var(--text-secondary)' }}>Join the B2B Marketplace</p>
-        </div>
+    <div className="centered">
+      <form className="card" onSubmit={handleSubmit}>
+        <h1>Create an account</h1>
+        {error && <p className="error">{error}</p>}
 
-        {error && <div style={{ background: 'rgba(239, 68, 68, 0.1)', color: '#ef4444', padding: '0.75rem', borderRadius: 'var(--radius-sm)', marginBottom: '1.5rem', fontSize: '0.875rem' }}>{error}</div>}
+        <label htmlFor="name">Your name</label>
+        <input id="name" required value={form.name} onChange={(e) => update("name", e.target.value)} />
 
-        <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
-          <div className="input-box" style={{ borderRadius: 'var(--radius-sm)' }}>
-            <input 
-              type="text" 
-              placeholder="Full Name" 
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              required 
-            />
-          </div>
-          <div className="input-box" style={{ borderRadius: 'var(--radius-sm)' }}>
-            <input 
-              type="email" 
-              placeholder="Email address" 
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              required 
-            />
-          </div>
-          <div className="input-box" style={{ borderRadius: 'var(--radius-sm)' }}>
-            <input 
-              type="password" 
-              placeholder="Password" 
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              required 
-            />
-          </div>
-          <div className="input-box" style={{ borderRadius: 'var(--radius-sm)' }}>
-            <input 
-              type="text" 
-              placeholder="Region / Country" 
-              value={region}
-              onChange={(e) => setRegion(e.target.value)}
-              required 
-            />
-          </div>
-          <div className="input-box" style={{ borderRadius: 'var(--radius-sm)' }}>
-            <input 
-              type="tel" 
-              placeholder="Phone Number" 
-              value={phone}
-              onChange={(e) => setPhone(e.target.value)}
-              required 
-            />
-          </div>
-          
-          <button type="submit" style={{ 
-            background: 'var(--accent-primary)', color: 'white', padding: '0.875rem', 
-            border: 'none', borderRadius: 'var(--radius-sm)', cursor: 'pointer',
-            fontSize: '1rem', fontWeight: 500, marginTop: '0.5rem'
-          }}>
-            Sign Up
-          </button>
-        </form>
+        <label htmlFor="email">Email</label>
+        <input
+          id="email"
+          type="email"
+          autoComplete="email"
+          required
+          value={form.email}
+          onChange={(e) => update("email", e.target.value)}
+        />
 
-        <p style={{ textAlign: 'center', marginTop: '2rem', color: 'var(--text-secondary)', fontSize: '0.9rem' }}>
-          Already have an account? <Link to="/login" style={{ color: 'var(--accent-primary)', textDecoration: 'none' }}>Sign in</Link>
+        <label htmlFor="password">Password</label>
+        <input
+          id="password"
+          type="password"
+          autoComplete="new-password"
+          required
+          minLength={MIN_PASSWORD_LENGTH}
+          value={form.password}
+          onChange={(e) => update("password", e.target.value)}
+        />
+        <small className="muted">At least {MIN_PASSWORD_LENGTH} characters.</small>
+
+        <label htmlFor="role">I want to</label>
+        <select id="role" value={form.role} onChange={(e) => update("role", e.target.value as UserRole)}>
+          <option value="buyer">Buy</option>
+          <option value="seller">Sell</option>
+          <option value="both">Both</option>
+        </select>
+
+        <label htmlFor="company">Company (optional)</label>
+        <input id="company" value={form.company_name} onChange={(e) => update("company_name", e.target.value)} />
+
+        <label htmlFor="phone">Phone (optional)</label>
+        <input
+          id="phone"
+          type="tel"
+          autoComplete="tel"
+          value={form.phone}
+          onChange={(e) => update("phone", e.target.value)}
+        />
+        <small className="muted">
+          Shared only with counterparties whose connection request you accept.
+        </small>
+
+        <label htmlFor="city">City (optional)</label>
+        <input
+          id="city"
+          value={form.city}
+          onChange={(e) => update("city", e.target.value)}
+          placeholder="Indore"
+        />
+
+        <button type="submit" disabled={submitting}>
+          {submitting ? "Creating..." : "Create account"}
+        </button>
+        <p className="muted">
+          Already registered? <Link to="/login">Sign in</Link>
         </p>
-      </div>
+      </form>
     </div>
   );
-};
+}

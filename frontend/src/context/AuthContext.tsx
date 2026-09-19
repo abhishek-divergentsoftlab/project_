@@ -1,81 +1,88 @@
-import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
+import {
+  createContext,
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  type ReactNode,
+} from "react";
 
-interface User {
-  id: string;
-  email: string;
-  name: string;
-  region: string;
-  phone: string;
-  role: string;
-}
+import { setAuthFailureHandler, tokenStore } from "@/api/client";
+import { auth, type SignupPayload } from "@/api/endpoints";
+import type { User } from "@/types";
 
-interface AuthContextType {
+interface AuthContextValue {
   user: User | null;
-  token: string | null;
-  login: (token: string) => void;
+  /** True until the stored token has been checked against the API. */
+  loading: boolean;
+  login: (email: string, password: string) => Promise<void>;
+  signup: (payload: SignupPayload) => Promise<void>;
   logout: () => void;
-  isLoading: boolean;
+  refreshUser: () => Promise<void>;
 }
 
-const AuthContext = createContext<AuthContextType | undefined>(undefined);
+export const AuthContext = createContext<AuthContextValue | null>(null);
 
-export const AuthProvider = ({ children }: { children: ReactNode }) => {
+export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
-  const [token, setToken] = useState<string | null>(localStorage.getItem('token'));
-  const [isLoading, setIsLoading] = useState(true);
+  const [loading, setLoading] = useState(true);
 
+  const logout = useCallback(() => {
+    auth.logout();
+    setUser(null);
+  }, []);
+
+  const refreshUser = useCallback(async () => {
+    const me = await auth.me();
+    setUser(me);
+  }, []);
+
+  // Lets the axios interceptor drop the session when a refresh fails.
   useEffect(() => {
-    const fetchUser = async () => {
-      if (!token) {
-        setIsLoading(false);
+    setAuthFailureHandler(() => setUser(null));
+  }, []);
+
+  // A stored token may be expired or revoked, so it is validated against the
+  // API before the app treats anyone as signed in.
+  useEffect(() => {
+    let cancelled = false;
+    async function restore() {
+      if (!tokenStore.access()) {
+        setLoading(false);
         return;
       }
-      setIsLoading(true);
       try {
-        const res = await fetch('http://localhost:8000/api/v1/auth/me', {
-          headers: {
-            'Authorization': `Bearer ${token}`
-          }
-        });
-        if (res.ok) {
-          const userData = await res.json();
-          setUser(userData);
-        } else {
-          logout();
+        const me = await auth.me();
+        if (!cancelled) setUser(me);
+      } catch {
+        if (!cancelled) {
+          tokenStore.clear();
+          setUser(null);
         }
-      } catch (err) {
-        console.error('Failed to fetch user', err);
-        logout();
       } finally {
-        setIsLoading(false);
+        if (!cancelled) setLoading(false);
       }
+    }
+    void restore();
+    return () => {
+      cancelled = true;
     };
+  }, []);
 
-    fetchUser();
-  }, [token]);
+  const login = useCallback(async (email: string, password: string) => {
+    await auth.login(email, password);
+    setUser(await auth.me());
+  }, []);
 
-  const login = (newToken: string) => {
-    localStorage.setItem('token', newToken);
-    setToken(newToken);
-  };
+  const signup = useCallback(async (payload: SignupPayload) => {
+    await auth.signup(payload);
+    setUser(await auth.me());
+  }, []);
 
-  const logout = () => {
-    localStorage.removeItem('token');
-    setToken(null);
-    setUser(null);
-  };
-
-  return (
-    <AuthContext.Provider value={{ user, token, login, logout, isLoading }}>
-      {children}
-    </AuthContext.Provider>
+  const value = useMemo(
+    () => ({ user, loading, login, signup, logout, refreshUser }),
+    [user, loading, login, signup, logout, refreshUser],
   );
-};
 
-export const useAuth = () => {
-  const context = useContext(AuthContext);
-  if (context === undefined) {
-    throw new Error('useAuth must be used within an AuthProvider');
-  }
-  return context;
-};
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+}
