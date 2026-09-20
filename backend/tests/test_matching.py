@@ -294,14 +294,13 @@ async def test_contact_details_are_hidden_until_a_connection_is_accepted(
     result = (await buyer.post(f"/rfqs/{mine['id']}/matches")).json()["results"][0]
     counterparty = result["counterparty"]
 
-    # Safe to show: who and roughly where.
+    # Safe to show on cards: who, location, and verified email for direct contact.
     assert counterparty["company_name"] == "Nandan Wires"
     assert counterparty["city"] == "Indore"
-    # Not safe to show, and not shown.
-    assert counterparty["email"] is None
+    assert counterparty["email"] == seller.email
+    # Phone remains protected until connection accepted
     assert counterparty["phone"] is None
     assert counterparty["connection_status"] is None
-    assert seller.email not in (await buyer.post(f"/rfqs/{mine['id']}/matches")).text
 
 
 async def test_the_card_reports_a_pending_request(make_actor, make_rfq):
@@ -360,7 +359,7 @@ async def test_a_rejected_request_does_not_reveal_contact_details(
         0
     ]["counterparty"]
     assert counterparty["connection_status"] == "rejected"
-    assert counterparty["email"] is None
+    assert counterparty["email"] == seller.email
     assert counterparty["phone"] is None
 
 

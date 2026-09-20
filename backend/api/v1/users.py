@@ -4,8 +4,10 @@ from fastapi import APIRouter, HTTPException, status
 
 from api.deps import CurrentUser, DbSession
 from models.user import UserProfile
+from schemas.kyc import KYCStatusOut, KYCVerificationPayload
 from schemas.user import AccountUpdate, ProfileOut, ProfileUpdate, UserOut
-from services import locations
+from services import kyc_service, locations
+from services.kyc_service import KYCError
 
 router = APIRouter()
 
@@ -82,3 +84,23 @@ async def update_profile(
     await db.commit()
     await db.refresh(profile)
     return ProfileOut.model_validate(profile)
+
+
+@router.post("/me/kyc/verify", response_model=KYCStatusOut, summary="Submit company KYC and GST for verification")
+async def verify_kyc(
+    payload: KYCVerificationPayload, current_user: CurrentUser, db: DbSession
+) -> KYCStatusOut:
+    try:
+        profile, message = await kyc_service.verify_company_kyc(
+            db, user_id=current_user.id, payload=payload
+        )
+    except KYCError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+
+    return KYCStatusOut(
+        kyc_status=profile.kyc_status,
+        trust_score=profile.trust_score,
+        gst_number=profile.gst_number,
+        legal_business_name=profile.legal_business_name,
+        message=message,
+    )

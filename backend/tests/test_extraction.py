@@ -73,16 +73,16 @@ def test_an_order_in_kg_is_not_duplicated_as_a_capacity_spec():
 
 def test_a_genuine_capacity_spec_still_survives():
     r = extract("20 pallets with 1000 kg capacity")
-    assert (r.quantity_value, r.quantity_unit) == (20, "pallets")
+    assert (r.quantity_value, r.quantity_unit) == (20, "pallet")
     assert r.attributes["capacity"] == {"value": 1000, "unit": "kg"}
 
 
 @pytest.mark.parametrize(
     "message,unit",
     [
-        ("200 bags of cement", "bags"),
+        ("200 bags of cement", "bag"),
         ("3 containers of denim fabric", "containers"),
-        ("40 cartons of mango pulp", "cartons"),
+        ("40 cartons of mango pulp", "carton"),
         ("12 rolls of kraft paper", "rolls"),
     ],
 )
@@ -204,3 +204,147 @@ def test_standalone_currency_change_updates_currency_without_polluting_product()
     assert refined.price_currency == "INR"
     assert refined.price_amount == 2
     assert refined.product == base.product
+
+
+def test_natural_language_currencies_in_extraction():
+    # "india ruppes"
+    r1 = extract("i want 1000 units of cotton shirts at 450 india ruppes per unit")
+    assert r1.price_amount == 450
+    assert r1.price_currency == "INR"
+
+    # "us dollar"
+    r2 = extract("need 500 widgets at 12 us dollar per piece")
+    assert r2.price_amount == 12
+    assert r2.price_currency == "USD"
+
+    # "kr"
+    r3 = extract("need 200 bearings at 85 kr per unit")
+    assert r3.price_amount == 85
+    assert r3.price_currency == "SEK"
+
+
+# --- Conversational Adaptation, Negation & Date Handling ----------------------
+
+
+def test_conversational_negation_and_product_refinement():
+    """User changes requirement: rejects type C, specifies simple usb cables."""
+    base = extract("i want usb type c cable of white color in indore within 7 days at price 2 dollar per unit")
+    assert base.attributes.get("type") == "C"
+    assert base.attributes.get("color") == "white"
+
+    negated_update = extract("actully i dont need type c cables i need just simple usb cables")
+    assert "type" in negated_update.negated_attributes
+    assert "type" not in negated_update.attributes
+    assert "dont" not in (negated_update.product or "")
+    assert "actully" not in (negated_update.product or "")
+    assert "cables" in (negated_update.product or "") or "cable" in (negated_update.product or "")
+
+    merged = merge(base, negated_update, "actully i dont need type c cables i need just simple usb cables")
+    assert "type" not in merged.attributes
+    assert merged.attributes.get("color") == "white"
+    assert "usb" in merged.product
+
+
+def test_product_pivot_prunes_incompatible_technical_attributes():
+    """Pivoting from USB cable to HDMI cables prunes type: C but keeps color, city, etc."""
+    base = extract("i want usb type c cable of white color in indore within 7 days at price 2 dollar per unit")
+    base.quantity_value = 3000
+    base.quantity_unit = "units"
+
+    hdmi_update = extract("actully sorry i need hdmi cables now")
+    assert "actully" not in (hdmi_update.product or "")
+    assert "sorry" not in (hdmi_update.product or "")
+    assert "hdmi" in hdmi_update.product
+
+    merged = merge(base, hdmi_update, "actully sorry i need hdmi cables now")
+    assert "type" not in merged.attributes
+    assert merged.attributes.get("color") == "white"
+    assert "hdmi" in merged.product
+    assert merged.quantity_value == 3000
+    assert merged.city == "Indore"
+
+
+def test_calendar_date_with_apostrophe_ordinal_and_of():
+    """'it can be before 12\'th of november' must parse deadline and NOT become a product or quantity."""
+    r = extract("it can be before 12'th of november")
+    assert r.deadline_days is not None
+    assert r.product is None
+    assert r.quantity_value is None
+
+
+def test_deadline_month_year_without_day():
+    """'before november 2026' must parse deadline and NOT become product or quantity."""
+    r = extract("before november 2026")
+    assert r.deadline_days is not None
+    assert r.product is None
+    assert r.quantity_value is None
+
+
+def test_deadline_answer_bare_number():
+    """Answering '23' to deadline question parses as 23 days, not quantity."""
+    ans = parse_answer("deadline", "23")
+    assert ans is not None
+    assert ans.deadline_days == 23
+    assert ans.quantity_value is None
+
+
+def test_filler_and_connector_type_a():
+    """'okey then find usb type a cables' must strip filler and capture type: A."""
+    r = extract("okey then find usb type a cables")
+    assert r.product == "usb type cables"
+    assert r.attributes.get("type") == "A"
+    assert "okey" not in (r.product or "")
+    assert "then" not in (r.product or "")
+
+
+def test_state_and_region_extraction_does_not_become_product():
+    """'in hariyana' and 'find in punjab' must extract states, never products."""
+    r1 = extract("in hariyana")
+    assert r1.product is None
+    assert r1.state == "Haryana"
+    assert r1.city is None
+
+    r2 = extract("find in punjab")
+    assert r2.product is None
+    assert r2.state == "Punjab"
+    assert r2.city is None
+
+    r3 = extract("tomatoes in punjab")
+    assert r3.product == "tomatoes"
+    assert r3.state == "Punjab"
+    assert r3.city is None
+
+
+def test_location_pivot_in_merge_clears_old_city():
+    """When switching location to a new state, the prior city must be cleared."""
+    initial = extract("i need tomatos in indore")
+    assert initial.product == "tomatos"
+    assert initial.city == "Indore"
+
+    haryana_req = extract("in hariyana")
+    merged1 = merge(initial, haryana_req, "in hariyana")
+    assert merged1.product == "tomatos"
+    assert merged1.city is None
+    assert merged1.state == "Haryana"
+
+    punjab_req = extract("find in punjab")
+    merged2 = merge(merged1, punjab_req, "find in punjab")
+    assert merged2.product == "tomatos"
+    assert merged2.city is None
+    assert merged2.state == "Punjab"
+
+
+def test_parse_answer_location_with_state():
+    """When asked for location, answering with a state should succeed."""
+    ans1 = parse_answer("location", "in hariyana")
+    assert ans1 is not None
+    assert ans1.state == "Haryana"
+    assert ans1.city is None
+
+    ans2 = parse_answer("location", "punjab")
+    assert ans2 is not None
+    assert ans2.state == "Punjab"
+    assert ans2.city is None
+
+
+

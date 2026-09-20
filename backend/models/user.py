@@ -7,14 +7,15 @@ touch the password hash.
 
 import uuid
 from datetime import datetime
+from decimal import Decimal
 from typing import TYPE_CHECKING, Optional
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Index, Numeric, String
+from sqlalchemy import DateTime, Enum, ForeignKey, Index, Integer, Numeric, String, text
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
-from models.enums import UserRole, UserStatus
+from models.enums import KYCStatus, UserRole, UserStatus
 
 if TYPE_CHECKING:
     from models.rfq import RFQ
@@ -93,5 +94,24 @@ class UserProfile(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     # Numeric rather than float: coordinates are compared and stored exactly.
     latitude: Mapped[Optional[float]] = mapped_column(Numeric(9, 6), nullable=True)
     longitude: Mapped[Optional[float]] = mapped_column(Numeric(9, 6), nullable=True)
+
+    # Company Verification & Anti-Fraud (KYC)
+    gst_number: Mapped[Optional[str]] = mapped_column(String(20), nullable=True, index=True)
+    legal_business_name: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    business_type: Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
+    registration_number: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    year_established: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    website: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    pan_number: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    signatory_name: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    kyc_status: Mapped[KYCStatus] = mapped_column(
+        Enum(KYCStatus, name="kyc_status", values_callable=lambda e: [m.value for m in e]),
+        nullable=False,
+        default=KYCStatus.UNVERIFIED,
+        server_default="unverified",
+    )
+    trust_score: Mapped[int] = mapped_column(Integer, nullable=False, default=20, server_default="20")
+    average_rating: Mapped[Optional[Decimal]] = mapped_column(Numeric(3, 2), nullable=True, default=None)
+    total_reviews: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
 
     user: Mapped["User"] = relationship(back_populates="profile")

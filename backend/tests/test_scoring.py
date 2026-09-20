@@ -212,6 +212,90 @@ def test_attributes_are_unscored_when_nothing_was_asked_for():
     assert ms.attribute_score({}, {"colour": "red"}) is None
 
 
+# --- semantic synonym matching -----------------------------------------------
+
+
+def test_spelling_variants_score_full_marks():
+    """grey vs gray, matte vs matt — same word, different spelling."""
+    assert ms.attribute_score({"colour": "grey"}, {"colour": "gray"}) == 1.0
+    assert ms.attribute_score({"finish": "matte"}, {"finish": "matt"}) == 1.0
+    assert ms.attribute_score({"material": "aluminum"}, {"material": "aluminium"}) == 1.0
+    assert ms.attribute_score({"coating": "galvanized"}, {"coating": "galvanised"}) == 1.0
+    assert ms.attribute_score({"coating": "anodized"}, {"coating": "anodised"}) == 1.0
+
+
+def test_related_color_shades_score_high():
+    """charcoal grey is a shade of grey — should score high, not zero."""
+    score = ms.attribute_score({"colour": "grey"}, {"colour": "charcoal grey"})
+    assert score >= 0.8
+
+
+def test_color_synonyms_score_high():
+    """crimson is a shade of red — synonym, not a token match."""
+    score = ms.attribute_score({"colour": "red"}, {"colour": "crimson"})
+    assert score >= 0.7
+
+
+def test_unrelated_colors_score_zero():
+    """red and blue are different colors — should be zero."""
+    assert ms.attribute_score({"colour": "red"}, {"colour": "blue"}) == 0.0
+
+
+def test_material_synonyms():
+    """wood/timber/lumber are the same material."""
+    assert ms.attribute_score({"material": "wood"}, {"material": "timber"}) == 1.0
+    assert ms.attribute_score({"material": "wood"}, {"material": "lumber"}) == 1.0
+    # cotton variants
+    assert ms.attribute_score({"material": "cotton"}, {"material": "pure cotton"}) == 1.0
+
+
+def test_finish_synonyms():
+    """glossy/gloss/shiny are the same finish."""
+    score = ms.attribute_score({"finish": "glossy"}, {"finish": "shiny"})
+    assert score >= 0.85
+
+
+def test_trade_term_synonyms():
+    """eco-friendly vs sustainable, waterproof vs water resistant."""
+    eco = ms.attribute_score({"type": "eco-friendly"}, {"type": "sustainable"})
+    assert eco >= 0.8
+    wp = ms.attribute_score({"type": "waterproof"}, {"type": "water resistant"})
+    assert wp >= 0.8
+
+
+def test_stainless_steel_abbreviation():
+    """SS is stainless steel in the materials world."""
+    assert ms.attribute_score({"material": "stainless steel"}, {"material": "ss"}) == 1.0
+    assert ms.attribute_score({"material": "stainless steel"}, {"material": "inox"}) == 1.0
+
+
+def test_grade_distinction_preserved_with_synonyms():
+    """SS 316L vs SS 304 must still be distinguished — synonym engine must not
+    collapse them just because both contain 'SS'."""
+    score = ms.attribute_score({"grade": "SS 316L"}, {"grade": "SS 304"})
+    assert score < 0.3
+
+
+def test_existing_exact_match_still_works():
+    """Regression: exact matches must still score 1.0."""
+    assert ms.attribute_score({"colour": "black"}, {"colour": "black"}) == 1.0
+    assert ms.attribute_score({"colour": "red"}, {"colour": "red"}) == 1.0
+
+
+def test_existing_numeric_comparison_unchanged():
+    """Regression: numeric grading must not be affected by synonyms."""
+    wanted = {"capacity": {"value": 20000, "unit": "mAh"}}
+    near = ms.attribute_score(wanted, {"capacity": {"value": 27000, "unit": "mAh"}})
+    assert near > 0.6
+
+
+def test_unknown_values_fall_through_to_token_overlap():
+    """Values not in the synonym graph should still use token overlap."""
+    # "foobar xyz" vs "foobar xyz" — exact match
+    assert ms.attribute_score({"spec": "foobar xyz"}, {"spec": "foobar xyz"}) == 1.0
+    # "foobar" vs "bazqux" — no overlap
+    assert ms.attribute_score({"spec": "foobar"}, {"spec": "bazqux"}) == 0.0
+
 # --- deadline ---------------------------------------------------------------
 
 
@@ -282,3 +366,26 @@ def test_blend_is_a_weighted_mean():
 
 def test_every_weight_is_a_known_dimension_and_they_sum_to_one():
     assert sum(ms.WEIGHTS.values()) == pytest.approx(1.0)
+
+
+# --- logistics estimation ----------------------------------------------------
+
+
+def test_estimate_logistics_metro():
+    res = ms.estimate_logistics(25.0)
+    assert "Same day" in res["label"]
+    assert res["customs_required"] is False
+    assert res["transit_days_min"] == 0
+
+
+def test_estimate_logistics_interstate():
+    res = ms.estimate_logistics(350.0)
+    assert "1–2 days" in res["label"]
+    assert res["customs_required"] is False
+
+
+def test_estimate_logistics_cross_border():
+    res = ms.estimate_logistics(1200.0, is_cross_border=True)
+    assert res["customs_required"] is True
+    assert "International" in res["label"]
+

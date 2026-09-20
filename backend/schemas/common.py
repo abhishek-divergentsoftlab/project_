@@ -7,7 +7,7 @@ side has to compromise: the API stays readable, the columns stay indexable.
 
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
-from typing import Optional, Self
+from typing import Any, Optional, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
 
@@ -42,16 +42,28 @@ class Money(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     amount: Decimal = Field(ge=0)
-    currency: str = Field(default="INR", min_length=3, max_length=3)
+    currency: str = Field(default="INR", max_length=64)
     per_unit: Optional[str] = Field(
         default=None,
         max_length=32,
         description="The unit the price is quoted per -- 'kg' in 'Rs 200/kg'.",
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_currency_input(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "currency" in data and data["currency"]:
+            from services.currency import normalize_currency
+            raw_cur = str(data["currency"]).strip()
+            norm = normalize_currency(raw_cur)
+            data["currency"] = norm if norm else raw_cur.upper()[:3]
+        return data
+
     @model_validator(mode="after")
-    def _upper_currency(self) -> Self:
-        self.currency = self.currency.upper()
+    def _ensure_valid_currency(self) -> Self:
+        from services.currency import normalize_currency
+        norm = normalize_currency(self.currency)
+        self.currency = norm if norm else self.currency.upper()[:3]
         return self
 
     @field_serializer("amount")
@@ -110,7 +122,14 @@ class Deadline(BaseModel):
 
 
 class DeadlineOut(BaseModel):
-    """Responses expose the resolved instant plus the original phrasing."""
+    """Responses expose the resolved instant plus the original phrasing.
+
+    In accordance with B2B trade standards, deadlines reflect the dispatch /
+    production readiness milestone and exclude transport/transit days.
+    """
 
     date: Optional[datetime] = None
     raw: Optional[str] = None
+    excludes_transport: bool = True
+    estimated_delivery_at: Optional[datetime] = None
+

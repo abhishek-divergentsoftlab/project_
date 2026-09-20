@@ -18,7 +18,7 @@ export function Layout() {
         <nav>
           <NavLink to="/search">Search</NavLink>
           <NavLink to="/rfqs">My RFQs</NavLink>
-          <NavLink to="/rfqs/new">New RFQ</NavLink>
+          {/* <NavLink to="/rfqs/new">New RFQ</NavLink> */}
           <NavLink to="/messages">Messages</NavLink>
           <NavLink to="/profile">Profile</NavLink>
         </nav>

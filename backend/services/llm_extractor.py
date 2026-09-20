@@ -32,15 +32,18 @@ _SCHEMA: dict[str, Any] = {
             ],
         },
         "attributes": {"type": "object"},
+        "location": {"type": ["string", "null"]},
     },
+    "required": ["product", "category", "attributes"],
 }
 
 _PROMPT = """You extract the product being searched for in a B2B marketplace.
 
 Return only what the message actually says. Use null when it is not stated.
-- product: the product name alone, with no quantity, price, city or date
-- category: one of Electronics, Packaging, Furniture, Agriculture, Textiles
-- attributes: qualities such as color, material, ply, type, grade
+- product: the product name alone, with no quantity, price, city or date. Return null if only location/quantity/chitchat is mentioned.
+- category: one of Electronics, Packaging, Furniture, Agriculture, Textiles, or null
+- attributes: qualities such as color, material, ply, type, grade as a JSON object
+- location: city, state, or country if mentioned, else null
 
 Do not invent anything.
 
@@ -54,6 +57,7 @@ def _call_ollama(message: str) -> Optional[dict[str, Any]]:
             "prompt": _PROMPT.format(message=message),
             "format": _SCHEMA,
             "stream": False,
+            "keep_alive": -1,
             "options": {"temperature": 0},
         }
     ).encode()
@@ -110,5 +114,18 @@ async def enrich(message: str, parsed: Requirements) -> Requirements:
             # The parser's attributes win; only genuinely new keys are added.
             if cleaned not in (None, "") and key not in enriched.attributes:
                 enriched.attributes[key] = cleaned
+
+    loc_str = _clean(raw.get("location"))
+    if loc_str and not enriched.city and not enriched.state:
+        from decimal import Decimal
+        from services.locations import find_location
+        loc = find_location(loc_str)
+        if loc:
+            enriched.city = loc.city
+            enriched.state = loc.state
+            enriched.country = loc.country
+            enriched.currency_hint = loc.currency
+            enriched.latitude = Decimal(str(loc.latitude))
+            enriched.longitude = Decimal(str(loc.longitude))
 
     return enriched

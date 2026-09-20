@@ -27,9 +27,9 @@ class Settings(BaseSettings):
     QDRANT_URL: str = "http://localhost:6333"
     REDIS_URL: str = "redis://localhost:6379/0"
     OLLAMA_BASE_URL: str = "http://localhost:11434"
-    OLLAMA_MODEL: str = "llama3.1:8b"
-    EMBEDDING_MODEL: str = "nomic-embed-text:latest"
-    EMBEDDING_TIMEOUT_SECONDS: int = 60
+    OLLAMA_MODEL: str = "qwen3-coder-next:q4_K_M"
+    EMBEDDING_MODEL: str = "qwen3-embedding:8b"
+    EMBEDDING_TIMEOUT_SECONDS: int = 60*60*60
     QDRANT_COLLECTION: str = "marketplace_rfq"
     # Cosine similarity below this is a different product, not a weak match.
     # Measured against the seed corpus with product-only embeddings: the right
@@ -40,17 +40,19 @@ class Settings(BaseSettings):
     # Used only when nothing clears the floor, so an unusual phrasing returns
     # the closest things rather than an empty table.
     RELEVANCE_FALLBACK_FLOOR: float = 0.60
-    OLLAMA_TIMEOUT_SECONDS: int = 30
-    # Short on purpose: a slow model should cost a moment, not the whole turn.
-    LLM_TIMEOUT_SECONDS: int = 8
-    # Off by default: the parser beat every local model tested on the fields
-    # that matter, without the latency. See the README.
-    DIRECT_SEARCH_LLM: bool = False
+    OLLAMA_TIMEOUT_SECONDS: int = 45
+    # Ample time for local LLM agent reasoning and tool emission
+    LLM_TIMEOUT_SECONDS: int = 45
+    # Use the LLM and prompt-based agent for conversational search
+    DIRECT_SEARCH_LLM: bool = True
+
+    HOST: str = "127.0.0.1"
+    PORT: int = 8011
 
     # NoDecode stops pydantic-settings from trying to JSON-parse this out of
     # the .env file, so it can be written as a plain comma-separated list.
     CORS_ORIGINS: Annotated[list[str], NoDecode] = Field(
-        default_factory=lambda: ["http://localhost:5173", "http://localhost:5174"]
+        default_factory=lambda: ["http://localhost:5173", "http://localhost:5174", "http://localhost:5175"]
     )
 
     @field_validator("CORS_ORIGINS", mode="before")
@@ -59,6 +61,8 @@ class Settings(BaseSettings):
         if isinstance(value, str):
             return [origin.strip() for origin in value.split(",") if origin.strip()]
         return value
+
+    UPLOAD_DIR: str = "uploads"
 
     @property
     def is_production(self) -> bool:

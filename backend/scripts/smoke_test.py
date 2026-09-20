@@ -26,7 +26,7 @@ from typing import Any, Optional
 
 import httpx
 
-DEFAULT_BASE = "http://127.0.0.1:8010/api/v1"
+DEFAULT_BASE = "http://127.0.0.1:8011/api/v1"
 PASSWORD = "smoke-test-password"
 
 _PASS = "\033[32m✓\033[0m"

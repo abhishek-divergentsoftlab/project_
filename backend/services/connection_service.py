@@ -9,9 +9,11 @@ details. The rules are:
 """
 
 import uuid
+from pathlib import Path
 from typing import Optional, Sequence
 
 from fastapi import HTTPException, status
+from core.config import settings
 from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,6 +25,8 @@ from models.rfq import RFQ
 from models.user import User
 from schemas.connection import ConnectionMessageCreate, ConnectionOut
 from schemas.match import Counterparty
+from services.websocket_manager import ws_manager
+
 
 # Everything a connection row needs in order to be rendered without a second
 # round trip: the listing, and both parties' profiles.
@@ -209,12 +213,108 @@ async def send_message(
         )
 
     message = ConnectionMessage(
-        connection_id=connection_id, sender_id=sender_id, content=payload.content
+        connection_id=connection_id,
+        sender_id=sender_id,
+        content=payload.content,
+        image_url=payload.image_url,
+        is_live_capture=payload.is_live_capture,
     )
     db.add(message)
     await db.commit()
     await db.refresh(message)
+
+    await ws_manager.broadcast(
+        connection_id,
+        "chat_message",
+        {
+            "id": str(message.id),
+            "connection_id": str(message.connection_id),
+            "sender_id": str(message.sender_id),
+            "content": message.content,
+            "image_url": message.image_url,
+            "is_live_capture": message.is_live_capture,
+            "created_at": message.created_at.isoformat(),
+        },
+    )
+
     return message
+
+
+async def send_live_capture_message(
+    db: AsyncSession,
+    connection_id: uuid.UUID,
+    sender_id: uuid.UUID,
+    file_bytes: bytes,
+    content_type: str,
+    caption: Optional[str] = None,
+) -> ConnectionMessage:
+    connection = await get_connection(db, connection_id, sender_id)
+    if connection.status is not ConnectionStatus.ACCEPTED:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "The connection must be accepted before either side can send messages",
+        )
+
+    # Validate mime type
+    allowed_types = {"image/jpeg", "image/png", "image/webp", "image/jpg"}
+    if content_type.lower() not in allowed_types:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Invalid image format '{content_type}'. Must be JPEG, PNG, or WebP.",
+        )
+
+    # Validate file size (max 10MB)
+    if len(file_bytes) > 10 * 1024 * 1024:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Image size exceeds maximum limit of 10MB.",
+        )
+
+    # Save to disk under UPLOAD_DIR/live_captures
+    upload_dir = Path(settings.UPLOAD_DIR) / "live_captures"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    ext = ".jpg"
+    if "png" in content_type.lower():
+        ext = ".png"
+    elif "webp" in content_type.lower():
+        ext = ".webp"
+
+    file_id = f"live_{uuid.uuid4().hex}{ext}"
+    dest_path = upload_dir / file_id
+    dest_path.write_bytes(file_bytes)
+
+    image_url = f"/api/v1/media/live_captures/{file_id}"
+    message_content = caption.strip() if caption and caption.strip() else "📸 Live Camera Snapshot"
+
+    message = ConnectionMessage(
+        connection_id=connection_id,
+        sender_id=sender_id,
+        content=message_content,
+        image_url=image_url,
+        is_live_capture=True,
+    )
+    db.add(message)
+    await db.commit()
+    await db.refresh(message)
+
+    await ws_manager.broadcast(
+        connection_id,
+        "chat_message",
+        {
+            "id": str(message.id),
+            "connection_id": str(message.connection_id),
+            "sender_id": str(message.sender_id),
+            "content": message.content,
+            "image_url": message.image_url,
+            "is_live_capture": True,
+            "created_at": message.created_at.isoformat(),
+        },
+    )
+
+    return message
+
+
 
 
 async def list_messages(

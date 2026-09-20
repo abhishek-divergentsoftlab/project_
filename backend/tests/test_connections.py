@@ -290,3 +290,54 @@ async def test_every_connection_route_requires_authentication(client, pair):
     assert (
         await client.get(f"/connections/{created['id']}/messages")
     ).status_code == 401
+
+
+async def test_live_camera_capture_message_and_media_serving(pair):
+    buyer, seller, listing = pair
+    created = (await buyer.post("/connections", json={"rfq_id": listing["id"]})).json()
+    await seller.post(f"/connections/{created['id']}/accept")
+
+    # Upload live photo via multipart/form-data
+    fake_image_bytes = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00`\x00`\x00\x00\xff\xdb\x00C\x00"
+    files = {"image": ("live_snap.jpg", fake_image_bytes, "image/jpeg")}
+    data = {"caption": "Live sample on workshop table"}
+
+    res = await buyer.post(
+        f"/connections/{created['id']}/messages/live-capture",
+        files=files,
+        data=data,
+    )
+    assert res.status_code == 201
+    msg = res.json()
+    assert msg["is_live_capture"] is True
+    assert msg["content"] == "Live sample on workshop table"
+    assert msg["image_url"] is not None
+    assert "/api/v1/media/live_captures/" in msg["image_url"]
+
+    # Verify both parties see it in message list
+    messages = (await seller.get(f"/connections/{created['id']}/messages")).json()
+    assert len(messages) == 1
+    assert messages[0]["is_live_capture"] is True
+    assert messages[0]["image_url"] == msg["image_url"]
+
+    # Test media serving endpoint
+    media_path = msg["image_url"].replace("/api/v1", "")
+    media_res = await buyer.get(media_path)
+    assert media_res.status_code == 200
+    assert media_res.headers["content-type"] == "image/jpeg"
+    assert media_res.content == fake_image_bytes
+
+
+async def test_live_camera_capture_invalid_format_blocked(pair):
+    buyer, seller, listing = pair
+    created = (await buyer.post("/connections", json={"rfq_id": listing["id"]})).json()
+    await seller.post(f"/connections/{created['id']}/accept")
+
+    files = {"image": ("script.sh", b"echo hack", "text/plain")}
+    res = await buyer.post(
+        f"/connections/{created['id']}/messages/live-capture",
+        files=files,
+    )
+    assert res.status_code == 400
+    assert "Invalid image format" in res.json()["detail"]
+

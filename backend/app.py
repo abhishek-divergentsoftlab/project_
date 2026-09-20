@@ -1,6 +1,7 @@
 """FastAPI application entry point.
 
-Run with:  uvicorn app:app --reload
+Run with:  uvicorn app:app --reload --port 8011
+           or: python app.py
 """
 
 from contextlib import asynccontextmanager
@@ -62,3 +63,9 @@ async def health() -> dict:
         "environment": settings.ENVIRONMENT,
         "database": database,
     }
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("app:app", host=settings.HOST, port=settings.PORT, reload=True)

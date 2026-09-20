@@ -5,11 +5,28 @@ must be re-exported here.
 """
 
 from models.conversation import Conversation, Message, MessageEvent
-from models.enums import ConversationType, EmbeddingStatus, MessageRole, RFQRole, RFQStatus, UserRole, UserStatus, ConnectionStatus
+from models.enums import (
+    CertificationStatus,
+    ConnectionStatus,
+    ConversationType,
+    EmbeddingStatus,
+    Incoterm,
+    KYCStatus,
+    MessageRole,
+    QuotationStatus,
+    RFQRole,
+    RFQStatus,
+    UserRole,
+    UserStatus,
+)
 from models.match import MatchResult, MatchSearch
 from models.rfq import RFQ
 from models.user import UserProfile, User
 from models.connection import Connection, ConnectionMessage
+from models.quotation import Quotation
+from models.review import Review
+from models.certificate import Certificate
+from models.moderation import ModerationLog
 
 __all__ = [
     "Conversation",
@@ -30,4 +47,13 @@ __all__ = [
     "Connection",
     "ConnectionMessage",
     "ConnectionStatus",
+    "Quotation",
+    "QuotationStatus",
+    "Incoterm",
+    "Review",
+    "Certificate",
+    "CertificationStatus",
+    "ModerationLog",
+    "KYCStatus",
 ]
+

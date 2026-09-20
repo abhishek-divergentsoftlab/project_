@@ -75,10 +75,11 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 cp .env.example .env          # then set SECRET_KEY
 .venv/bin/alembic upgrade head
-.venv/bin/uvicorn app:app --reload --port 8010
+.venv/bin/uvicorn app:app --reload --port 8011
+# or: .venv/bin/python app.py
 ```
 
-> Port **8010**, not the usual 8000: this machine already runs another service
+> Port **8011**, not the usual 8000: this machine already runs another service
 > there. If yours does not, use 8000 and set `VITE_PROXY_TARGET` in
 > `frontend/.env` to match.
 
@@ -95,7 +96,7 @@ Generate a secret with:
 python3 -c "import secrets; print(secrets.token_urlsafe(64))"
 ```
 
-API on <http://127.0.0.1:8010>, interactive docs at `/docs`, health at
+API on <http://127.0.0.1:8011>, interactive docs at `/docs`, health at
 `/api/v1/health` (which performs a real database round trip, so it reports
 `degraded` when PostgreSQL is unreachable).
 
@@ -154,10 +155,10 @@ npm install
 npm run dev
 ```
 
-On <http://localhost:5173>. Calls to `/api` are proxied to the backend by Vite
+On <http://localhost:5175>. Calls to `/api` are proxied to the backend by Vite
 (target set by `VITE_PROXY_TARGET`),
 so development is same-origin and CORS never enters the picture. If Vite reports
-the port is in use it will move to 5174, which is also in the backend's default
+the port is in use it will move to the next available port (e.g. 5176), which can also be added to the backend's default
 CORS list.
 
 ### 5. Tests

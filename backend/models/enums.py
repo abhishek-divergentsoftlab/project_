@@ -72,3 +72,38 @@ class ConnectionStatus(str, enum.Enum):
     PENDING = "pending"
     ACCEPTED = "accepted"
     REJECTED = "rejected"
+
+
+class QuotationStatus(str, enum.Enum):
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    COUNTERED = "countered"
+    EXPIRED = "expired"
+    DISPATCHED = "dispatched"
+    DELIVERED = "delivered"
+    RECEIVED = "received"
+    COMPLETED = "completed"
+
+
+class Incoterm(str, enum.Enum):
+    EXW = "EXW"
+    FOB = "FOB"
+    CIF = "CIF"
+    CFR = "CFR"
+    DDP = "DDP"
+    CIP = "CIP"
+
+
+class KYCStatus(str, enum.Enum):
+    UNVERIFIED = "unverified"
+    PENDING = "pending"
+    VERIFIED = "verified"
+    FLAGGED = "flagged"
+
+
+class CertificationStatus(str, enum.Enum):
+    PENDING = "pending"
+    VERIFIED = "verified"
+    REJECTED = "rejected"
+

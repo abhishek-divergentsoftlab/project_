@@ -24,15 +24,23 @@ from models.rfq import RFQ
 from models.user import User
 from schemas.match import MatchCandidate
 from core.config import settings
-from services import conversation_llm, llm_extractor, match_service
+from services import conversation_llm, currency as currency_service, llm_extractor, match_service
+from services.moderation_service import AIContentModerator
 from services.query_extractor import (
     Requirements,
+    _CATEGORY_EXAMPLES,
     extract,
+    is_broad_product,
     merge,
     merge_answer,
     parse_answer,
 )
 from services.rfq_indexing import build_search_tags, build_search_text
+
+
+class ModerationSessionBlockedError(Exception):
+    """Raised when a user attempts to continue a session terminated for safety violations."""
+
 
 # Asked in this order: the earlier a field is, the more it changes the ranking.
 QUESTION_ORDER: tuple[str, ...] = ("quantity", "price", "location", "deadline")
@@ -105,6 +113,9 @@ class DirectSearchResult:
         pending: Optional[str],
         search_id: Optional[uuid.UUID],
         notes: list[str],
+        blocked: bool = False,
+        block_reason: Optional[str] = None,
+        block_category: Optional[str] = None,
     ) -> None:
         self.conversation = conversation
         self.requirements = requirements
@@ -114,6 +125,9 @@ class DirectSearchResult:
         self.pending = pending
         self.search_id = search_id
         self.notes = notes
+        self.blocked = blocked
+        self.block_reason = block_reason
+        self.block_category = block_category
 
 
 def _is_show_now(message: str) -> bool:
@@ -189,6 +203,10 @@ def _describe(requirements: Requirements) -> str:
     text = " ".join(parts) or "that"
     if requirements.city:
         text += f" in {requirements.city}"
+    elif requirements.state:
+        text += f" in {requirements.state}"
+    elif requirements.country:
+        text += f" in {requirements.country}"
     return text
 
 
@@ -210,6 +228,10 @@ def _acknowledge(requirements: Requirements) -> str:
         extras.append(f"{requirements.price_amount:,} {requirements.price_currency or 'INR'}{unit}")
     if requirements.city:
         extras.append(requirements.city)
+    elif requirements.state:
+        extras.append(requirements.state)
+    elif requirements.country:
+        extras.append(requirements.country)
     if requirements.deadline_days is not None:
         extras.append(f"within {requirements.deadline_days} days")
 
@@ -249,11 +271,15 @@ def _currency_note(requirements: Requirements, results: list[MatchCandidate]) ->
     wanted = requirements.price_currency or "INR"
     theirs = {c.price.currency for c in results if c.price is not None}
     if theirs and wanted not in theirs:
-        listed = ", ".join(sorted(theirs))
-        return [
-            f"Note: your target is in {wanted} but these are quoted in {listed}, "
-            "so price was not scored."
+        unconvertible = [
+            c for c in theirs if currency_service.convert(Decimal("1"), c, wanted) is None
         ]
+        if unconvertible:
+            listed = ", ".join(sorted(unconvertible))
+            return [
+                f"Note: your target is in {wanted} but some listings are quoted in {listed} "
+                "(which could not be converted), so their price was not scored."
+            ]
     return []
 
 
@@ -322,14 +348,178 @@ async def handle_message(
 ) -> DirectSearchResult:
     conversation = await _load_conversation(db, user, conversation_id)
     state = dict(conversation.state or {})
+
+    # Check if this session has already been locked due to a policy violation
+    if state.get("blocked"):
+        reason = state.get("block_reason") or "Prohibited items detected."
+        raise ModerationSessionBlockedError(
+            f"This search session has been terminated and locked due to a safety policy violation: {reason}"
+        )
+
+    # AI Safety Moderation Guardrail Check
+    mod_check = await AIContentModerator.audit_and_verify(
+        db, user_id=user.id, action="direct_search", title=text
+    )
+    if not mod_check.is_safe:
+        # Policy violation: immediately lock this conversation session
+        state["blocked"] = True
+        state["block_reason"] = mod_check.reason
+        state["block_category"] = mod_check.category
+        state["flagged_terms"] = mod_check.flagged_terms
+        conversation.state = state
+
+        # Record user message and assistant safety warning in chat history
+        db.add(Message(conversation_id=conversation.id, role=MessageRole.USER, content=text))
+        warning_reply = (
+            f"⚠️ {mod_check.reason}\n\n"
+            "This search session has been locked and terminated due to a violation of our safety policies. "
+            "You cannot continue chatting in this session."
+        )
+        assistant = Message(
+            conversation_id=conversation.id,
+            role=MessageRole.ASSISTANT,
+            content=warning_reply,
+        )
+        db.add(assistant)
+        seq = 0
+        db.add(_record(assistant, seq, "moderation_blocked", warning_reply, {
+            "category": mod_check.category,
+            "flagged_terms": mod_check.flagged_terms,
+        }))
+
+        await db.commit()
+        await db.refresh(conversation)
+
+        return DirectSearchResult(
+            conversation=conversation,
+            requirements=_load_requirements(conversation),
+            reply=warning_reply,
+            results=[],
+            total=0,
+            pending=None,
+            search_id=None,
+            notes=[],
+            blocked=True,
+            block_reason=mod_check.reason,
+            block_category=mod_check.category,
+        )
+
     requirements = _load_requirements(conversation)
+    product_before = requirements.product
+    category_before = requirements.category
     pending_before: Optional[str] = state.get("pending")
+    confirming_before: bool = bool(state.get("confirming_product"))
+
+    # Load conversation history for the LLM agent
+    history_records = (
+        await db.scalars(
+            select(Message)
+            .where(Message.conversation_id == conversation.id)
+            .order_by(Message.created_at.asc())
+        )
+    ).all()
+    history_dicts = [
+        {"role": m.role.value if hasattr(m.role, "value") else str(m.role), "content": m.content}
+        for m in history_records
+        if m.content
+    ]
 
     db.add(Message(conversation_id=conversation.id, role=MessageRole.USER, content=text))
 
+    # Autonomous LLM Search Agent: decides what to ask next, manages pivots, and calls search_marketplace
+    agent_decision: Optional[conversation_llm.SearchAgentDecision] = None
+    if settings.DIRECT_SEARCH_LLM:
+        agent_decision = await conversation_llm.run_search_agent(
+            history=history_dicts,
+            current_requirements=requirements,
+            user_message=text,
+            already_searched=bool(state.get("searched")),
+        )
+
+    if agent_decision is not None:
+        requirements = agent_decision.updated_requirements
+        assistant = Message(
+            conversation_id=conversation.id, role=MessageRole.ASSISTANT, content=""
+        )
+        db.add(assistant)
+        sequence = 0
+        db.add(_record(assistant, sequence, "status", "Understanding your request", {"thought": agent_decision.thought or ""}))
+
+        results: list[MatchCandidate] = []
+        total = 0
+        search_id: Optional[uuid.UUID] = None
+        notes: list[str] = []
+
+        if agent_decision.action == "search_marketplace" and requirements.product:
+            sequence += 1
+            db.add(
+                _record(
+                    assistant, sequence, "tool_call", "Searching the marketplace",
+                    {"tool": "search_marketplace", "parameters": requirements.model_dump(mode="json")},
+                )
+            )
+            probe = build_probe_rfq(requirements, user.id)
+            response = await match_service.run_match(
+                db, user, probe,
+                rfq_id=None,
+                conversation_id=conversation.id,
+                query=text,
+                source="direct_search",
+                limit=limit,
+                offset=0,
+            )
+            results, total, search_id = response.results, response.total, response.search_id
+            notes = _currency_note(requirements, results)
+            pending = None
+            reply = _compose_reply(requirements, total, len(results), pending, notes)
+            sequence += 1
+            db.add(
+                _record(
+                    assistant, sequence, "tool_result", f"Found {total} matches",
+                    {"count": total, "search_id": str(search_id)},
+                )
+            )
+            sequence += 1
+            db.add(
+                _record(
+                    assistant, sequence, "search_results", "",
+                    {"results": [c.model_dump(mode="json") for c in results]},
+                )
+            )
+            state["searched"] = True
+            state["pending"] = None
+            state["confirming_product"] = False
+        else:
+            reply = agent_decision.reply or "Could you specify what product or details you need?"
+            pending = "clarify"
+            state["pending"] = pending
+
+        assistant.content = reply
+        sequence += 1
+        db.add(_record(assistant, sequence, "done", "", {}))
+
+        state["requirements"] = requirements.model_dump(mode="json")
+        conversation.state = state
+        if conversation.title is None and requirements.product:
+            conversation.title = f"Search: {requirements.product}"[:300]
+
+        await db.commit()
+        await db.refresh(conversation)
+
+        return DirectSearchResult(
+            conversation=conversation,
+            requirements=requirements,
+            reply=reply,
+            results=results,
+            total=total,
+            pending=pending,
+            search_id=search_id,
+            notes=notes,
+        )
+
+    # --- Fallback to deterministic engine when LLM is unavailable or offline ---
     # Ask the model what the reply meant; fall back to keyword matching when it
-    # is unavailable or too slow. "doesn't really matter, just show me what's
-    # out there" is a sentence no word list handles well.
+    # is unavailable or too slow.
     intent = await conversation_llm.interpret(text, pending_before)
     if intent is None:
         intent = (
@@ -349,7 +539,26 @@ async def handle_message(
         # A reply to a specific question is read as an answer to that field
         # only. Parsing it as a whole new query is how "i need it before 30 sep"
         # ended up setting the product to "sep" and the quantity to 30.
-        scoped = parse_answer(pending_before, text) if pending_before else None
+        scoped = None
+        if pending_before in QUESTION_ORDER and not confirming_before:
+            scoped = parse_answer(pending_before, text)
+            if scoped is None:
+                # Check other missing fields first, then any other field,
+                # but only if the user is not stating a new product or pivot.
+                cand_parsed = extract(text)
+                user_stated_product = bool(
+                    cand_parsed.product
+                    and cand_parsed.product.lower() != (requirements.product or "").lower()
+                )
+                if not user_stated_product:
+                    missing_fields = [f for f in QUESTION_ORDER if not requirements.known(f) and f != pending_before]
+                    other_candidates = missing_fields + [f for f in QUESTION_ORDER if f != pending_before and f not in missing_fields]
+                    for other_field in other_candidates:
+                        cand = parse_answer(other_field, text)
+                        if cand is not None:
+                            scoped = cand
+                            break
+
         if scoped is not None:
             requirements = merge_answer(requirements, scoped)
         else:
@@ -373,12 +582,105 @@ async def handle_message(
     missing = _missing_fields(requirements)
     already_searched = bool(state.get("searched"))
 
+    product_now = requirements.product
+    product_changed = bool(
+        product_before and product_now and product_now.lower() != product_before.lower()
+    )
+    is_broad = is_broad_product(product_now)
+    explicit_search_permission = _is_show_now(text) or any(
+        w in text.lower().split() for w in ("search", "find", "yes", "proceed", "same", "keep", "sure", "ok", "okay")
+    )
+
     if not requirements.product:
         pending = None
         reply = (
             "What product are you looking for? For example: "
             "“white USB type-c cables in Indore within 7 days”."
         )
+
+    elif confirming_before:
+        # User is answering the product confirmation / clarification prompt
+        if explicit_search_permission or not is_broad:
+            state["confirming_product"] = False
+            state["searched"] = True
+            sequence += 1
+            db.add(
+                _record(
+                    assistant, sequence, "tool_call", "Searching the marketplace",
+                    {"tool": "search_marketplace"},
+                )
+            )
+            probe = build_probe_rfq(requirements, user.id)
+            response = await match_service.run_match(
+                db, user, probe,
+                rfq_id=None,
+                conversation_id=conversation.id,
+                query=text,
+                source="direct_search",
+                limit=limit,
+                offset=0,
+            )
+            results, total, search_id = response.results, response.total, response.search_id
+            notes = _currency_note(requirements, results)
+            pending = None
+            reply = _compose_reply(requirements, total, len(results), pending, notes)
+            sequence += 1
+            db.add(
+                _record(
+                    assistant, sequence, "tool_result", f"Found {total} matches",
+                    {"count": total, "search_id": str(search_id)},
+                )
+            )
+            sequence += 1
+            db.add(
+                _record(
+                    assistant, sequence, "search_results", "",
+                    {"results": [c.model_dump(mode="json") for c in results]},
+                )
+            )
+        else:
+            examples = _CATEGORY_EXAMPLES.get(requirements.category or "Agriculture", "specific items")
+            reply = (
+                f"Could you specify which item you need (e.g., {examples})? "
+                "Or say “search” to find all suppliers right now."
+            )
+            pending = "clarify_product"
+
+    elif product_changed and (is_broad or not explicit_search_permission):
+        # Product changed mid-conversation! Pause RAG and confirm details or clarify broad term
+        state["confirming_product"] = True
+        state["searched"] = False
+        if is_broad:
+            category_label = requirements.category or "Agriculture"
+            examples = _CATEGORY_EXAMPLES.get(category_label, "specific items")
+            reply = (
+                f"Got it — switching to {category_label} ({requirements.product}). "
+                f"Which specific item are you looking for (for example: {examples})? "
+                "Also, would you like to specify target quantity and price, or any configurations like organic or grade? "
+                "(Or say “search” to find all sellers now.)"
+            )
+            pending = "clarify_product"
+        elif category_before and requirements.category and requirements.category != category_before:
+            reply = (
+                f"Got it — switching to {requirements.product} ({requirements.category}). "
+                "Would you like to set your target quantity and price for this item, or any specific requirements (such as organic, grade, or variety)? "
+                "(Or say “search” to find sellers now.)"
+            )
+            pending = "confirm_details"
+        else:
+            carried = []
+            if requirements.quantity_value:
+                carried.append(f"{requirements.quantity_value:,} {requirements.quantity_unit or 'units'}")
+            if requirements.price_amount:
+                carried.append(f"{requirements.price_amount:,} {requirements.price_currency or 'INR'}")
+            carried_str = f" ({', '.join(carried)})" if carried else ""
+            loc_str = f" in {requirements.city}" if requirements.city else (f" in {requirements.state}" if requirements.state else "")
+            reply = (
+                f"Got it — switching to {requirements.product}{loc_str}. "
+                f"Would you like to keep the same target details{carried_str}, or specify new requirements (such as length, color, or grade)? "
+                "(Or say “search” to find sellers now.)"
+            )
+            pending = "confirm_details"
 
     elif missing and not already_searched:
         # Gather first, search once. The tool is not called until the picture is
@@ -438,9 +740,7 @@ async def handle_message(
 
     state["requirements"] = requirements.model_dump(mode="json")
     state["pending"] = pending
-    # Sticky: once the search has run, later messages refine live rather than
-    # dropping the user back into a questionnaire.
-    state["searched"] = already_searched or bool(search_id)
+    state["searched"] = (already_searched and not state.get("confirming_product")) or bool(search_id)
     conversation.state = state
     if conversation.title is None and requirements.product:
         conversation.title = f"Search: {requirements.product}"[:300]

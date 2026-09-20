@@ -13,7 +13,18 @@ import type {
   Connection,
   ConnectionMessage,
   ConnectionStatus,
+  Quotation,
+  QuotationCreatePayload,
+  Certificate,
+  CertificateCreatePayload,
+  KYCStatusOut,
+  KYCVerificationPayload,
+  ModerationCheckResult,
+  Review,
+  ReviewCreatePayload,
+  UserReviewStats,
 } from "@/types";
+
 
 export interface SignupPayload {
   email: string;
@@ -139,4 +150,100 @@ export const connections = {
     const { data } = await api.post<ConnectionMessage>(`/connections/${connectionId}/messages`, { content });
     return data;
   },
+  async sendLiveCapture(connectionId: string, imageBlob: Blob, caption?: string): Promise<ConnectionMessage> {
+    const formData = new FormData();
+    formData.append("image", imageBlob, "live_camera_snapshot.jpg");
+    if (caption && caption.trim()) {
+      formData.append("caption", caption.trim());
+    }
+    const { data } = await api.post<ConnectionMessage>(
+      `/connections/${connectionId}/messages/live-capture`,
+      formData,
+      { headers: { "Content-Type": "multipart/form-data" } }
+    );
+    return data;
+  },
 };
+
+export const quotations = {
+  async list(connectionId: string): Promise<Quotation[]> {
+    const { data } = await api.get<Quotation[]>(`/connections/${connectionId}/quotes`);
+    return data;
+  },
+  async create(connectionId: string, payload: QuotationCreatePayload): Promise<Quotation> {
+    const { data } = await api.post<Quotation>(`/connections/${connectionId}/quotes`, payload);
+    return data;
+  },
+  async accept(connectionId: string, quoteId: string): Promise<Quotation> {
+    const { data } = await api.post<Quotation>(`/connections/${connectionId}/quotes/${quoteId}/accept`);
+    return data;
+  },
+  async reject(connectionId: string, quoteId: string, reason?: string): Promise<Quotation> {
+    const { data } = await api.post<Quotation>(`/connections/${connectionId}/quotes/${quoteId}/reject`, { reason });
+    return data;
+  },
+};
+
+export const reviews = {
+  async listQuoteReviews(connectionId: string, quoteId: string): Promise<Review[]> {
+    const { data } = await api.get<Review[]>(`/connections/${connectionId}/quotes/${quoteId}/reviews`);
+    return data;
+  },
+  async dispatchQuote(connectionId: string, quoteId: string): Promise<Quotation> {
+    const { data } = await api.post<Quotation>(`/connections/${connectionId}/quotes/${quoteId}/dispatch`);
+    return data;
+  },
+  async markDelivered(connectionId: string, quoteId: string): Promise<Quotation> {
+    const { data } = await api.post<Quotation>(`/connections/${connectionId}/quotes/${quoteId}/deliver`);
+    return data;
+  },
+  async acceptDelivery(connectionId: string, quoteId: string): Promise<Quotation> {
+    const { data } = await api.post<Quotation>(`/connections/${connectionId}/quotes/${quoteId}/accept-delivery`);
+    return data;
+  },
+  async rate(connectionId: string, quoteId: string, payload: ReviewCreatePayload): Promise<Review> {
+    const { data } = await api.post<Review>(`/connections/${connectionId}/quotes/${quoteId}/rate`, payload);
+    return data;
+  },
+  async getUserReviews(userId: string): Promise<UserReviewStats> {
+    const { data } = await api.get<UserReviewStats>(`/users/${userId}/reviews`);
+    return data;
+  },
+};
+
+export const certifications = {
+  async list(): Promise<Certificate[]> {
+    const { data } = await api.get<Certificate[]>("/certifications");
+    return data;
+  },
+  async create(payload: CertificateCreatePayload): Promise<Certificate> {
+    const { data } = await api.post<Certificate>("/certifications", payload);
+    return data;
+  },
+  async delete(certificateId: string): Promise<void> {
+    await api.delete(`/certifications/${certificateId}`);
+  },
+  async getPublic(userId: string): Promise<Certificate[]> {
+    const { data } = await api.get<Certificate[]>(`/certifications/user/${userId}`);
+    return data;
+  },
+};
+
+export const kyc = {
+  async verify(payload: KYCVerificationPayload): Promise<KYCStatusOut> {
+    const { data } = await api.post<KYCStatusOut>("/users/me/kyc/verify", payload);
+    return data;
+  },
+};
+
+export const moderation = {
+  async check(title: string, description?: string, category?: string): Promise<ModerationCheckResult> {
+    const { data } = await api.post<ModerationCheckResult>("/moderation/check", {
+      title,
+      description,
+      category,
+    });
+    return data;
+  },
+};
+

@@ -22,6 +22,8 @@ class ConnectionMessageCreate(BaseModel):
     # Bounded on the way in: an unbounded Text column reachable from an
     # authenticated POST is a cheap way to fill the disk.
     content: str = Field(min_length=1, max_length=4000)
+    image_url: Optional[str] = Field(default=None, max_length=512)
+    is_live_capture: bool = Field(default=False)
 
 
 class ConnectionMessageOut(BaseModel):
@@ -31,6 +33,8 @@ class ConnectionMessageOut(BaseModel):
     connection_id: uuid.UUID
     sender_id: uuid.UUID
     content: str
+    image_url: Optional[str] = None
+    is_live_capture: bool = False
     created_at: datetime
 
 

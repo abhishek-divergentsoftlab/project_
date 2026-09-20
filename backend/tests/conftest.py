@@ -33,6 +33,9 @@ from httpx import ASGITransport, AsyncClient  # noqa: E402
 
 from app import app  # noqa: E402
 from core.config import settings  # noqa: E402
+
+# Fast, offline deterministic execution for unit and regression tests
+settings.DIRECT_SEARCH_LLM = False
 from db.session import SessionLocal, engine  # noqa: E402
 from models.enums import RFQRole, RFQStatus, UserRole  # noqa: E402
 
@@ -115,12 +118,14 @@ async def clean_tables(database: None) -> AsyncIterator[None]:
 
         await session.execute(
             text(
-                "TRUNCATE users, rfqs, connections, connection_messages, "
+                "TRUNCATE users, rfqs, connections, connection_messages, quotations, "
+                "reviews, certificates, moderation_logs, "
                 "conversations, messages, message_events, match_searches, "
                 "match_results RESTART IDENTITY CASCADE"
             )
         )
         await session.commit()
+
 
 
 @pytest.fixture
@@ -189,6 +194,9 @@ class Actor:
 
     async def patch(self, url: str, **kwargs: Any):
         return await self._client.patch(url, headers=self.headers, **kwargs)
+
+    async def delete(self, url: str, **kwargs: Any):
+        return await self._client.delete(url, headers=self.headers, **kwargs)
 
 
 @pytest.fixture
@@ -290,3 +298,22 @@ def make_rfq():
         return response.json()
 
     return _make
+
+
+@pytest.fixture
+async def accepted_pair(make_actor, make_rfq):
+    """A buyer and a seller connected with mutual consent."""
+    buyer = await make_actor("buyer", name="Buyer Alpha", company_name="Alpha Sourcing")
+    seller = await make_actor(
+        "seller", name="Seller Beta", company_name="Beta Manufacturing", city="Pune"
+    )
+    listing = await make_rfq(
+        seller, role="seller", title="Supplying 10,000 industrial ball bearings"
+    )
+    conn_res = await buyer.post("/connections", json={"rfq_id": listing["id"]})
+    conn_id = conn_res.json()["id"]
+
+    # Seller accepts connection
+    await seller.post(f"/connections/{conn_id}/accept")
+    return buyer, seller, conn_id, listing
+

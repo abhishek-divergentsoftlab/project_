@@ -71,26 +71,21 @@ export function Search() {
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [blocked, setBlocked] = useState(false);
+  const [blockReason, setBlockReason] = useState<string | null>(null);
+  const [blockCategory, setBlockCategory] = useState<string | null>(null);
 
   const endRef = useRef<HTMLDivElement>(null);
   const resultsEndRef = useRef<HTMLDivElement>(null);
   const nextId = useRef(0);
 
-  // Collect all results across every turn (latest turn's results first).
-  const allResults: MatchCandidate[] = [];
-  const seenIds = new Set<string>();
-  for (let i = turns.length - 1; i >= 0; i--) {
-    const turn = turns[i];
-    if (turn.results) {
-      for (const candidate of turn.results) {
-        if (!seenIds.has(candidate.rfq_id)) {
-          seenIds.add(candidate.rfq_id);
-          allResults.push(candidate);
-        }
-      }
-    }
-  }
-  const hasResults = allResults.length > 0;
+  // Display the active search results from the latest search turn,
+  // replacing previous results when a new search or query update occurs.
+  const latestSearchTurn = [...turns].reverse().find(
+    (t) => t.results && t.results.length > 0
+  );
+  const activeResults: MatchCandidate[] = latestSearchTurn?.results || [];
+  const hasResults = activeResults.length > 0;
 
   // Toggle sidebar visibility: hide when results are showing so chat + results
   // get the full viewport width in a 50/50 split.
@@ -113,11 +108,11 @@ export function Search() {
 
   useEffect(() => {
     resultsEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [allResults.length]);
+  }, [activeResults.length]);
 
   async function send(text: string) {
     const message = text.trim();
-    if (!message || sending) return;
+    if (!message || sending || blocked) return;
 
     setDraft("");
     setError(null);
@@ -141,6 +136,13 @@ export function Search() {
 
       setConversationId(response.conversation_id);
       setRequirements(response.requirements);
+
+      if (response.blocked) {
+        setBlocked(true);
+        setBlockReason(response.block_reason || "Prohibited items detected.");
+        setBlockCategory(response.block_category || null);
+      }
+
       setTurns((current) => [
         ...current,
         {
@@ -152,7 +154,15 @@ export function Search() {
         },
       ]);
     } catch (err) {
-      setError(errorMessage(err, "Could not run that search"));
+      if (isAxiosError(err) && (err.response?.status === 422 || err.response?.data?.blocked)) {
+        const detail = err.response?.data?.detail;
+        const msg = typeof detail === "string" ? detail : (detail?.message || errorMessage(err, "Policy violation"));
+        setError(msg);
+        setBlocked(true);
+        setBlockReason(msg);
+      } else {
+        setError(errorMessage(err, "Could not run that search"));
+      }
     } finally {
       setSending(false);
     }
@@ -187,6 +197,9 @@ export function Search() {
     setConversationId(undefined);
     setError(null);
     setNotice(null);
+    setBlocked(false);
+    setBlockReason(null);
+    setBlockCategory(null);
   }
 
   // ─── Chat panel (always rendered) ──────────────────────────────────────────
@@ -228,23 +241,28 @@ export function Search() {
           </div>
         )}
 
-        {turns.map((turn) => (
-          <div key={turn.id} className={`turn turn-${turn.who}`}>
-            <div className="bubble">{turn.text}</div>
-            {/* In split mode, results show in the right panel instead */}
-            {!hasResults && turn.results && turn.results.length > 0 && (
-              <div className="match-grid">
-                {turn.results.map((candidate) => (
-                  <MatchCard
-                    key={candidate.rfq_id}
-                    candidate={candidate}
-                    onContact={handleContact}
-                  />
-                ))}
-              </div>
-            )}
-          </div>
-        ))}
+        {turns.map((turn) => {
+          const isViolation =
+            turn.who === "assistant" &&
+            (turn.text.includes("Safety Moderation") || turn.text.includes("prohibited items") || turn.text.startsWith("⚠️"));
+          return (
+            <div key={turn.id} className={`turn turn-${turn.who}${isViolation ? " turn-violation" : ""}`}>
+              <div className={`bubble${isViolation ? " bubble-violation" : ""}`}>{turn.text}</div>
+              {/* In split mode, results show in the right panel instead */}
+              {!hasResults && turn.results && turn.results.length > 0 && (
+                <div className="match-grid">
+                  {turn.results.map((candidate) => (
+                    <MatchCard
+                      key={candidate.rfq_id}
+                      candidate={candidate}
+                      onContact={handleContact}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })}
 
         {sending && <div className="turn turn-assistant"><div className="bubble muted">Searching…</div></div>}
         <div ref={endRef} />
@@ -253,20 +271,42 @@ export function Search() {
       {error && <p className="error">{error}</p>}
       {notice && <p className="success">{notice}</p>}
 
-      <form className="composer" onSubmit={handleSubmit}>
+      {blocked && (
+        <div className="search-blocked-banner">
+          <div className="blocked-banner-header">
+            <span className="blocked-icon">🛡️</span>
+            <div className="blocked-title-group">
+              <span className="blocked-title">AI Safety Policy Violation &mdash; Session Locked</span>
+              {blockCategory && <span className="blocked-badge">{blockCategory.replace(/_/g, " ")}</span>}
+            </div>
+          </div>
+          <p className="blocked-desc">
+            {blockReason || "This search session has been terminated and locked due to prohibited items policy violations. You cannot send further messages in this session."}
+          </p>
+          <div className="blocked-action-row">
+            <button type="button" className="btn-reset-session" onClick={reset}>
+              + Start Clean New Search
+            </button>
+          </div>
+        </div>
+      )}
+
+      <form className={`composer${blocked ? " composer-blocked" : ""}`} onSubmit={handleSubmit}>
         <input
           aria-label="Your message"
           placeholder={
-            turns.length === 0
+            blocked
+              ? "Session locked due to safety policy violation. Click 'Start Clean New Search' to reset."
+              : turns.length === 0
               ? "e.g. white usb type-c cables in Indore within 7 days"
               : "Refine it — e.g. show me black instead, deadline 9 days"
           }
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
-          disabled={sending}
+          disabled={sending || blocked}
         />
-        <button type="submit" disabled={sending || !draft.trim()}>
-          Send
+        <button type="submit" disabled={sending || blocked || !draft.trim()}>
+          {blocked ? "Locked" : "Send"}
         </button>
       </form>
     </div>
@@ -277,11 +317,11 @@ export function Search() {
     <div className="search-results-panel">
       <div className="search-results-head">
         <h2>Results</h2>
-        <span className="muted">{allResults.length} match{allResults.length !== 1 ? "es" : ""}</span>
+        <span className="muted">{activeResults.length} match{activeResults.length !== 1 ? "es" : ""}</span>
       </div>
       <div className="search-results-scroll">
         <div className="search-results-grid">
-          {allResults.map((candidate) => (
+          {activeResults.map((candidate) => (
             <MatchCard
               key={candidate.rfq_id}
               candidate={candidate}

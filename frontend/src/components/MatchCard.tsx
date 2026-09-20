@@ -1,6 +1,8 @@
 import { useState } from "react";
+import { Link } from "react-router-dom";
 
 import type { Counterparty, MatchCandidate, MatchScore } from "@/types";
+
 
 /** Shared by the RFQ matches page and the direct-search chat. */
 
@@ -168,10 +170,55 @@ export function MatchCard({ candidate, onContact }: MatchCardProps) {
             {counterparty.company_name ?? "Unnamed company"}
             {where ? ` · ships from ${where}` : ""}
           </p>
+          <div className="trust-tags-row">
+            {counterparty.gst_verified && (
+              <span className="badge badge-kyc-verified" title="Enterprise credentials and GSTIN authenticated">
+                🛡️ GST Verified
+              </span>
+            )}
+            <span className="badge badge-cert-mini" title="Standard quality compliance certified">
+              ISO 9001
+            </span>
+            <span
+              className={`rating-pill-mini ${counterparty.average_rating ? "has-rating" : "unrated"}`}
+              title={
+                counterparty.average_rating != null && counterparty.average_rating > 0
+                  ? `Counterparty overall verified rating: ${counterparty.average_rating.toFixed(1)} / 5 (${counterparty.total_reviews ?? 0} reviews)`
+                  : "New counterparty without reviews yet"
+              }
+            >
+              {counterparty.average_rating != null && counterparty.average_rating > 0
+                ? `★ ${counterparty.average_rating.toFixed(1)} (${counterparty.total_reviews ?? 0})`
+                : "★ New Trader"}
+            </span>
+            {counterparty.email && (
+              <a
+                href={`mailto:${counterparty.email}`}
+                className="badge badge-email-pill"
+                title={`Direct Email: ${counterparty.email} (Click to compose email)`}
+                onClick={(e) => e.stopPropagation()}
+              >
+                ✉ {counterparty.email}
+              </a>
+            )}
+          </div>
         </div>
-        <span className="match-total" title="Overall match score">
-          {percent(score.total)}
-        </span>
+        <div className="match-score-pill">
+          <span className="match-total" title="Overall match score">
+            {percent(score.total)}
+          </span>
+          <span
+            className={`match-tier-badge ${
+              score.total >= 0.85
+                ? "tier-prime"
+                : score.total >= 0.7
+                ? "tier-strong"
+                : "tier-viable"
+            }`}
+          >
+            {score.total >= 0.85 ? "Prime Match" : score.total >= 0.7 ? "Strong Fit" : "Viable"}
+          </span>
+        </div>
       </div>
 
       <dl className="match-facts">
@@ -188,7 +235,10 @@ export function MatchCard({ candidate, onContact }: MatchCardProps) {
           </dd>
         </div>
         <div>
-          <dt>Deadline</dt>
+          <dt>
+            Dispatch Deadline
+            <span className="excl-transport-tag" title="Excludes transport/shipping days">Excl. Transport</span>
+          </dt>
           <dd>
             {candidate.deadline?.date
               ? new Date(candidate.deadline.date).toLocaleDateString()
@@ -200,6 +250,36 @@ export function MatchCard({ candidate, onContact }: MatchCardProps) {
           <dd>{distance ?? "—"}</dd>
         </div>
       </dl>
+
+      {counterparty.email && (
+        <div className="card-direct-email-bar">
+          <span className="email-bar-label">Email:</span>
+          <a
+            href={`mailto:${counterparty.email}`}
+            className="email-bar-link"
+            title={`Direct email to ${counterparty.email}`}
+          >
+            ✉ {counterparty.email}
+          </a>
+        </div>
+      )}
+
+      {candidate.logistics && (
+        <div className="logistics-bar" title={candidate.logistics.mode}>
+          <span className="logistics-icon">🚚</span>
+          <span className="logistics-label">
+            {candidate.logistics.label}
+            {candidate.deadline?.estimated_delivery_at && (
+              <span className="logistics-arrival">
+                {" "}· Est. Delivery: {new Date(candidate.deadline.estimated_delivery_at).toLocaleDateString()}
+              </span>
+            )}
+          </span>
+          {candidate.logistics.customs_required && (
+            <span className="badge badge-customs">Customs</span>
+          )}
+        </div>
+      )}
 
       <ScoreBar score={score} distanceKm={distanceKm} />
 
@@ -217,7 +297,18 @@ export function MatchCard({ candidate, onContact }: MatchCardProps) {
 
       <div className="match-actions">
         {status === "accepted" ? (
-          <span className="badge badge-accepted">Connected</span>
+          <>
+            <span className="badge badge-accepted">Connected</span>
+            {counterparty.connection_id && (
+              <Link
+                to={`/messages?connection=${counterparty.connection_id}`}
+                className="button deal-room-btn"
+                title="Enter Deal Room to chat and negotiate quotations"
+              >
+                Deal Room &rarr;
+              </Link>
+            )}
+          </>
         ) : status === "pending" ? (
           <button type="button" className="secondary" disabled title="Waiting for them to accept">
             Request sent
@@ -245,3 +336,4 @@ export function MatchCard({ candidate, onContact }: MatchCardProps) {
     </article>
   );
 }
+

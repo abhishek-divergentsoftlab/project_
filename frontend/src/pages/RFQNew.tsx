@@ -2,9 +2,10 @@ import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 
 import { errorMessage } from "@/api/client";
-import { rfqs as rfqApi } from "@/api/endpoints";
+import { moderation as moderationApi, rfqs as rfqApi } from "@/api/endpoints";
 import { useAuth } from "@/context/useAuth";
 import type { ProductDetails, RFQ, RFQCreatePayload, RFQRole } from "@/types";
+import { normalizeCurrency, CURRENCY_NAMES } from "@/utils/currency";
 
 interface Attribute {
   key: string;
@@ -158,6 +159,29 @@ export function RFQNew() {
     };
   }, [rfqId, prefill]);
 
+  const [moderationWarning, setModerationWarning] = useState<string | null>(null);
+
+  // Debounced real-time safety pre-check
+  useEffect(() => {
+    if (!form.title.trim() && !form.description.trim()) {
+      setModerationWarning(null);
+      return;
+    }
+    const timer = setTimeout(() => {
+      void moderationApi
+        .check(form.title, form.description, form.category)
+        .then((res) => {
+          if (!res.is_safe && res.reason) {
+            setModerationWarning(res.reason);
+          } else {
+            setModerationWarning(null);
+          }
+        })
+        .catch(() => { });
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [form.title, form.description, form.category]);
+
   function update<K extends keyof typeof form>(key: K, value: (typeof form)[K]) {
     setForm((current) => ({ ...current, [key]: value }));
   }
@@ -171,6 +195,14 @@ export function RFQNew() {
   async function handleSubmit(event: FormEvent) {
     event.preventDefault();
     setError(null);
+
+    if (moderationWarning) {
+      setError(
+        "Listing violates safety policies regarding prohibited items. Please remove prohibited items to proceed.",
+      );
+      return;
+    }
+
     setSubmitting(true);
 
     const payload: RFQCreatePayload = {
@@ -202,7 +234,7 @@ export function RFQNew() {
     if (form.priceAmount) {
       payload.price_target = {
         amount: Number(form.priceAmount),
-        currency: form.priceCurrency,
+        currency: normalizeCurrency(form.priceCurrency) || form.priceCurrency || "INR",
         per_unit: form.pricePerUnit || form.quantityUnit || null,
       };
     }
@@ -275,6 +307,16 @@ export function RFQNew() {
           )
         )}
 
+        {moderationWarning && (
+          <div className="moderation-alert-banner">
+            <span className="warning-icon">⚠️</span>
+            <div>
+              <strong>AI Safety Alert &mdash; Prohibited Item Detected</strong>
+              <p>{moderationWarning}</p>
+            </div>
+          </div>
+        )}
+
         <label htmlFor="title">Title</label>
         <input
           id="title"
@@ -334,13 +376,36 @@ export function RFQNew() {
             />
           </div>
           <div>
-            <label htmlFor="priceCurrency">Currency</label>
+            <label htmlFor="priceCurrency">
+              Currency
+              {CURRENCY_NAMES[form.priceCurrency] && (
+                <span className="excl-transport-tag" style={{ background: "rgba(16, 185, 129, 0.1)", color: "#10b981" }}>
+                  {CURRENCY_NAMES[form.priceCurrency]}
+                </span>
+              )}
+            </label>
             <input
               id="priceCurrency"
-              maxLength={3}
+              placeholder="e.g. INR, USD, india ruppes, kr"
               value={form.priceCurrency}
-              onChange={(e) => update("priceCurrency", e.target.value.toUpperCase())}
+              onChange={(e) => {
+                const val = e.target.value;
+                const norm = normalizeCurrency(val);
+                if (norm && norm !== val.toUpperCase() && val.length > 2) {
+                  update("priceCurrency", norm);
+                } else {
+                  update("priceCurrency", val.toUpperCase());
+                }
+              }}
+              onBlur={() => {
+                if (form.priceCurrency) {
+                  update("priceCurrency", normalizeCurrency(form.priceCurrency));
+                }
+              }}
             />
+            {/* <small className="muted" style={{ display: "block", marginTop: "0.2rem" }}>
+              Accepts codes or names (e.g. &ldquo;india ruppes&rdquo; &rarr; INR, &ldquo;us dollar&rdquo; &rarr; USD, &ldquo;kr&rdquo; &rarr; SEK).
+            </small> */}
           </div>
         </div>
 
@@ -388,7 +453,10 @@ export function RFQNew() {
             <input id="country" value={form.country} onChange={(e) => update("country", e.target.value)} />
           </div>
           <div>
-            <label htmlFor="deadlineDays">Deadline (days)</label>
+            <label htmlFor="deadlineDays">
+              Dispatch Deadline (days)
+              <span className="excl-transport-tag" title="Excludes transport/shipping days">Excl. Transport</span>
+            </label>
             <input
               id="deadlineDays"
               type="number"
@@ -401,9 +469,11 @@ export function RFQNew() {
               value={form.deadlineDays}
               onChange={(e) => update("deadlineDays", e.target.value)}
             />
-            {editing && (
-              <small className="muted">Leave blank to keep the current deadline.</small>
-            )}
+            <small className="muted" style={{ display: "block", marginTop: "0.2rem" }}>
+              {/* {editing
+                ? "Leave blank to keep current deadline. Excludes transport days (transit calculated separately)."
+                : "Manufacturing/readiness window. Transport & freight transit days are excluded."} */}
+            </small>
           </div>
         </div>
 

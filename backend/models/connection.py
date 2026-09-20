@@ -1,7 +1,7 @@
 import uuid
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
-from sqlalchemy import Enum, ForeignKey, Index, Text, UniqueConstraint
+from sqlalchemy import Boolean, Enum, ForeignKey, Index, String, Text, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -77,5 +77,9 @@ class ConnectionMessage(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         nullable=False,
     )
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    image_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    is_live_capture: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false"), nullable=False
+    )
 
     connection: Mapped["Connection"] = relationship(back_populates="messages")

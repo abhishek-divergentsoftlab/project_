@@ -69,6 +69,12 @@ class Counterparty(BaseModel):
     phone: Optional[str] = None
     address: Optional[str] = None
 
+    # Public enterprise trust & reputation fields
+    average_rating: Optional[float] = None
+    total_reviews: int = 0
+    trust_score: Optional[int] = None
+    gst_verified: bool = False
+
     @property
     def contact_unlocked(self) -> bool:
         return self.connection_status is ConnectionStatus.ACCEPTED
@@ -94,9 +100,11 @@ class MatchCandidate(BaseModel):
     # Great-circle km between the two listings, when both are geocoded. The
     # location score alone left "73%" unexplainable on the card.
     distance_km: Optional[float] = None
+    logistics: Optional[dict[str, Any]] = None
 
     counterparty: Counterparty
     score: MatchScore
+
 
 
 class MatchResponse(BaseModel):
@@ -122,6 +130,8 @@ class RequirementsOut(BaseModel):
     quantity: Optional[Quantity] = None
     price: Optional[Money] = None
     city: Optional[str] = None
+    state: Optional[str] = None
+    country: Optional[str] = None
     deadline_days: Optional[int] = None
 
     skipped: list[str] = Field(default_factory=list)
@@ -157,3 +167,8 @@ class DirectSearchResponse(BaseModel):
     results: list[MatchCandidate] = Field(default_factory=list)
     total: int = 0
     search_id: Optional[uuid.UUID] = None
+
+    # AI Content Moderation & Policy Guardrails
+    blocked: bool = False
+    block_reason: Optional[str] = None
+    block_category: Optional[str] = None

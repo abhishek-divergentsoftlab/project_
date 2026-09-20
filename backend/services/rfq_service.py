@@ -22,6 +22,7 @@ from schemas.common import DeadlineOut, Location, Money, Quantity
 from schemas.rfq import RFQCreate, RFQOut, RFQUpdate
 from services import locations, qdrant_index
 from services.embeddings import embed_one
+from services.moderation_service import AIContentModerator
 from services.rfq_indexing import build_match_text, refresh_index_fields
 
 # How long a listing stays matchable when the RFQ carries no delivery deadline.
@@ -146,6 +147,18 @@ async def create_rfq(db: AsyncSession, user: User, payload: RFQCreate) -> RFQ:
     if not user.can_post_as(payload.role):
         raise RFQError(f"this account is registered as '{user.role.value}' and cannot post a {payload.role.value} RFQ")
 
+    # AI Safety & Prohibited Items Moderation
+    mod_check = await AIContentModerator.audit_and_verify(
+        db,
+        user_id=user.id,
+        action="rfq_create",
+        title=payload.title,
+        description=payload.description,
+        category=payload.category,
+    )
+    if not mod_check.is_safe:
+        raise RFQError(mod_check.reason or "Listing contains prohibited items")
+
     rfq = RFQ(
         user_id=user.id,
         role=payload.role,
@@ -177,6 +190,21 @@ async def create_rfq(db: AsyncSession, user: User, payload: RFQCreate) -> RFQ:
 async def update_rfq(db: AsyncSession, rfq: RFQ, payload: RFQUpdate) -> RFQ:
     # exclude_unset distinguishes "set this to null" from "do not touch".
     provided = payload.model_dump(exclude_unset=True)
+
+    # AI Safety & Prohibited Items Moderation on update
+    new_title = provided.get("title", rfq.title)
+    new_desc = provided.get("description", rfq.description)
+    new_cat = provided.get("category", rfq.category)
+    mod_check = await AIContentModerator.audit_and_verify(
+        db,
+        user_id=rfq.user_id,
+        action="rfq_update",
+        title=new_title,
+        description=new_desc,
+        category=new_cat,
+    )
+    if not mod_check.is_safe:
+        raise RFQError(mod_check.reason or "Listing contains prohibited items")
 
     for field in ("category", "title", "description"):
         if field in provided:

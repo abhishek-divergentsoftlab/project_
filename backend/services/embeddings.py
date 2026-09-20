@@ -21,8 +21,15 @@ from core.config import settings
 
 logger = logging.getLogger(__name__)
 
+def get_expected_dimensions(model_name: Optional[str] = None) -> int:
+    model = model_name or settings.EMBEDDING_MODEL
+    if "qwen3" in model or "qwen" in model:
+        return 4096
+    return 768
+
+
 # Must match the model. Changing either means recreating the collection.
-EMBEDDING_DIMENSIONS = 768
+EMBEDDING_DIMENSIONS = get_expected_dimensions()
 
 
 def _post(path: str, payload: dict, timeout: int) -> Optional[dict]:
@@ -43,9 +50,14 @@ def _embed_sync(texts: Sequence[str]) -> Optional[list[list[float]]]:
     if not texts:
         return []
 
+    expected_dim = get_expected_dimensions(settings.EMBEDDING_MODEL)
     data = _post(
         "/api/embed",
-        {"model": settings.EMBEDDING_MODEL, "input": list(texts)},
+        {
+            "model": settings.EMBEDDING_MODEL,
+            "input": list(texts),
+            "keep_alive": -1,
+        },
         settings.EMBEDDING_TIMEOUT_SECONDS,
     )
     if not data:
@@ -55,12 +67,12 @@ def _embed_sync(texts: Sequence[str]) -> Optional[list[list[float]]]:
     if not isinstance(vectors, list) or len(vectors) != len(texts):
         logger.warning("embedding response did not match the number of inputs")
         return None
-    if vectors and len(vectors[0]) != EMBEDDING_DIMENSIONS:
+    if vectors and len(vectors[0]) != expected_dim:
         # A dimension mismatch would be rejected by the collection anyway, and
         # silently indexing half a corpus at the wrong width is worse.
         logger.warning(
             "embedding model returned %s dimensions, expected %s",
-            len(vectors[0]), EMBEDDING_DIMENSIONS,
+            len(vectors[0]), expected_dim,
         )
         return None
     return vectors

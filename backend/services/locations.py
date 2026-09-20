@@ -40,8 +40,18 @@ CITIES: dict[str, City] = {
     "rajkot": _c("Rajkot", "Gujarat", "India", "INR", 22.3039, 70.8022),
     "jaipur": _c("Jaipur", "Rajasthan", "India", "INR", 26.9124, 75.7873),
     "ludhiana": _c("Ludhiana", "Punjab", "India", "INR", 30.9010, 75.8573),
+    "amritsar": _c("Amritsar", "Punjab", "India", "INR", 31.6340, 74.8723),
+    "jalandhar": _c("Jalandhar", "Punjab", "India", "INR", 31.3260, 75.5762),
+    "mohali": _c("Mohali", "Punjab", "India", "INR", 30.7046, 76.7179),
+    "chandigarh": _c("Chandigarh", "Chandigarh", "India", "INR", 30.7333, 76.7794),
+    "gurgaon": _c("Gurgaon", "Haryana", "India", "INR", 28.4595, 77.0266),
+    "gurugram": _c("Gurugram", "Haryana", "India", "INR", 28.4595, 77.0266),
+    "faridabad": _c("Faridabad", "Haryana", "India", "INR", 28.4089, 77.3178),
+    "panipat": _c("Panipat", "Haryana", "India", "INR", 29.3909, 76.9635),
+    "ambala": _c("Ambala", "Haryana", "India", "INR", 30.3782, 76.7767),
     "delhi": _c("Delhi", "Delhi", "India", "INR", 28.6139, 77.2090),
     "noida": _c("Noida", "Uttar Pradesh", "India", "INR", 28.5355, 77.3910),
+    "ghaziabad": _c("Ghaziabad", "Uttar Pradesh", "India", "INR", 28.6692, 77.4538),
     "kanpur": _c("Kanpur", "Uttar Pradesh", "India", "INR", 26.4499, 80.3319),
     "lucknow": _c("Lucknow", "Uttar Pradesh", "India", "INR", 26.8467, 80.9462),
     "kolkata": _c("Kolkata", "West Bengal", "India", "INR", 22.5726, 88.3639),
@@ -51,6 +61,8 @@ CITIES: dict[str, City] = {
     "bengaluru": _c("Bengaluru", "Karnataka", "India", "INR", 12.9716, 77.5946),
     "bangalore": _c("Bengaluru", "Karnataka", "India", "INR", 12.9716, 77.5946),
     "hyderabad": _c("Hyderabad", "Telangana", "India", "INR", 17.3850, 78.4867),
+    "visakhapatnam": _c("Visakhapatnam", "Andhra Pradesh", "India", "INR", 17.6868, 83.2185),
+    "vizag": _c("Visakhapatnam", "Andhra Pradesh", "India", "INR", 17.6868, 83.2185),
     "kochi": _c("Kochi", "Kerala", "India", "INR", 9.9312, 76.2673),
 
     # --- China ---------------------------------------------------------------
@@ -104,8 +116,125 @@ CITIES: dict[str, City] = {
     "sydney": _c("Sydney", "New South Wales", "Australia", "AUD", -33.8688, 151.2093),
 }
 
+class Location(NamedTuple):
+    name: str
+    city: Optional[str]
+    state: Optional[str]
+    country: str
+    currency: str
+    latitude: float
+    longitude: float
+    is_city: bool = False
+    is_state: bool = False
+    is_country: bool = False
+    matched_key: str = ""
+
+
+def _loc(
+    name: str,
+    city: Optional[str],
+    state: Optional[str],
+    country: str,
+    currency: str,
+    lat: float,
+    lng: float,
+    is_city: bool = False,
+    is_state: bool = False,
+    is_country: bool = False,
+    matched_key: str = "",
+) -> Location:
+    return Location(
+        name=name,
+        city=city,
+        state=state,
+        country=country,
+        currency=currency,
+        latitude=lat,
+        longitude=lng,
+        is_city=is_city,
+        is_state=is_state,
+        is_country=is_country,
+        matched_key=matched_key,
+    )
+
+
+# Indian states, territories, nationwide markets, and countries.
+REGIONS: dict[str, Location] = {
+    # --- Indian States & Territories -----------------------------------------
+    "haryana": _loc("Haryana", None, "Haryana", "India", "INR", 29.0588, 76.0856, is_state=True),
+    "hariyana": _loc("Haryana", None, "Haryana", "India", "INR", 29.0588, 76.0856, is_state=True),
+    "haryanvi": _loc("Haryana", None, "Haryana", "India", "INR", 29.0588, 76.0856, is_state=True),
+    "punjab": _loc("Punjab", None, "Punjab", "India", "INR", 31.1471, 75.3412, is_state=True),
+    "panjab": _loc("Punjab", None, "Punjab", "India", "INR", 31.1471, 75.3412, is_state=True),
+    "maharashtra": _loc("Maharashtra", None, "Maharashtra", "India", "INR", 19.7515, 75.7139, is_state=True),
+    "gujarat": _loc("Gujarat", None, "Gujarat", "India", "INR", 22.2587, 71.1924, is_state=True),
+    "gujrat": _loc("Gujarat", None, "Gujarat", "India", "INR", 22.2587, 71.1924, is_state=True),
+    "rajasthan": _loc("Rajasthan", None, "Rajasthan", "India", "INR", 27.0238, 74.2179, is_state=True),
+    "madhya pradesh": _loc("Madhya Pradesh", None, "Madhya Pradesh", "India", "INR", 22.9734, 78.6569, is_state=True),
+    "in mp": _loc("Madhya Pradesh", None, "Madhya Pradesh", "India", "INR", 22.9734, 78.6569, is_state=True),
+    "uttar pradesh": _loc("Uttar Pradesh", None, "Uttar Pradesh", "India", "INR", 26.8467, 80.9462, is_state=True),
+    "in up": _loc("Uttar Pradesh", None, "Uttar Pradesh", "India", "INR", 26.8467, 80.9462, is_state=True),
+    "karnataka": _loc("Karnataka", None, "Karnataka", "India", "INR", 15.3173, 75.7139, is_state=True),
+    "tamil nadu": _loc("Tamil Nadu", None, "Tamil Nadu", "India", "INR", 11.1271, 78.6569, is_state=True),
+    "tamilnadu": _loc("Tamil Nadu", None, "Tamil Nadu", "India", "INR", 11.1271, 78.6569, is_state=True),
+    "telangana": _loc("Telangana", None, "Telangana", "India", "INR", 18.1124, 79.0193, is_state=True),
+    "andhra pradesh": _loc("Andhra Pradesh", None, "Andhra Pradesh", "India", "INR", 15.9129, 79.7400, is_state=True),
+    "andhra": _loc("Andhra Pradesh", None, "Andhra Pradesh", "India", "INR", 15.9129, 79.7400, is_state=True),
+    "west bengal": _loc("West Bengal", None, "West Bengal", "India", "INR", 22.9868, 87.8550, is_state=True),
+    "kerala": _loc("Kerala", None, "Kerala", "India", "INR", 10.8505, 76.2711, is_state=True),
+    "bihar": _loc("Bihar", None, "Bihar", "India", "INR", 25.0961, 85.3131, is_state=True),
+    "odisha": _loc("Odisha", None, "Odisha", "India", "INR", 20.9517, 85.0985, is_state=True),
+    "orissa": _loc("Odisha", None, "Odisha", "India", "INR", 20.9517, 85.0985, is_state=True),
+    "assam": _loc("Assam", None, "Assam", "India", "INR", 26.2006, 92.9376, is_state=True),
+    "goa": _loc("Goa", None, "Goa", "India", "INR", 15.2993, 74.1240, is_state=True),
+    "himachal pradesh": _loc("Himachal Pradesh", None, "Himachal Pradesh", "India", "INR", 31.1048, 77.1734, is_state=True),
+    "himachal": _loc("Himachal Pradesh", None, "Himachal Pradesh", "India", "INR", 31.1048, 77.1734, is_state=True),
+    "uttarakhand": _loc("Uttarakhand", None, "Uttarakhand", "India", "INR", 30.0668, 79.0193, is_state=True),
+    "uttaranchal": _loc("Uttarakhand", None, "Uttarakhand", "India", "INR", 30.0668, 79.0193, is_state=True),
+    "jharkhand": _loc("Jharkhand", None, "Jharkhand", "India", "INR", 23.6102, 85.2799, is_state=True),
+    "chhattisgarh": _loc("Chhattisgarh", None, "Chhattisgarh", "India", "INR", 21.2787, 81.8661, is_state=True),
+    "jammu and kashmir": _loc("Jammu & Kashmir", None, "Jammu & Kashmir", "India", "INR", 33.7782, 76.5762, is_state=True),
+    "delhi ncr": _loc("Delhi NCR", "Delhi", "Delhi", "India", "INR", 28.6139, 77.2090, is_city=True, is_state=True),
+    "new delhi": _loc("Delhi", "Delhi", "Delhi", "India", "INR", 28.6139, 77.2090, is_city=True, is_state=True),
+
+    # --- Pan-National / Countries --------------------------------------------
+    "pan india": _loc("India", None, None, "India", "INR", 20.5937, 78.9629, is_country=True),
+    "all india": _loc("India", None, None, "India", "INR", 20.5937, 78.9629, is_country=True),
+    "across india": _loc("India", None, None, "India", "INR", 20.5937, 78.9629, is_country=True),
+    "nationwide": _loc("India", None, None, "India", "INR", 20.5937, 78.9629, is_country=True),
+    "india": _loc("India", None, None, "India", "INR", 20.5937, 78.9629, is_country=True),
+    "china": _loc("China", None, None, "China", "CNY", 35.8617, 104.1954, is_country=True),
+    "united states": _loc("United States", None, None, "United States", "USD", 37.0902, -95.7129, is_country=True),
+    "usa": _loc("United States", None, None, "United States", "USD", 37.0902, -95.7129, is_country=True),
+    "united kingdom": _loc("United Kingdom", None, None, "United Kingdom", "GBP", 55.3781, -3.4360, is_country=True),
+    "germany": _loc("Germany", None, None, "Germany", "EUR", 51.1657, 10.4515, is_country=True),
+    "united arab emirates": _loc("United Arab Emirates", None, None, "United Arab Emirates", "AED", 23.4241, 53.8478, is_country=True),
+    "uae": _loc("United Arab Emirates", None, None, "United Arab Emirates", "AED", 23.4241, 53.8478, is_country=True),
+    "vietnam": _loc("Vietnam", None, None, "Vietnam", "VND", 14.0583, 108.2772, is_country=True),
+}
+
 # Longest first, so "ho chi minh city" wins over any shorter substring.
 _CITY_KEYS = sorted(CITIES, key=len, reverse=True)
+
+# Build unified location lookup: city matches map to Location with is_city=True.
+_UNIFIED_LOCATIONS: dict[str, Location] = {}
+for _k, _city in CITIES.items():
+    _UNIFIED_LOCATIONS[_k] = _loc(
+        name=_city.name,
+        city=_city.name,
+        state=_city.region,
+        country=_city.country,
+        currency=_city.currency,
+        lat=_city.latitude,
+        lng=_city.longitude,
+        is_city=True,
+        matched_key=_k,
+    )
+for _k, _reg in REGIONS.items():
+    if _k not in _UNIFIED_LOCATIONS:
+        _UNIFIED_LOCATIONS[_k] = _reg._replace(matched_key=_k)
+
+_LOCATION_KEYS = sorted(_UNIFIED_LOCATIONS, key=len, reverse=True)
 
 
 def find_city(text: str) -> Optional[City]:
@@ -114,6 +243,18 @@ def find_city(text: str) -> Optional[City]:
     for key in _CITY_KEYS:
         if f" {key} " in lowered or f" {key}." in lowered or f" {key}," in lowered:
             return CITIES[key]
+    return None
+
+
+def find_location(text: str) -> Optional[Location]:
+    """First known city, state, territory or country mentioned anywhere in the text."""
+    # Normalize punctuation to spaces for clean token matching
+    cleaned = "".join(c if c.isalnum() or c.isspace() else " " for c in text.lower())
+    padded = f" {' '.join(cleaned.split())} "
+    for key in _LOCATION_KEYS:
+        target = key.replace("-", " ")
+        if f" {target} " in padded:
+            return _UNIFIED_LOCATIONS[key]
     return None
 
 

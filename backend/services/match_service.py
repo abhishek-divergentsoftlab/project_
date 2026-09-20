@@ -12,7 +12,7 @@ central rule -- a buyer is only ever shown sellers, and a seller only buyers.
 """
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Optional, Sequence
 
 from sqlalchemy import or_, select
@@ -29,6 +29,7 @@ from schemas.match import Counterparty, MatchCandidate, MatchResponse, MatchScor
 from core.config import settings
 from services import match_scoring, qdrant_index
 from services.embeddings import embed_one
+from services.query_extractor import is_broad_product
 from services.rfq_indexing import build_match_text
 
 # How many rows stage 1 hands to stage 2. Business rules reorder heavily, so the
@@ -209,6 +210,8 @@ def _score(
         "quantity": match_scoring.quantity_score(
             buyer.quantity_value, buyer.quantity_unit,
             seller.quantity_value, seller.quantity_unit,
+            needed_attributes=buyer.product_details or {},
+            available_attributes=seller.product_details or {},
         ) if comparable else None,
         "location": match_scoring.location_score(
             {
@@ -225,11 +228,39 @@ def _score(
         "deadline": match_scoring.deadline_score(rfq.deadline_at, candidate.deadline_at),
     }
 
-    # Same product only. The old rule also kept anything sharing a category,
-    # which is why a search for cables always returned the same GaN chargers --
-    # every Electronics listing qualified no matter what was asked for.
     keep = comparable
-    return MatchScore(total=match_scoring.blend(scores), **scores), keep
+    base_total = match_scoring.blend(scores)
+
+    # Core Product Gatekeeping:
+    # 1. Non-product dimensions (category, price, quantity, location) must never
+    # inflate a low product relevance (< RELEVANCE_FLOOR = 0.70) into a "Prime Match" (>= 0.85).
+    # Total score cannot exceed its product relevance.
+    if relevance < settings.RELEVANCE_FLOOR:
+        base_total = min(base_total, relevance)
+
+    # 2. Distinct commodity check: If requester named a specific product (e.g. "tomatos")
+    # and candidate is an entirely different commodity (e.g. "Fuji apples") with zero
+    # token overlap on product tokens, do not present it as a match unless it is a
+    # high-confidence semantic match (vector similarity >= 0.85).
+    req_prod = (rfq.product_details or {}).get("name") or ""
+    if req_prod and not is_broad_product(req_prod):
+        req_tokens = {match_scoring.singularise(w) for w in match_scoring.tokenize(req_prod)}
+        cand_name = (candidate.product_details or {}).get("name") or candidate.title or ""
+        cand_tokens = {match_scoring.singularise(w) for w in match_scoring.tokenize(cand_name)}
+        is_strong_semantic = (similarity is not None and similarity >= 0.85)
+        if req_tokens and cand_tokens and not (req_tokens & cand_tokens) and not is_strong_semantic:
+            keep = False
+
+    # Review & rating reputation adjustment for future match ranking
+    profile = candidate.user.profile if candidate.user else None
+    if profile and profile.average_rating is not None and profile.total_reviews > 0:
+        avg = float(profile.average_rating)
+        rep_delta = round((avg - 3.5) * 0.04, 4)
+        total_with_rep = min(1.0, max(0.0, round(base_total + rep_delta, 4)))
+    else:
+        total_with_rep = base_total
+
+    return MatchScore(total=total_with_rep, **scores), keep
 
 
 async def _connections_for(
@@ -263,6 +294,11 @@ def _counterparty(candidate: RFQ, connection: Optional[Connection]) -> Counterpa
     profile = candidate.user.profile if candidate.user else None
     accepted = connection is not None and connection.status is ConnectionStatus.ACCEPTED
 
+    avg_rating = float(profile.average_rating) if profile and profile.average_rating is not None else None
+    tot_reviews = profile.total_reviews if profile else 0
+    t_score = profile.trust_score if profile else 20
+    is_gst = bool(profile and profile.gst_number and getattr(profile.kyc_status, "value", str(profile.kyc_status)) == "verified")
+
     return Counterparty(
         company_name=profile.company_name if profile else None,
         city=profile.city if profile else None,
@@ -272,9 +308,13 @@ def _counterparty(candidate: RFQ, connection: Optional[Connection]) -> Counterpa
         connection_id=connection.id if connection else None,
         connection_status=connection.status if connection else None,
         contact_name=(profile.name if profile else None) if accepted else None,
-        email=(candidate.user.email if candidate.user else None) if accepted else None,
+        email=candidate.user.email if candidate.user else None,
         phone=(profile.phone if profile else None) if accepted else None,
         address=(profile.address if profile else None) if accepted else None,
+        average_rating=avg_rating,
+        total_reviews=tot_reviews,
+        trust_score=t_score,
+        gst_verified=is_gst,
     )
 
 
@@ -312,17 +352,34 @@ def _to_candidate(
         if any((candidate.location_city, candidate.location_state, candidate.location_country))
         else None
     )
-    deadline = (
-        DeadlineOut(date=candidate.deadline_at, raw=candidate.deadline_raw)
-        if candidate.deadline_at is not None
-        else None
-    )
-
     raw_distance = match_scoring.distance_km(
         {"latitude": requester.latitude, "longitude": requester.longitude},
         {"latitude": candidate.latitude, "longitude": candidate.longitude},
     )
     distance = round(raw_distance, 1) if raw_distance is not None else None
+
+    is_cross_border = bool(
+        requester.location_country
+        and candidate.location_country
+        and requester.location_country.strip().lower() != candidate.location_country.strip().lower()
+    )
+    logistics = match_scoring.estimate_logistics(distance, is_cross_border=is_cross_border)
+
+    est_delivery = None
+    if candidate.deadline_at is not None and logistics:
+        transit_days = logistics.get("transit_days_max", 0)
+        est_delivery = candidate.deadline_at + timedelta(days=transit_days)
+
+    deadline = (
+        DeadlineOut(
+            date=candidate.deadline_at,
+            raw=candidate.deadline_raw,
+            excludes_transport=True,
+            estimated_delivery_at=est_delivery,
+        )
+        if candidate.deadline_at is not None
+        else None
+    )
 
     return MatchCandidate(
         rfq_id=candidate.id,
@@ -338,9 +395,11 @@ def _to_candidate(
         product_details=candidate.product_details,
         search_tags=candidate.search_tags,
         distance_km=distance,
+        logistics=logistics,
         counterparty=_counterparty(candidate, connection),
         score=score,
     )
+
 
 
 async def match_for_rfq(

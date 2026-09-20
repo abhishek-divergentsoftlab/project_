@@ -35,6 +35,8 @@ def _to_requirements_out(requirements: Requirements) -> RequirementsOut:
         quantity=quantity,
         price=price,
         city=requirements.city,
+        state=requirements.state,
+        country=requirements.country,
         deadline_days=requirements.deadline_days,
         skipped=requirements.skipped,
     )
@@ -59,6 +61,10 @@ async def direct_search(
         raise HTTPException(
             status.HTTP_404_NOT_FOUND, "conversation not found"
         ) from exc
+    except direct_search_service.ModerationSessionBlockedError as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)
+        ) from exc
 
     requirements = outcome.requirements
     missing = [
@@ -76,4 +82,7 @@ async def direct_search(
         results=outcome.results,
         total=outcome.total,
         search_id=outcome.search_id,
+        blocked=outcome.blocked,
+        block_reason=outcome.block_reason,
+        block_category=outcome.block_category,
     )

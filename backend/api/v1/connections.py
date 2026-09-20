@@ -3,7 +3,7 @@
 import uuid
 from typing import Annotated, Optional
 
-from fastapi import APIRouter, Query, status
+from fastapi import APIRouter, File, Form, Query, UploadFile, status
 
 from api.deps import CurrentUser, DbSession
 from models.enums import ConnectionStatus
@@ -104,3 +104,30 @@ async def send_message(
         db, connection_id, current_user.id, payload
     )
     return ConnectionMessageOut.model_validate(message)
+
+
+@router.post(
+    "/{connection_id}/messages/live-capture",
+    response_model=ConnectionMessageOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def send_live_capture(
+    connection_id: uuid.UUID,
+    image: UploadFile = File(...),
+    caption: Optional[str] = Form(None),
+    current_user: CurrentUser = None,
+    db: DbSession = None,
+) -> ConnectionMessageOut:
+    """Capture photo directly from camera/webcam and post to deal room chat."""
+    file_bytes = await image.read()
+    content_type = image.content_type or "image/jpeg"
+    message = await connection_service.send_live_capture_message(
+        db=db,
+        connection_id=connection_id,
+        sender_id=current_user.id,
+        file_bytes=file_bytes,
+        content_type=content_type,
+        caption=caption,
+    )
+    return ConnectionMessageOut.model_validate(message)
+
