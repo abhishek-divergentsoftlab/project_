@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from models.enums import EmbeddingStatus, RFQRole, RFQStatus
 from schemas.common import Deadline, DeadlineOut, Location, Money, Quantity
+from schemas.rfq_structure import RFQStructure
 
 
 class RFQCreate(BaseModel):

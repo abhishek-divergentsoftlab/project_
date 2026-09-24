@@ -78,6 +78,7 @@ cp .env.example .env          # then set SECRET_KEY
 .venv/bin/uvicorn app:app --reload --port 8011
 # or: .venv/bin/python app.py
 ```
+kill -9 $(lsof -t -i:8011)
 
 > Port **8011**, not the usual 8000: this machine already runs another service
 > there. If yours does not, use 8000 and set `VITE_PROXY_TARGET` in

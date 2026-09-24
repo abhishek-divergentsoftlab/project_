@@ -84,6 +84,9 @@ class Message(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         nullable=False,
     )
     content: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    msg_metadata: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
 
     conversation: Mapped["Conversation"] = relationship(back_populates="messages")
     events: Mapped[list["MessageEvent"]] = relationship(

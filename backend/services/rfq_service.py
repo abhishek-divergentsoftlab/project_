@@ -191,20 +191,23 @@ async def update_rfq(db: AsyncSession, rfq: RFQ, payload: RFQUpdate) -> RFQ:
     # exclude_unset distinguishes "set this to null" from "do not touch".
     provided = payload.model_dump(exclude_unset=True)
 
-    # AI Safety & Prohibited Items Moderation on update
-    new_title = provided.get("title", rfq.title)
-    new_desc = provided.get("description", rfq.description)
-    new_cat = provided.get("category", rfq.category)
-    mod_check = await AIContentModerator.audit_and_verify(
-        db,
-        user_id=rfq.user_id,
-        action="rfq_update",
-        title=new_title,
-        description=new_desc,
-        category=new_cat,
-    )
-    if not mod_check.is_safe:
-        raise RFQError(mod_check.reason or "Listing contains prohibited items")
+    # AI Safety & Prohibited Items Moderation on update.
+    # Closing a listing takes it off the marketplace; closing must never be blocked by moderation.
+    is_closing = payload.status == RFQStatus.CLOSED
+    if not is_closing and any(k in provided for k in ("title", "description", "category", "product_details")):
+        new_title = provided.get("title", rfq.title)
+        new_desc = provided.get("description", rfq.description)
+        new_cat = provided.get("category", rfq.category)
+        mod_check = await AIContentModerator.audit_and_verify(
+            db,
+            user_id=rfq.user_id,
+            action="rfq_update",
+            title=new_title,
+            description=new_desc,
+            category=new_cat,
+        )
+        if not mod_check.is_safe:
+            raise RFQError(mod_check.reason or "Listing contains prohibited items")
 
     for field in ("category", "title", "description"):
         if field in provided:
@@ -228,7 +231,10 @@ async def update_rfq(db: AsyncSession, rfq: RFQ, payload: RFQUpdate) -> RFQ:
     await db.commit()
     await db.refresh(rfq)
 
-    await index_rfq(db, rfq)
+    if rfq.status == RFQStatus.CLOSED:
+        await qdrant_index.delete([rfq.id])
+    else:
+        await index_rfq(db, rfq)
     return rfq
 
 

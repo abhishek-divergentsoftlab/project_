@@ -9,7 +9,7 @@ export function ProtectedRoute({ children }: { children: ReactNode }) {
 
   // Without this gate the redirect would fire before the stored token has
   // been validated, bouncing a signed-in user to the login page on reload.
-  if (loading) return <div className="centered muted">Loading...</div>;
+  if (loading) return <div className="centered muted">Loading…</div>;
 
   if (!user) {
     // The whole location, not just the pathname: a deep link with a query

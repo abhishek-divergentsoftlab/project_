@@ -34,5 +34,11 @@ async def get_media_file(subpath: str):
         media_type = "image/png"
     elif ext == ".webp":
         media_type = "image/webp"
+    elif ext == ".pdf":
+        media_type = "application/pdf"
 
-    return FileResponse(target_path, media_type=media_type)
+    return FileResponse(
+        target_path,
+        media_type=media_type,
+        headers={"X-Content-Type-Options": "nosniff"},
+    )

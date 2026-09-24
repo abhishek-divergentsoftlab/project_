@@ -60,6 +60,7 @@ class EmbeddingStatus(str, enum.Enum):
 class ConversationType(str, enum.Enum):
     ONBOARDING = "onboarding"
     DIRECT_SEARCH = "direct_search"
+    BUSINESS_CHAT = "business_chat"
 
 
 class MessageRole(str, enum.Enum):
@@ -106,4 +107,22 @@ class CertificationStatus(str, enum.Enum):
     PENDING = "pending"
     VERIFIED = "verified"
     REJECTED = "rejected"
+
+
+class ShippingMode(str, enum.Enum):
+    ROAD = "road"
+    OCEAN = "ocean"
+    AIR = "air"
+    COURIER = "courier"
+
+
+class ShipmentStatus(str, enum.Enum):
+    BOOKED = "booked"
+    DISPATCHED = "dispatched"
+    IN_TRANSIT = "in_transit"
+    CUSTOMS_HOLD = "customs_hold"
+    CUSTOMS_CLEARED = "customs_cleared"
+    OUT_FOR_DELIVERY = "out_for_delivery"
+    DELIVERED = "delivered"
+    EXCEPTION = "exception"
 

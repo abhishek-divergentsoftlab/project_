@@ -190,34 +190,6 @@ export interface MatchResponse {
   offset: number;
 }
 
-export interface SearchRequirements {
-  role: RFQRole;
-  product: string | null;
-  category: string | null;
-  attributes: Record<string, unknown>;
-  quantity: Quantity | null;
-  price: Money | null;
-  city: string | null;
-  state?: string | null;
-  country?: string | null;
-  deadline_days: number | null;
-  skipped: string[];
-}
-
-export interface DirectSearchResponse {
-  conversation_id: string;
-  reply: string;
-  requirements: SearchRequirements;
-  pending_question: string | null;
-  missing: string[];
-  results: MatchCandidate[];
-  total: number;
-  search_id: string | null;
-  blocked?: boolean;
-  block_reason?: string | null;
-  block_category?: string | null;
-}
-
 export type ConnectionStatus = "pending" | "accepted" | "rejected";
 
 export interface Connection {
@@ -353,6 +325,12 @@ export interface CertificateCreatePayload {
   document_url?: string;
 }
 
+export interface CertificateUploadResponse {
+  document_url: string;
+  filename: string;
+  file_size: number;
+}
+
 export interface KYCVerificationPayload {
   gst_number: string;
   legal_business_name: string;
@@ -377,5 +355,384 @@ export interface ModerationCheckResult {
   category?: string | null;
   reason?: string | null;
   flagged_terms: string[];
+}
+
+export type DealIssueCategory =
+  | "quality"
+  | "delivery"
+  | "packaging"
+  | "payment"
+  | "specs"
+  | "documentation"
+  | "other";
+
+export type DealIssueSeverity = "low" | "medium" | "high";
+export type DealIssueStatus = "open" | "in_discussion" | "resolved";
+
+export interface DealIssue {
+  id: string;
+  connection_id: string;
+  title: string;
+  category: DealIssueCategory;
+  severity: DealIssueSeverity;
+  description: string;
+  suggested_resolution?: string;
+  status: DealIssueStatus;
+  reported_by: string;
+  reporter_name: string;
+  created_at: string;
+  resolved_at?: string;
+  resolution_notes?: string;
+}
+
+export interface AgentInfo {
+  id: string;
+  name: string;
+  icon: string;
+  description: string;
+  short_description: string;
+  suggested_prompts: Array<{ label: string; prompt: string }>;
+}
+
+export interface DashboardStats {
+  rfqs: {
+    total: number;
+    active: number;
+    draft: number;
+    closed: number;
+    expired: number;
+  };
+  connections: {
+    total: number;
+    pending: number;
+    accepted: number;
+    rejected: number;
+    pending_received: number;
+  };
+  quotations: {
+    total: number;
+    pending: number;
+    accepted: number;
+    in_transit: number;
+    completed: number;
+  };
+  messages_sent: number;
+  profile_completeness: number;
+  trust_score: number;
+  average_rating: number | null;
+  total_reviews: number;
+}
+
+export interface ActivityItem {
+  id: string;
+  type: "connection" | "quotation" | "message";
+  icon: string;
+  title: string;
+  body: string;
+  link: string;
+  timestamp: string;
+}
+
+export interface NotificationItem {
+  id: string;
+  user_id: string;
+  type: string;
+  title: string;
+  body: string | null;
+  link: string | null;
+  is_read: boolean;
+  created_at: string;
+}
+
+export interface NotificationList {
+  items: NotificationItem[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface CatalogCounterparty {
+  company_name: string | null;
+  contact_name: string | null;
+  city: string | null;
+  country: string | null;
+  kyc_status: KYCStatus;
+  trust_score: number;
+  verified_certs: string[];
+  connection_id: string | null;
+  connection_status: "pending" | "accepted" | "rejected" | null;
+  connection_direction: "sent" | "received" | null;
+}
+
+export interface CatalogItem {
+  id: string;
+  user_id: string;
+  role: RFQRole;
+  category: string;
+  title: string;
+  description: string | null;
+  quantity: Quantity | null;
+  minimum_order: Quantity | null;
+  price_target: Money | null;
+  location: RFQLocation | null;
+  deadline: DeadlineOut | null;
+  product_details: ProductDetails;
+  search_tags: string[];
+  created_at: string;
+  counterparty: CatalogCounterparty;
+  distance_km: number | null;
+}
+
+export interface CatalogListResponse {
+  items: CatalogItem[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface CategoryCount {
+  category: string;
+  total_count: number;
+  seller_count: number;
+  buyer_count: number;
+}
+
+export interface CatalogFilterParams {
+  q?: string;
+  role?: RFQRole;
+  category?: string;
+  city?: string;
+  country?: string;
+  min_price?: number;
+  max_price?: number;
+  currency?: string;
+  verified_only?: boolean;
+  sort_by?: "newest" | "price_asc" | "price_desc" | "trust_desc";
+  limit?: number;
+  offset?: number;
+}
+
+export interface LanguageInfo {
+  code: string;
+  name: string;
+  native_name: string;
+  flag: string;
+}
+
+export interface TranslationResponse {
+  original_text: string;
+  translated_text: string;
+  source_language: string;
+  target_language: string;
+  cached: boolean;
+}
+
+export interface BatchTranslationResponse {
+  translations: TranslationResponse[];
+}
+
+export interface EscrowMilestone {
+  id: string;
+  escrow_account_id: string;
+  title: string;
+  percentage: number | string;
+  amount: number | string;
+  order_index: number;
+  status: "pending" | "funded" | "release_requested" | "released" | "disputed" | "refunded";
+  released_at?: string | null;
+  release_note?: string | null;
+  created_at: string;
+}
+
+export interface DealDispute {
+  id: string;
+  connection_id: string;
+  escrow_account_id?: string | null;
+  raised_by_id: string;
+  title: string;
+  category: string;
+  reason: string;
+  severity: "low" | "medium" | "high" | "critical";
+  status: "open" | "under_review" | "resolved_release_funds" | "resolved_refund_buyer" | "resolved_mutual_settlement" | "cancelled" | string;
+  suggested_resolution?: string | null;
+  resolution_notes?: string | null;
+  resolved_at?: string | null;
+  created_at: string;
+}
+
+export interface EscrowAccount {
+  id: string;
+  connection_id: string;
+  quotation_id: string;
+  buyer_id: string;
+  seller_id: string;
+  currency: string;
+  total_amount: number | string;
+  funded_amount: number | string;
+  released_amount: number | string;
+  refunded_amount: number | string;
+  status: "pending_deposit" | "funded" | "partially_released" | "completed" | "disputed" | "refunded";
+  milestones: EscrowMilestone[];
+  disputes: DealDispute[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface EscrowDepositPayload {
+  payment_method?: string;
+  notes?: string;
+}
+
+export interface MilestoneReleaseRequestPayload {
+  proof_note?: string;
+}
+
+export interface MilestoneReleaseApprovePayload {
+  note?: string;
+}
+
+export interface DealDisputeCreatePayload {
+  title: string;
+  category?: string;
+  reason: string;
+  severity?: string;
+  suggested_resolution?: string;
+}
+
+export interface DealDisputeResolvePayload {
+  resolution: "release_funds" | "refund_buyer" | "mutual_settlement";
+  resolution_notes: string;
+}
+
+// ==========================================
+// Logistics, Freight & Shipment Tracking
+// ==========================================
+
+export type ShippingMode = "road" | "ocean" | "air" | "courier";
+
+export type ShipmentStatus =
+  | "booked"
+  | "dispatched"
+  | "in_transit"
+  | "customs_hold"
+  | "customs_cleared"
+  | "out_for_delivery"
+  | "delivered"
+  | "exception";
+
+export interface TrackingEvent {
+  status: string;
+  location?: string;
+  timestamp: string;
+  note?: string;
+}
+
+export interface Shipment {
+  id: string;
+  connection_id: string;
+  quotation_id?: string | null;
+  sender_id: string;
+  receiver_id: string;
+  carrier_name: string;
+  tracking_number: string;
+  tracking_url?: string | null;
+  shipping_mode: ShippingMode;
+  origin_city: string;
+  origin_country: string;
+  destination_city: string;
+  destination_country: string;
+  incoterm: string;
+  status: ShipmentStatus;
+  gross_weight_kg?: number | null;
+  chargeable_weight_kg?: number | null;
+  cbm?: number | null;
+  packages_count?: number | null;
+  estimated_delivery?: string | null;
+  actual_dispatch_date?: string | null;
+  delivered_at?: string | null;
+  shipping_cost?: number | null;
+  currency: string;
+  customs_declaration_no?: string | null;
+  notes?: string | null;
+  tracking_events: TrackingEvent[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FreightRateOption {
+  mode: ShippingMode;
+  mode_label: string;
+  transit_days_min: number;
+  transit_days_max: number;
+  base_freight_usd: number;
+  fuel_surcharge_usd: number;
+  documentation_fee_usd: number;
+  customs_clearance_usd: number;
+  total_estimated_usd: number;
+  chargeable_weight_kg: number;
+  basis: string;
+  recommended: boolean;
+}
+
+export interface IncotermCostBreakdown {
+  incoterm: string;
+  full_name: string;
+  seller_responsibility: string;
+  buyer_responsibility: string;
+  risk_transfer_point: string;
+  estimated_seller_logistics_usd: number;
+  estimated_buyer_logistics_usd: number;
+}
+
+export interface FreightEstimateRequest {
+  origin_country: string;
+  origin_city?: string;
+  destination_country: string;
+  destination_city?: string;
+  gross_weight_kg: number;
+  length_cm?: number;
+  width_cm?: number;
+  height_cm?: number;
+  cbm?: number;
+  incoterm?: string;
+}
+
+export interface FreightEstimateResponse {
+  origin: string;
+  destination: string;
+  gross_weight_kg: number;
+  cbm: number;
+  rates: FreightRateOption[];
+  incoterm_breakdown: IncotermCostBreakdown;
+}
+
+export interface ShipmentCreatePayload {
+  quotation_id?: string;
+  carrier_name: string;
+  tracking_number: string;
+  tracking_url?: string;
+  shipping_mode: ShippingMode;
+  origin_city: string;
+  origin_country: string;
+  destination_city: string;
+  destination_country: string;
+  incoterm?: string;
+  gross_weight_kg?: number;
+  length_cm?: number;
+  width_cm?: number;
+  height_cm?: number;
+  cbm?: number;
+  packages_count?: number;
+  estimated_delivery?: string;
+  shipping_cost?: number;
+  customs_declaration_no?: string;
+  notes?: string;
+  trigger_escrow_milestone?: boolean;
+}
+
+export interface ShipmentStatusUpdatePayload {
+  status: ShipmentStatus;
+  location?: string;
+  note?: string;
 }
 

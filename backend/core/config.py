@@ -28,8 +28,9 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://localhost:6379/0"
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "qwen3-coder-next:q4_K_M"
-    EMBEDDING_MODEL: str = "qwen3-embedding:8b"
-    EMBEDDING_TIMEOUT_SECONDS: int = 60*60*60
+    OLLAMA_NUM_CTX: int = 65536
+    EMBEDDING_MODEL: str = "nomic-embed-text"
+    EMBEDDING_TIMEOUT_SECONDS: int = 30
     QDRANT_COLLECTION: str = "marketplace_rfq"
     # Cosine similarity below this is a different product, not a weak match.
     # Measured against the seed corpus with product-only embeddings: the right
@@ -41,10 +42,18 @@ class Settings(BaseSettings):
     # the closest things rather than an empty table.
     RELEVANCE_FALLBACK_FLOOR: float = 0.60
     OLLAMA_TIMEOUT_SECONDS: int = 45
-    # Ample time for local LLM agent reasoning and tool emission
-    LLM_TIMEOUT_SECONDS: int = 45
     # Use the LLM and prompt-based agent for conversational search
     DIRECT_SEARCH_LLM: bool = True
+    # AI Conversational Business Assistant (Ollama)
+    AI_CHAT_MODEL: str = OLLAMA_MODEL
+    AI_CHAT_TIMEOUT_SECONDS: int = 120
+    AI_CHAT_NUM_CTX: int = 65536
+
+    # Image safety moderation via vision model
+    IMAGE_MODERATION_MODEL: str = "qwen3-vl:8b"
+    IMAGE_MODERATION_TIMEOUT_SECONDS: int = 45
+    IMAGE_MODERATION_ENABLED: bool = True
+    IMAGE_MODERATION_FAIL_CLOSED: bool = True
 
     HOST: str = "127.0.0.1"
     PORT: int = 8011

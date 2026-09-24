@@ -15,7 +15,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, Field
 
 from models.enums import ConnectionStatus, RFQRole
 from schemas.common import DeadlineOut, Location, Money, Quantity
@@ -117,58 +117,3 @@ class MatchResponse(BaseModel):
     total: int = Field(description="Total viable candidates, not just this page.")
     limit: int
     offset: int
-
-
-class RequirementsOut(BaseModel):
-    """What the assistant currently understands. Rendered as chips in the UI."""
-
-    role: RFQRole
-    product: Optional[str] = None
-    category: Optional[str] = None
-    attributes: dict[str, Any] = Field(default_factory=dict)
-
-    quantity: Optional[Quantity] = None
-    price: Optional[Money] = None
-    city: Optional[str] = None
-    state: Optional[str] = None
-    country: Optional[str] = None
-    deadline_days: Optional[int] = None
-
-    skipped: list[str] = Field(default_factory=list)
-
-
-class DirectSearchRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    # strip_whitespace runs before the length check, so a message of nothing but
-    # spaces is rejected rather than handed to the parser as an empty query.
-    message: str = Field(min_length=1, max_length=2000)
-    # Omit to start a new conversation; pass it back to continue one.
-    conversation_id: Optional[uuid.UUID] = None
-
-    @field_validator("message")
-    @classmethod
-    def _not_only_whitespace(cls, value: str) -> str:
-        stripped = value.strip()
-        if not stripped:
-            raise ValueError("message cannot be empty")
-        return stripped
-
-
-class DirectSearchResponse(BaseModel):
-    conversation_id: uuid.UUID
-    reply: str
-    requirements: RequirementsOut
-
-    # The field the assistant just asked about, if any.
-    pending_question: Optional[str] = None
-    missing: list[str] = Field(default_factory=list)
-
-    results: list[MatchCandidate] = Field(default_factory=list)
-    total: int = 0
-    search_id: Optional[uuid.UUID] = None
-
-    # AI Content Moderation & Policy Guardrails
-    blocked: bool = False
-    block_reason: Optional[str] = None
-    block_category: Optional[str] = None

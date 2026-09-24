@@ -173,7 +173,7 @@ _FILLER = frozenset(
     prefer preferably instead rather change switch convert set update make it them one give requirement
     almost exactly total overall
     actually actully actualy basically literally sorry sry apologies excuse
-    ok okay okey then well alright fine search check yes yeah yep sure k definitely absolutely
+    ok okay okey then well alright fine search check rfq yes yeah yep sure k definitely absolutely
     dont don't not didnt didn't wont won't never no nope
     cancel remove drop delete forgetting forget
     just simple plain basic standard regular ordinary

@@ -58,7 +58,10 @@ def _call_ollama(message: str) -> Optional[dict[str, Any]]:
             "format": _SCHEMA,
             "stream": False,
             "keep_alive": -1,
-            "options": {"temperature": 0},
+            "options": {
+                "temperature": 0,
+                "num_ctx": settings.OLLAMA_NUM_CTX,
+            },
         }
     ).encode()
 

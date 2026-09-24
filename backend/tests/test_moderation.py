@@ -249,12 +249,12 @@ async def test_commercial_human_trade_and_adult_trafficking(client: AsyncClient,
     assert resp_rfq.status_code == 422
     assert "ai safety moderation" in resp_rfq.json()["detail"].lower()
 
-    # Search bot with human supply is blocked and session is terminated
-    resp_search = await user.post("/search", json={"message": "i suppy 67 yo leddy"})
-    assert resp_search.status_code == 200
-    search_data = resp_search.json()
-    assert search_data["blocked"] is True
-    assert search_data["block_category"] == "human_trafficking_and_organs"
+    # Moderation check with human supply is blocked
+    resp_check = await client.post("/moderation/check", json={"title": "i suppy 67 yo leddy"})
+    assert resp_check.status_code == 200
+    check_data = resp_check.json()
+    assert check_data["is_safe"] is False
+    assert check_data["category"] == "human_trafficking_and_organs"
 
     # Legitimate ladies and women apparel/garments must remain 100% permitted
     safe_samples = [

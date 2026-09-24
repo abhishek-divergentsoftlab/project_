@@ -3,7 +3,9 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 
 import { errorMessage } from "@/api/client";
 import { moderation as moderationApi, rfqs as rfqApi } from "@/api/endpoints";
+import { IconAlert, IconChevronLeft, IconClose, IconPlus } from "@/components/icons";
 import { useAuth } from "@/context/useAuth";
+import { useFeedback } from "@/context/useFeedback";
 import type { ProductDetails, RFQ, RFQCreatePayload, RFQRole } from "@/types";
 import { normalizeCurrency, CURRENCY_NAMES } from "@/utils/currency";
 
@@ -77,6 +79,7 @@ function buildProductDetails(name: string, attributes: Attribute[]): ProductDeta
 
 export function RFQNew() {
   const { user } = useAuth();
+  const { toast } = useFeedback();
   const navigate = useNavigate();
   // Present only on /rfqs/:rfqId/edit.
   const { rfqId } = useParams<{ rfqId: string }>();
@@ -259,8 +262,10 @@ export function RFQNew() {
         const { role: _role, ...patch } = payload;
         void _role;
         await rfqApi.update(rfqId, patch);
+        toast("Changes saved.");
       } else {
         await rfqApi.create(payload);
+        toast(payload.status === "active" ? "RFQ published." : "Draft saved.");
       }
       navigate("/rfqs", { replace: true });
     } catch (err) {
@@ -270,298 +275,349 @@ export function RFQNew() {
     }
   }
 
-  if (loading) return <p className="muted">Loading&hellip;</p>;
+  if (loading) {
+    return (
+      <div className="loading-state">
+        <span className="spinner" />
+        Loading RFQ…
+      </div>
+    );
+  }
+
+  const currencyName = CURRENCY_NAMES[form.priceCurrency];
 
   return (
-    <section>
-      <p className="muted">
-        <Link to="/rfqs">&larr; My RFQs</Link>
-      </p>
+    <section className="page page-narrow">
+      <header>
+        <Link to="/rfqs" className="back-link">
+          <IconChevronLeft size={16} />
+          My RFQs
+        </Link>
+        <h1>{editing ? "Edit RFQ" : "New RFQ"}</h1>
+        <p className="page-subtitle">
+          {editing
+            ? "Saving updates the listing and refreshes its matches."
+            : "Structured details get you better matches. Only the title and category are required."}
+        </p>
+      </header>
 
-      <h1>{editing ? "Edit RFQ" : "New RFQ"}</h1>
-      <p className="muted">
-        Structured fields drive matching. Anything product-specific goes in attributes.
-        {editing ? " Saving re-indexes the listing." : ""}
-      </p>
-
-      <form className="card wide" onSubmit={handleSubmit}>
+      <form className="panel form-panel" onSubmit={handleSubmit}>
         {error && <p className="error">{error}</p>}
 
-        <label htmlFor="role">I am</label>
-        <select
-          id="role"
-          value={form.role}
-          disabled={!canChooseRole || editing}
-          onChange={(e) => update("role", e.target.value as RFQRole)}
-        >
-          <option value="buyer">Buying</option>
-          <option value="seller">Selling</option>
-        </select>
-        {editing ? (
-          <small className="muted">
-            A listing cannot change sides &mdash; create a new one instead.
-          </small>
-        ) : (
-          !canChooseRole && (
-            <small className="muted">Fixed by your account role ({user?.role}).</small>
-          )
-        )}
+        <div className="form-section">
+          <div className="form-section-head">
+            <h2>What you need</h2>
+          </div>
 
-        {moderationWarning && (
-          <div className="moderation-alert-banner">
-            <span className="warning-icon">⚠️</span>
-            <div>
-              <strong>AI Safety Alert &mdash; Prohibited Item Detected</strong>
-              <p>{moderationWarning}</p>
+          <div className="field">
+            <span className="field-label" id="role-label">
+              I am
+            </span>
+            <div className="tabs segmented" role="radiogroup" aria-labelledby="role-label">
+              {(["buyer", "seller"] as RFQRole[]).map((value) => (
+                <button
+                  key={value}
+                  type="button"
+                  role="radio"
+                  aria-checked={form.role === value}
+                  className={form.role === value ? "tab active" : "tab"}
+                  disabled={(!canChooseRole || editing) && form.role !== value}
+                  onClick={() => update("role", value)}
+                >
+                  {value === "buyer" ? "Buying" : "Selling"}
+                </button>
+              ))}
             </div>
+            {editing ? (
+              <small>A listing can't change sides — create a new one instead.</small>
+            ) : (
+              !canChooseRole && <small>Set by your account type ({user?.role}).</small>
+            )}
           </div>
-        )}
 
-        <label htmlFor="title">Title</label>
-        <input
-          id="title"
-          required
-          placeholder="Need 6000 red Type-C cables"
-          value={form.title}
-          onChange={(e) => update("title", e.target.value)}
-        />
-
-        <label htmlFor="category">Category</label>
-        <input
-          id="category"
-          required
-          placeholder="Electronics"
-          value={form.category}
-          onChange={(e) => update("category", e.target.value)}
-        />
-
-        <label htmlFor="productName">Product name</label>
-        <input
-          id="productName"
-          placeholder="USB cable"
-          value={form.productName}
-          onChange={(e) => update("productName", e.target.value)}
-        />
-
-        <div className="row">
-          <div>
-            <label htmlFor="quantityValue">Quantity</label>
+          <div className="field">
+            <label htmlFor="title">Title</label>
             <input
-              id="quantityValue"
-              type="number"
-              min="0"
-              step="any"
-              value={form.quantityValue}
-              onChange={(e) => update("quantityValue", e.target.value)}
+              id="title"
+              required
+              placeholder="e.g. Need 6,000 red USB-C cables"
+              value={form.title}
+              onChange={(e) => update("title", e.target.value)}
             />
           </div>
-          <div>
-            <label htmlFor="quantityUnit">Unit</label>
-            <input
-              id="quantityUnit"
-              placeholder="pcs, kg, tonnes"
-              value={form.quantityUnit}
-              onChange={(e) => update("quantityUnit", e.target.value)}
-            />
-          </div>
-          <div>
-            <label htmlFor="priceAmount">Target price</label>
-            <input
-              id="priceAmount"
-              type="number"
-              min="0"
-              step="any"
-              value={form.priceAmount}
-              onChange={(e) => update("priceAmount", e.target.value)}
-            />
-          </div>
-          <div>
-            <label htmlFor="priceCurrency">
-              Currency
-              {CURRENCY_NAMES[form.priceCurrency] && (
-                <span className="excl-transport-tag" style={{ background: "rgba(16, 185, 129, 0.1)", color: "#10b981" }}>
-                  {CURRENCY_NAMES[form.priceCurrency]}
-                </span>
-              )}
-            </label>
-            <input
-              id="priceCurrency"
-              placeholder="e.g. INR, USD, india ruppes, kr"
-              value={form.priceCurrency}
-              onChange={(e) => {
-                const val = e.target.value;
-                const norm = normalizeCurrency(val);
-                if (norm && norm !== val.toUpperCase() && val.length > 2) {
-                  update("priceCurrency", norm);
-                } else {
-                  update("priceCurrency", val.toUpperCase());
-                }
-              }}
-              onBlur={() => {
-                if (form.priceCurrency) {
-                  update("priceCurrency", normalizeCurrency(form.priceCurrency));
-                }
-              }}
-            />
-            {/* <small className="muted" style={{ display: "block", marginTop: "0.2rem" }}>
-              Accepts codes or names (e.g. &ldquo;india ruppes&rdquo; &rarr; INR, &ldquo;us dollar&rdquo; &rarr; USD, &ldquo;kr&rdquo; &rarr; SEK).
-            </small> */}
+
+          {moderationWarning && (
+            <div className="alert alert-warning" role="alert">
+              <IconAlert size={16} />
+              <div>
+                <strong>This listing may break marketplace rules</strong>
+                <p>{moderationWarning}</p>
+              </div>
+            </div>
+          )}
+
+          <div className="field-grid">
+            <div className="field">
+              <label htmlFor="category">Category</label>
+              <input
+                id="category"
+                required
+                placeholder="e.g. Electronics"
+                value={form.category}
+                onChange={(e) => update("category", e.target.value)}
+              />
+            </div>
+            <div className="field">
+              <label htmlFor="productName">
+                Product name <span className="optional">Optional</span>
+              </label>
+              <input
+                id="productName"
+                placeholder="e.g. USB cable"
+                value={form.productName}
+                onChange={(e) => update("productName", e.target.value)}
+              />
+            </div>
           </div>
         </div>
 
-        {form.role === "seller" && (
-          <div className="row">
-            <div>
-              <label htmlFor="minOrderValue">Minimum Order</label>
+        <div className="form-section">
+          <div className="form-section-head">
+            <h2>Quantity &amp; price</h2>
+          </div>
+
+          <div className="field-grid field-grid-4">
+            <div className="field">
+              <label htmlFor="quantityValue">Quantity</label>
               <input
-                id="minOrderValue"
+                id="quantityValue"
                 type="number"
                 min="0"
                 step="any"
-                value={form.minOrderValue}
-                onChange={(e) => update("minOrderValue", e.target.value)}
+                inputMode="decimal"
+                value={form.quantityValue}
+                onChange={(e) => update("quantityValue", e.target.value)}
               />
             </div>
-            <div>
-              <label htmlFor="minOrderUnit">Minimum Order Unit</label>
+            <div className="field">
+              <label htmlFor="quantityUnit">Unit</label>
               <input
-                id="minOrderUnit"
+                id="quantityUnit"
                 placeholder="pcs, kg, tonnes"
-                value={form.minOrderUnit}
-                onChange={(e) => update("minOrderUnit", e.target.value)}
+                value={form.quantityUnit}
+                onChange={(e) => update("quantityUnit", e.target.value)}
               />
             </div>
+            <div className="field">
+              <label htmlFor="priceAmount">Target price</label>
+              <input
+                id="priceAmount"
+                type="number"
+                min="0"
+                step="any"
+                inputMode="decimal"
+                placeholder="Per unit"
+                value={form.priceAmount}
+                onChange={(e) => update("priceAmount", e.target.value)}
+              />
+            </div>
+            <div className="field">
+              <label htmlFor="priceCurrency">Currency</label>
+              <input
+                id="priceCurrency"
+                placeholder="INR, USD…"
+                value={form.priceCurrency}
+                aria-describedby={currencyName ? "currency-hint" : undefined}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  const norm = normalizeCurrency(val);
+                  if (norm && norm !== val.toUpperCase() && val.length > 2) {
+                    update("priceCurrency", norm);
+                  } else {
+                    update("priceCurrency", val.toUpperCase());
+                  }
+                }}
+                onBlur={() => {
+                  if (form.priceCurrency) {
+                    update("priceCurrency", normalizeCurrency(form.priceCurrency));
+                  }
+                }}
+              />
+              {currencyName && <small id="currency-hint">{currencyName}</small>}
+            </div>
           </div>
-        )}
 
-        <div className="row">
-          <div>
-            <label htmlFor="city">City</label>
-            <input
-              id="city"
-              placeholder="Indore"
-              value={form.city}
-              onChange={(e) => update("city", e.target.value)}
-            />
+          {form.role === "seller" && (
+            <div className="field-grid field-grid-4">
+              <div className="field">
+                <label htmlFor="minOrderValue">Minimum order</label>
+                <input
+                  id="minOrderValue"
+                  type="number"
+                  min="0"
+                  step="any"
+                  inputMode="decimal"
+                  value={form.minOrderValue}
+                  onChange={(e) => update("minOrderValue", e.target.value)}
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="minOrderUnit">Unit</label>
+                <input
+                  id="minOrderUnit"
+                  placeholder="pcs, kg, tonnes"
+                  value={form.minOrderUnit}
+                  onChange={(e) => update("minOrderUnit", e.target.value)}
+                />
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="form-section">
+          <div className="form-section-head">
+            <h2>Delivery</h2>
+            <p>A recognised city fills in the state and country, so matches can be ranked by real distance.</p>
           </div>
-          <div>
-            <label htmlFor="state">State</label>
-            <input id="state" value={form.state} onChange={(e) => update("state", e.target.value)} />
+
+          <div className="field-grid">
+            <div className="field">
+              <label htmlFor="city">City</label>
+              <input
+                id="city"
+                placeholder="e.g. Indore"
+                value={form.city}
+                onChange={(e) => update("city", e.target.value)}
+              />
+            </div>
+            <div className="field">
+              <label htmlFor="state">State</label>
+              <input id="state" value={form.state} onChange={(e) => update("state", e.target.value)} />
+            </div>
+            <div className="field">
+              <label htmlFor="country">Country</label>
+              <input id="country" value={form.country} onChange={(e) => update("country", e.target.value)} />
+            </div>
           </div>
-          <div>
-            <label htmlFor="country">Country</label>
-            <input id="country" value={form.country} onChange={(e) => update("country", e.target.value)} />
-          </div>
-          <div>
-            <label htmlFor="deadlineDays">
-              Dispatch Deadline (days)
-              <span className="excl-transport-tag" title="Excludes transport/shipping days">Excl. Transport</span>
-            </label>
+
+          <div className="field field-narrow">
+            <label htmlFor="deadlineDays">Dispatch within (days)</label>
             <input
               id="deadlineDays"
               type="number"
               min="0"
+              inputMode="numeric"
               placeholder={
                 editing && existing?.deadline?.date
-                  ? new Date(existing.deadline.date).toLocaleDateString()
+                  ? `Currently ${new Date(existing.deadline.date).toLocaleDateString()}`
                   : undefined
               }
               value={form.deadlineDays}
               onChange={(e) => update("deadlineDays", e.target.value)}
             />
-            <small className="muted" style={{ display: "block", marginTop: "0.2rem" }}>
-              {/* {editing
-                ? "Leave blank to keep current deadline. Excludes transport days (transit calculated separately)."
-                : "Manufacturing/readiness window. Transport & freight transit days are excluded."} */}
+            <small>
+              Time to have the goods ready, not including transport.
+              {editing ? " Leave blank to keep the current deadline." : ""}
             </small>
           </div>
         </div>
 
-        <small className="muted">
-          A recognised city fills in the state, country and coordinates, so matches can be
-          ranked by real distance.
-        </small>
+        <div className="form-section">
+          <div className="form-section-head">
+            <h2>Details</h2>
+            <p>Specs that matter for this product — material, colour, grade, amperage.</p>
+          </div>
 
-        <label htmlFor="description">Notes</label>
-        <textarea
-          id="description"
-          rows={3}
-          value={form.description}
-          onChange={(e) => update("description", e.target.value)}
-        />
+          <div className="field">
+            <label htmlFor="description">
+              Notes <span className="optional">Optional</span>
+            </label>
+            <textarea
+              id="description"
+              rows={3}
+              value={form.description}
+              onChange={(e) => update("description", e.target.value)}
+            />
+          </div>
 
-        <fieldset className="attributes">
-          <legend>Product attributes</legend>
-          <p className="muted">
-            Whatever matters for this product &mdash; ply, colour, material, amperage. Stored as
-            JSON, so no two products need the same fields.
-          </p>
-
-          {attributes.map((attribute, index) => (
-            // Index keys are safe here: rows are only appended and removed,
-            // never reordered.
-            <div className="attribute-row" key={index}>
-              <input
-                aria-label={`Attribute ${index + 1} name`}
-                placeholder="colour"
-                value={attribute.key}
-                onChange={(e) => updateAttribute(index, { key: e.target.value })}
-              />
-              <input
-                aria-label={`Attribute ${index + 1} value`}
-                placeholder="red"
-                value={attribute.value}
-                onChange={(e) => updateAttribute(index, { value: e.target.value })}
-              />
-              <label
-                className={`must-match-label${attribute.mustMatch ? " checked" : ""}`}
-                title="When checked, matching strongly favours exact or nearest values for this attribute"
-              >
-                <input
-                  type="checkbox"
-                  checked={attribute.mustMatch}
-                  onChange={(e) => updateAttribute(index, { mustMatch: e.target.checked })}
-                />
-                Must match
-              </label>
-              <button
-                type="button"
-                className="secondary"
-                aria-label={`Remove attribute ${index + 1}`}
-                onClick={() => setAttributes((current) => current.filter((_, i) => i !== index))}
-              >
-                &times;
-              </button>
+          <fieldset className="attributes">
+            <legend>Product attributes</legend>
+            <div className="attribute-list">
+              {attributes.map((attribute, index) => (
+                // Index keys are safe here: rows are only appended and removed,
+                // never reordered.
+                <div className="attribute-row" key={index}>
+                  <input
+                    aria-label={`Attribute ${index + 1} name`}
+                    placeholder="Name, e.g. colour"
+                    value={attribute.key}
+                    onChange={(e) => updateAttribute(index, { key: e.target.value })}
+                  />
+                  <input
+                    aria-label={`Attribute ${index + 1} value`}
+                    placeholder="Value, e.g. red"
+                    value={attribute.value}
+                    onChange={(e) => updateAttribute(index, { value: e.target.value })}
+                  />
+                  <label
+                    className={`must-match-label${attribute.mustMatch ? " checked" : ""}`}
+                    title="Matching strongly favours exact or nearest values for this attribute"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={attribute.mustMatch}
+                      onChange={(e) => updateAttribute(index, { mustMatch: e.target.checked })}
+                    />
+                    Must match
+                  </label>
+                  <button
+                    type="button"
+                    className="icon-btn"
+                    aria-label={`Remove attribute ${index + 1}`}
+                    title="Remove"
+                    onClick={() => setAttributes((current) => current.filter((_, i) => i !== index))}
+                  >
+                    <IconClose size={16} />
+                  </button>
+                </div>
+              ))}
             </div>
-          ))}
+            <button
+              type="button"
+              className="ghost small-btn add-attribute-btn"
+              onClick={() => setAttributes((current) => [...current, { key: "", value: "", mustMatch: false }])}
+            >
+              <IconPlus size={14} />
+              Add attribute
+            </button>
+          </fieldset>
+        </div>
 
-          <button
-            type="button"
-            className="secondary"
-            onClick={() => setAttributes((current) => [...current, { key: "", value: "", mustMatch: false }])}
-          >
-            Add attribute
+        <div className="form-footer">
+          <label className="checkbox form-footer-start">
+            <input
+              type="checkbox"
+              checked={form.publishNow}
+              onChange={(e) => update("publishNow", e.target.checked)}
+            />
+            Publish now
+            <span className="muted">(otherwise saved as a draft)</span>
+          </label>
+          <Link to="/rfqs" className="button secondary">
+            Cancel
+          </Link>
+          <button type="submit" disabled={submitting}>
+            {submitting
+              ? editing
+                ? "Saving\u2026"
+                : "Creating\u2026"
+              : editing
+                ? "Save changes"
+                : form.publishNow
+                  ? "Publish RFQ"
+                  : "Save draft"}
           </button>
-        </fieldset>
-
-        <label className="checkbox">
-          <input
-            type="checkbox"
-            checked={form.publishNow}
-            onChange={(e) => update("publishNow", e.target.checked)}
-          />
-          Publish immediately (otherwise saved as a draft)
-        </label>
-
-        <button type="submit" disabled={submitting}>
-          {submitting
-            ? editing
-              ? "Saving\u2026"
-              : "Creating\u2026"
-            : editing
-              ? "Save changes"
-              : "Create RFQ"}
-        </button>
+        </div>
       </form>
     </section>
   );

@@ -2,14 +2,17 @@ import { Navigate, Route, Routes } from "react-router-dom";
 
 import { Layout } from "@/components/Layout";
 import { ProtectedRoute } from "@/components/ProtectedRoute";
+import { SidebarDataProvider } from "@/context/SidebarDataContext";
+import { Dashboard } from "@/pages/Dashboard";
 import { Login } from "@/pages/Login";
+import { Marketplace } from "@/pages/Marketplace";
 import { Matches } from "@/pages/Matches";
 import { Profile } from "@/pages/Profile";
 import { RFQList } from "@/pages/RFQList";
 import { RFQNew } from "@/pages/RFQNew";
-import { Search } from "@/pages/Search";
-import { Signup } from "@/pages/Signup";
 import { Messages } from "@/pages/Messages";
+import { AIChat } from "@/pages/AIChat";
+import { Signup } from "@/pages/Signup";
 
 export default function App() {
   return (
@@ -20,21 +23,27 @@ export default function App() {
       <Route
         element={
           <ProtectedRoute>
-            <Layout />
+            <SidebarDataProvider>
+              <Layout />
+            </SidebarDataProvider>
           </ProtectedRoute>
         }
       >
+        <Route path="/" element={<Navigate to="/dashboard" replace />} />
+        <Route path="/dashboard" element={<Dashboard />} />
+        <Route path="/marketplace" element={<Marketplace />} />
         <Route path="/rfqs" element={<RFQList />} />
         <Route path="/rfqs/new" element={<RFQNew />} />
         {/* Same form in edit mode: PATCH /rfqs/{id} existed but nothing called it. */}
         <Route path="/rfqs/:rfqId/edit" element={<RFQNew />} />
         <Route path="/rfqs/:rfqId/matches" element={<Matches />} />
         <Route path="/messages" element={<Messages />} />
-        <Route path="/search" element={<Search />} />
+        <Route path="/ai-chat" element={<AIChat />} />
         <Route path="/profile" element={<Profile />} />
       </Route>
 
-      <Route path="*" element={<Navigate to="/rfqs" replace />} />
+
+      <Route path="*" element={<Navigate to="/dashboard" replace />} />
     </Routes>
   );
 }

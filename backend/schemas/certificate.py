@@ -33,3 +33,9 @@ class CertificateOut(BaseModel):
     document_url: Optional[str] = None
     verification_status: CertificationStatus
     created_at: datetime
+ 
+ 
+class CertificateDocumentUploadOut(BaseModel):
+    document_url: str = Field(description="Relative media URL of the uploaded certificate document")
+    filename: str = Field(description="Original sanitized filename")
+    file_size: int = Field(description="Size of uploaded file in bytes")

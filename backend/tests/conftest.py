@@ -36,6 +36,7 @@ from core.config import settings  # noqa: E402
 
 # Fast, offline deterministic execution for unit and regression tests
 settings.DIRECT_SEARCH_LLM = False
+settings.IMAGE_MODERATION_ENABLED = False
 from db.session import SessionLocal, engine  # noqa: E402
 from models.enums import RFQRole, RFQStatus, UserRole  # noqa: E402
 
@@ -119,9 +120,9 @@ async def clean_tables(database: None) -> AsyncIterator[None]:
         await session.execute(
             text(
                 "TRUNCATE users, rfqs, connections, connection_messages, quotations, "
-                "reviews, certificates, moderation_logs, "
+                "reviews, certificates, moderation_logs, notifications, "
                 "conversations, messages, message_events, match_searches, "
-                "match_results RESTART IDENTITY CASCADE"
+                "match_results, escrow_accounts, escrow_milestones, deal_disputes, shipments RESTART IDENTITY CASCADE"
             )
         )
         await session.commit()
@@ -162,9 +163,13 @@ def offline_vectors(monkeypatch: pytest.MonkeyPatch) -> None:
             "the test suite must not talk to the live Qdrant collection"
         )
 
+    async def no_delete(*_args: Any, **_kwargs: Any) -> bool:
+        return True
+
     monkeypatch.setattr("services.match_service.embed_one", no_embedding)
     monkeypatch.setattr("services.rfq_service.embed_one", no_embedding)
-    for call in ("upsert", "delete", "search", "ensure_collection"):
+    monkeypatch.setattr("services.qdrant_index.delete", no_delete)
+    for call in ("upsert", "search", "ensure_collection"):
         monkeypatch.setattr(f"services.qdrant_index.{call}", forbidden)
 
 

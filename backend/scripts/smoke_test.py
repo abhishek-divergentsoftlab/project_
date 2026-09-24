@@ -255,36 +255,6 @@ def run(base_url: str) -> int:
                     buyer.post(f"/connections/{connection['id']}/messages",
                                json={"content": ""}).status_code == 422)
 
-        # --- direct search ----------------------------------------------------
-        checks.section("Direct search")
-        turn = buyer.post("/search", json={"message": "i want red usb type c cable"})
-        checks.that("search answers", turn.status_code == 200, turn.text)
-        first = turn.json() if turn.status_code == 200 else {}
-        checks.that("an incomplete query asks before searching",
-                    first.get("pending_question") is not None and not first.get("results"))
-
-        conversation = first.get("conversation_id")
-        answers = {"quantity": "6000 pcs", "price": "200 inr per piece",
-                   "location": "indore", "deadline": "21 days"}
-        guard = 0
-        while first.get("pending_question") and guard < 8:
-            guard += 1
-            first = buyer.post("/search",
-                               json={"message": answers.get(first["pending_question"], "skip"),
-                                     "conversation_id": conversation}).json()
-        checks.that("the conversation reaches a search", guard < 8)
-        checks.that("search returns results", bool(first.get("results")),
-                    "index may be empty")
-        checks.that("direct search creates no RFQ",
-                    buyer.get("/rfqs", params={"limit": 100}).json()["total"]
-                    == listed.json()["total"])
-        checks.that("a stale conversation id is refused",
-                    buyer.post("/search", json={"message": "hi",
-                                                "conversation_id": str(uuid.uuid4())}
-                               ).status_code == 404)
-        checks.that("an empty message is refused",
-                    buyer.post("/search", json={"message": "   "}).status_code == 422)
-
         # --- cleanup ----------------------------------------------------------
         checks.section("Cleanup")
         removed = 0

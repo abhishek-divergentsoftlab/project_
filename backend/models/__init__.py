@@ -27,6 +27,10 @@ from models.quotation import Quotation
 from models.review import Review
 from models.certificate import Certificate
 from models.moderation import ModerationLog
+from models.notification import Notification
+from models.escrow import DealDispute, EscrowAccount, EscrowMilestone
+from models.shipment import Shipment
+from models.enums import ShipmentStatus, ShippingMode
 
 __all__ = [
     "Conversation",
@@ -55,5 +59,13 @@ __all__ = [
     "CertificationStatus",
     "ModerationLog",
     "KYCStatus",
+    "Notification",
+    "EscrowAccount",
+    "EscrowMilestone",
+    "DealDispute",
+    "Shipment",
+    "ShippingMode",
+    "ShipmentStatus",
 ]
+
 

@@ -106,7 +106,10 @@ async def close_rfq(
     rfq_id: uuid.UUID, current_user: CurrentUser, db: DbSession
 ) -> RFQOut:
     rfq = await _get_owned(db, rfq_id, current_user.id)
-    rfq = await rfq_service.update_rfq(db, rfq, RFQUpdate(status=RFQStatus.CLOSED))
+    try:
+        rfq = await rfq_service.update_rfq(db, rfq, RFQUpdate(status=RFQStatus.CLOSED))
+    except RFQError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
     pending_counts = await connection_service.get_rfq_pending_counts(db, current_user.id)
     return rfq_service.to_out(rfq, pending_connections=pending_counts.get(rfq.id, 0))
 

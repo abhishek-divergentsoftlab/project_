@@ -8,6 +8,7 @@ details. The rules are:
 * only an accepted connection carries messages or contact details
 """
 
+import logging
 import uuid
 from pathlib import Path
 from typing import Optional, Sequence
@@ -25,6 +26,7 @@ from models.rfq import RFQ
 from models.user import User
 from schemas.connection import ConnectionMessageCreate, ConnectionOut
 from schemas.match import Counterparty
+from services.image_moderator import inspect_live_image
 from services.websocket_manager import ws_manager
 
 
@@ -144,7 +146,29 @@ async def create_connection(
             raise
         return await _reload(db, duplicate.id)
 
-    return await _reload(db, connection.id)
+    conn_loaded = await _reload(db, connection.id)
+
+    # --- Notification: tell the RFQ owner ---
+    try:
+        from services import notification_service
+        sender_user = await db.get(User, sender_id)
+        sender_profile = getattr(sender_user, "profile", None) if sender_user else None
+        sender_name = (
+            (getattr(sender_profile, "company_name", None) or getattr(sender_profile, "name", None))
+            if sender_profile else "Someone"
+        ) or "Someone"
+        await notification_service.notify_connection_request(
+            db,
+            receiver_id=rfq.user_id,
+            sender_name=sender_name,
+            rfq_title=rfq.title,
+            connection_id=connection.id,
+        )
+        await db.commit()
+    except Exception:
+        logging.getLogger(__name__).debug("Notification create failed (non-fatal)", exc_info=True)
+
+    return conn_loaded
 
 
 async def get_connection(
@@ -190,7 +214,23 @@ async def _decide(
 async def accept_connection(
     db: AsyncSession, connection_id: uuid.UUID, user_id: uuid.UUID
 ) -> Connection:
-    return await _decide(db, connection_id, user_id, ConnectionStatus.ACCEPTED)
+    conn = await _decide(db, connection_id, user_id, ConnectionStatus.ACCEPTED)
+    # --- Notification: tell the sender their request was accepted ---
+    try:
+        from services import notification_service
+        accepter = await db.get(User, user_id)
+        accepter_profile = getattr(accepter, "profile", None) if accepter else None
+        accepter_name = (
+            (getattr(accepter_profile, "company_name", None) or getattr(accepter_profile, "name", None))
+            if accepter_profile else "Someone"
+        ) or "Someone"
+        await notification_service.notify_connection_accepted(
+            db, sender_id=conn.sender_id, accepter_name=accepter_name, connection_id=connection_id
+        )
+        await db.commit()
+    except Exception:
+        logging.getLogger(__name__).debug("Notification accept failed (non-fatal)", exc_info=True)
+    return conn
 
 
 async def reject_connection(
@@ -237,6 +277,29 @@ async def send_message(
         },
     )
 
+    # --- Notification: tell the counterparty ---
+    try:
+        from services import notification_service
+        receiver_id = (
+            connection.receiver_id if connection.sender_id == sender_id else connection.sender_id
+        )
+        sender_user = await db.get(User, sender_id)
+        sender_profile = getattr(sender_user, "profile", None) if sender_user else None
+        sender_name = (
+            (getattr(sender_profile, "company_name", None) or getattr(sender_profile, "name", None))
+            if sender_profile else "Someone"
+        ) or "Someone"
+        await notification_service.notify_new_message(
+            db,
+            receiver_id=receiver_id,
+            sender_name=sender_name,
+            connection_id=connection_id,
+            preview=payload.content[:80] if payload.content else None,
+        )
+        await db.commit()
+    except Exception:
+        logging.getLogger(__name__).debug("Notification message failed (non-fatal)", exc_info=True)
+
     return message
 
 
@@ -268,6 +331,15 @@ async def send_live_capture_message(
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             "Image size exceeds maximum limit of 10MB.",
+        )
+
+    # AI Content Safety Moderation using Ollama qwen3-vl:8b
+    is_safe, warning_msg, _ = await inspect_live_image(file_bytes, content_type)
+    if not is_safe:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            warning_msg
+            or "⚠️ Content Warning: Image flagged for vulgar, violent, or sexual content. Upload rejected.",
         )
 
     # Save to disk under UPLOAD_DIR/live_captures

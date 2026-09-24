@@ -2,6 +2,7 @@ import { useState, type FormEvent } from "react";
 import { Link, Navigate, useLocation, useNavigate } from "react-router-dom";
 
 import { errorMessage } from "@/api/client";
+import { AuthShell } from "@/components/AuthShell";
 import { useAuth } from "@/context/useAuth";
 
 export function Login() {
@@ -17,7 +18,7 @@ export function Login() {
   // Where the user was heading before the login gate sent them here.
   const from = (location.state as { from?: string } | null)?.from ?? "/rfqs";
 
-  if (loading) return <div className="centered muted">Loading&hellip;</div>;
+  if (loading) return <div className="centered muted">Loading…</div>;
   if (user) return <Navigate to={from} replace />;
 
   async function handleSubmit(event: FormEvent) {
@@ -36,38 +37,54 @@ export function Login() {
   }
 
   return (
-    <div className="centered">
-      <form className="card" onSubmit={handleSubmit}>
-        <h1>Sign in</h1>
-        {error && <p className="error">{error}</p>}
+    <AuthShell>
+      <form className="card auth-card" onSubmit={handleSubmit}>
+        <div>
+          <h1>Sign in</h1>
+          <p className="auth-lead">Welcome back. Pick up where you left off.</p>
+        </div>
 
-        <label htmlFor="email">Email</label>
-        <input
-          id="email"
-          type="email"
-          autoComplete="email"
-          required
-          value={email}
-          onChange={(e) => setEmail(e.target.value)}
-        />
+        {error && (
+          <p className="error" role="alert">
+            {error}
+          </p>
+        )}
 
-        <label htmlFor="password">Password</label>
-        <input
-          id="password"
-          type="password"
-          autoComplete="current-password"
-          required
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-        />
+        <div className="form-stack">
+          <div className="field">
+            <label htmlFor="email">Email</label>
+            <input
+              id="email"
+              type="email"
+              autoComplete="email"
+              autoFocus
+              required
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+            />
+          </div>
 
-        <button type="submit" disabled={submitting}>
-          {submitting ? "Signing in..." : "Sign in"}
+          <div className="field">
+            <label htmlFor="password">Password</label>
+            <input
+              id="password"
+              type="password"
+              autoComplete="current-password"
+              required
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+            />
+          </div>
+        </div>
+
+        <button type="submit" className="btn-block btn-lg" disabled={submitting}>
+          {submitting ? "Signing in…" : "Sign in"}
         </button>
-        <p className="muted">
-          No account? <Link to="/signup">Create one</Link>
+
+        <p className="auth-footer">
+          New here? <Link to="/signup">Create an account</Link>
         </p>
       </form>
-    </div>
+    </AuthShell>
   );
 }

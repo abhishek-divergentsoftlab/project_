@@ -1,0 +1,166 @@
+/* ==========================================================================
+   Design tokens
+   --------------------------------------------------------------------------
+   One neutral scale, one accent, four semantic colours. Every component
+   should be expressible with these; if something needs a new colour, add a
+   token here rather than a hex value in a feature stylesheet.
+   ========================================================================== */
+
+:root,
+[data-theme="light"] {
+  color-scheme: light;
+
+  /* Neutrals — canvas, surfaces, lines, text */
+  --bg: #f6f7f9;
+  --bg-subtle: #f1f3f5;
+  --bg-elevated: #f8f9fa;
+  --surface: #ffffff;
+  --surface-glass: #ffffff;
+  --surface-raised: #ffffff;
+  --border: #e4e7eb;
+  --border-strong: #d0d5dc;
+  --text: #15181d;
+  --text-secondary: #3c424b;
+  --muted: #646b76;
+  --subtle: #8b919b;
+
+  /* Brand accent — the only saturated colour used for emphasis */
+  --accent: #1f57a4;
+  --accent-hover: #194a8d;
+  --accent-text: #ffffff;
+  --accent-soft: #eef3fb;
+  --accent-muted: #c9d7ee;
+  --link: #1f57a4;
+  --focus-ring: color-mix(in srgb, var(--accent) 35%, transparent);
+
+  /* Semantic */
+  --success: #16794a;
+  --success-bg: #edf7f1;
+  --success-text: #135f3b;
+  --warning: #a8620b;
+  --warn-bg: #fdf6e9;
+  --warn-text: #7f4a08;
+  --danger: #c0352b;
+  --error-bg: #fdf1f0;
+  --error-text: #a12a21;
+  --star: #b7791f;
+
+  --scrim: rgb(15 18 23 / 0.4);
+
+  /* Elevation — used only for things that float (menus, dialogs) */
+  --shadow-xs: 0 1px 2px rgb(16 24 40 / 0.04);
+  --shadow-sm: 0 1px 2px rgb(16 24 40 / 0.05);
+  --shadow: 0 4px 16px rgb(16 24 40 / 0.08);
+  --shadow-lg: 0 16px 40px rgb(16 24 40 / 0.14);
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #0f1114;
+  --bg-subtle: #23272e;
+  --bg-elevated: #15181c;
+  --surface: #181b20;
+  --surface-glass: #181b20;
+  --surface-raised: #2a2f37;
+  --border: #262a31;
+  --border-strong: #353a43;
+  --text: #e3e6ea;
+  --text-secondary: #c2c7ce;
+  --muted: #959ca7;
+  --subtle: #6d7480;
+
+  --accent: #5a8fd8;
+  --accent-hover: #6d9de0;
+  --accent-text: #0b1220;
+  --accent-soft: #1a2433;
+  --accent-muted: #2c3f5c;
+  --link: #82aee6;
+
+  --success: #4fb987;
+  --success-bg: #14231c;
+  --success-text: #7dd3a8;
+  --warning: #d9a14a;
+  --warn-bg: #2a2114;
+  --warn-text: #e8bf7a;
+  --danger: #e2685e;
+  --error-bg: #2b1616;
+  --error-text: #f19a92;
+  --star: #e0b35a;
+
+  --scrim: rgb(0 0 0 / 0.6);
+
+  --shadow-xs: 0 1px 2px rgb(0 0 0 / 0.3);
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.35);
+  --shadow: 0 6px 20px rgb(0 0 0 / 0.45);
+  --shadow-lg: 0 20px 48px rgb(0 0 0 / 0.55);
+}
+
+:root {
+  /* Type scale — 14px is the UI base; larger sizes are for headings only */
+  --font-sans: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --text-xs: 0.75rem;     /* 12 — meta, captions */
+  --text-sm: 0.8125rem;   /* 13 — secondary text, dense UI */
+  --text-base: 0.875rem;  /* 14 — body & controls */
+  --text-md: 1rem;        /* 16 — card titles, emphasis */
+  --text-lg: 1.125rem;    /* 18 — section titles */
+  --text-xl: 1.25rem;     /* 20 — dialog titles */
+  --text-2xl: 1.5rem;     /* 24 — page titles */
+  --text-3xl: 1.875rem;   /* 30 — hero numbers */
+
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+
+  --leading-tight: 1.25;
+  --leading: 1.5;
+
+  /* Spacing — 4px grid */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.25rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+  --space-10: 2.5rem;
+  --space-12: 3rem;
+
+  /* Radius — small and consistent; pills only for status badges */
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius: 8px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-full: 999px;
+
+  /* Controls */
+  --control-h-sm: 2rem;
+  --control-h: 2.25rem;
+  --control-h-lg: 2.5rem;
+
+  --icon-sm: 1rem;
+  --icon-md: 1.125rem;
+  --icon-lg: 1.25rem;
+
+  /* Layout */
+  --sidebar-width: 15rem;
+  --page-max: 72rem;
+  --page-narrow: 48rem;
+  --page-pad: clamp(1rem, 3vw, 2.5rem);
+
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+  --duration: 140ms;
+
+  /* Aliases — names used by older feature stylesheets. Several were never
+     defined anywhere, so the declarations using them silently did nothing. */
+  --text-muted: var(--muted);
+  --foreground: var(--text);
+  --background: var(--bg);
+  --bg-alt: var(--bg-subtle);
+  --surface-card: var(--surface);
+  --surface-elevated: var(--surface);
+  --surface-hover: var(--bg-subtle);
+  --border-subtle: var(--border);
+  --color-primary: var(--accent);
+}

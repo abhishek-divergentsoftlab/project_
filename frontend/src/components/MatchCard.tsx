@@ -1,7 +1,9 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
 
+import { IconShield, IconStar, IconTruck } from "@/components/icons";
 import type { Counterparty, MatchCandidate, MatchScore } from "@/types";
+import { formatDate, formatShortDate } from "@/utils/format";
 
 
 /** Shared by the RFQ matches page and the direct-search chat. */
@@ -65,7 +67,7 @@ function ScoreBar({ score, distanceKm }: { score: MatchScore; distanceKm: number
             <div key={key} className="score-row">
               <span className="score-label">{label}</span>
               <span className="score-na" title="Neither side filled this in, so it was left out of the total">
-                not comparable
+                Not compared
               </span>
             </div>
           );
@@ -105,15 +107,13 @@ function ContactDetails({ counterparty }: { counterparty: Counterparty }) {
   if (rows.length === 0) {
     return (
       <div className="contact-panel">
-        <span className="contact-heading">Connected</span>
-        <p className="muted">They have not added contact details to their profile yet.</p>
+        <p className="muted">They haven't added contact details to their profile yet.</p>
       </div>
     );
   }
 
   return (
     <div className="contact-panel">
-      <span className="contact-heading">Contact details</span>
       <dl className="contact-rows">
         {rows.map(({ label, value, href }) => (
           <div key={label}>
@@ -160,68 +160,47 @@ export function MatchCard({ candidate, onContact }: MatchCardProps) {
     .slice(0, 2)
     .join(", ");
 
+  const tier = score.total >= 0.85 ? "Excellent fit" : score.total >= 0.7 ? "Strong fit" : "Possible fit";
+  const rating = counterparty.average_rating;
+
   return (
     <article className="match-card">
-      <div className="match-head">
-        <span className="match-rank">#{candidate.rank}</span>
-        <div>
-          <h2>{candidate.title}</h2>
-          <p className="muted">
-            {counterparty.company_name ?? "Unnamed company"}
-            {where ? ` · ships from ${where}` : ""}
+      <header className="match-head">
+        <div className="match-head-main">
+          <h3 className="match-title">{candidate.title}</h3>
+          <p className="match-company">
+            <span className="match-company-name">{counterparty.company_name ?? "Unnamed company"}</span>
+            {where && <span> · ships from {where}</span>}
           </p>
-          <div className="trust-tags-row">
+          <div className="match-trust">
             {counterparty.gst_verified && (
-              <span className="badge badge-kyc-verified" title="Enterprise credentials and GSTIN authenticated">
-                🛡️ GST Verified
+              <span className="match-trust-item is-verified" title="GSTIN verified">
+                <IconShield size={13} />
+                GST verified
               </span>
             )}
-            <span className="badge badge-cert-mini" title="Standard quality compliance certified">
-              ISO 9001
-            </span>
             <span
-              className={`rating-pill-mini ${counterparty.average_rating ? "has-rating" : "unrated"}`}
+              className="match-trust-item"
               title={
-                counterparty.average_rating != null && counterparty.average_rating > 0
-                  ? `Counterparty overall verified rating: ${counterparty.average_rating.toFixed(1)} / 5 (${counterparty.total_reviews ?? 0} reviews)`
-                  : "New counterparty without reviews yet"
+                rating != null && rating > 0
+                  ? `${rating.toFixed(1)} out of 5 from ${counterparty.total_reviews ?? 0} reviews`
+                  : "No reviews yet"
               }
             >
-              {counterparty.average_rating != null && counterparty.average_rating > 0
-                ? `★ ${counterparty.average_rating.toFixed(1)} (${counterparty.total_reviews ?? 0})`
-                : "★ New Trader"}
+              <IconStar size={13} />
+              {rating != null && rating > 0
+                ? `${rating.toFixed(1)} (${counterparty.total_reviews ?? 0})`
+                : "No reviews yet"}
             </span>
-            {counterparty.email && (
-              <a
-                href={`mailto:${counterparty.email}`}
-                className="badge badge-email-pill"
-                title={`Direct Email: ${counterparty.email} (Click to compose email)`}
-                onClick={(e) => e.stopPropagation()}
-              >
-                ✉ {counterparty.email}
-              </a>
-            )}
           </div>
         </div>
-        <div className="match-score-pill">
-          <span className="match-total" title="Overall match score">
-            {percent(score.total)}
-          </span>
-          <span
-            className={`match-tier-badge ${
-              score.total >= 0.85
-                ? "tier-prime"
-                : score.total >= 0.7
-                ? "tier-strong"
-                : "tier-viable"
-            }`}
-          >
-            {score.total >= 0.85 ? "Prime Match" : score.total >= 0.7 ? "Strong Fit" : "Viable"}
-          </span>
+        <div className="match-score" title="Overall match score">
+          <span className="match-total">{percent(score.total)}</span>
+          <span className="match-tier">{tier}</span>
         </div>
-      </div>
+      </header>
 
-      <dl className="match-facts">
+      <dl className="meta-list match-facts">
         <div>
           <dt>Quantity</dt>
           <dd>{quantity ? `${quantity.value.toLocaleString()} ${quantity.unit}` : "—"}</dd>
@@ -235,14 +214,9 @@ export function MatchCard({ candidate, onContact }: MatchCardProps) {
           </dd>
         </div>
         <div>
-          <dt>
-            Dispatch Deadline
-            <span className="excl-transport-tag" title="Excludes transport/shipping days">Excl. Transport</span>
-          </dt>
+          <dt title="Time to dispatch, not including transport">Dispatch by</dt>
           <dd>
-            {candidate.deadline?.date
-              ? new Date(candidate.deadline.date).toLocaleDateString()
-              : "—"}
+            {formatDate(candidate.deadline?.date)}
           </dd>
         </div>
         <div>
@@ -251,89 +225,73 @@ export function MatchCard({ candidate, onContact }: MatchCardProps) {
         </div>
       </dl>
 
-      {counterparty.email && (
-        <div className="card-direct-email-bar">
-          <span className="email-bar-label">Email:</span>
-          <a
-            href={`mailto:${counterparty.email}`}
-            className="email-bar-link"
-            title={`Direct email to ${counterparty.email}`}
-          >
-            ✉ {counterparty.email}
-          </a>
-        </div>
-      )}
-
       {candidate.logistics && (
-        <div className="logistics-bar" title={candidate.logistics.mode}>
-          <span className="logistics-icon">🚚</span>
-          <span className="logistics-label">
+        <p className="match-logistics" title={candidate.logistics.mode}>
+          <IconTruck size={15} />
+          <span>
             {candidate.logistics.label}
-            {candidate.deadline?.estimated_delivery_at && (
-              <span className="logistics-arrival">
-                {" "}· Est. Delivery: {new Date(candidate.deadline.estimated_delivery_at).toLocaleDateString()}
-              </span>
-            )}
+            {candidate.deadline?.estimated_delivery_at &&
+              ` · arrives around ${formatShortDate(candidate.deadline.estimated_delivery_at)}`}
           </span>
           {candidate.logistics.customs_required && (
             <span className="badge badge-customs">Customs</span>
           )}
-        </div>
+        </p>
       )}
 
-      <ScoreBar score={score} distanceKm={distanceKm} />
-
-      {candidate.search_tags.length > 0 && (
-        <div className="tags">
-          {candidate.search_tags.slice(0, 6).map((tag) => (
-            <span key={tag} className="tag">
-              {tag}
-            </span>
-          ))}
-        </div>
-      )}
+      <details className="match-breakdown">
+        <summary>Why this match</summary>
+        <ScoreBar score={score} distanceKm={distanceKm} />
+      </details>
 
       {status === "accepted" && <ContactDetails counterparty={counterparty} />}
 
       <div className="match-actions">
         {status === "accepted" ? (
           <>
-            <span className="badge badge-accepted">Connected</span>
+            <span className="match-status">
+              <span className="status-dot is-success" />
+              Connected
+            </span>
             {counterparty.connection_id && (
               <Link
                 to={`/messages?connection=${counterparty.connection_id}`}
-                className="button deal-room-btn"
-                title="Enter Deal Room to chat and negotiate quotations"
+                className="button small-btn"
               >
-                Deal Room &rarr;
+                Open deal room
               </Link>
             )}
           </>
         ) : status === "pending" ? (
-          <button type="button" className="secondary" disabled title="Waiting for them to accept">
-            Request sent
-          </button>
+          <>
+            <span className="match-status">
+              <span className="status-dot is-warning" />
+              Waiting for them to accept
+            </span>
+            <button type="button" className="secondary small-btn" disabled>
+              Request sent
+            </button>
+          </>
         ) : status === "rejected" ? (
-          <button type="button" className="secondary" disabled title="They declined this request">
-            Declined
-          </button>
+          <span className="match-status">
+            <span className="status-dot" />
+            They declined this request
+          </span>
         ) : (
-          <button
-            type="button"
-            className="secondary"
-            onClick={handleContact}
-            disabled={!onContact || contacting}
-            title={
-              onContact
-                ? "Ask them to share their contact details"
-                : "Not available here"
-            }
-          >
-            {contacting ? "Sending…" : "Request contact"}
-          </button>
+          <>
+            <span />
+            <button
+              type="button"
+              className="primary small-btn"
+              onClick={handleContact}
+              disabled={!onContact || contacting}
+              title={onContact ? undefined : "Not available here"}
+            >
+              {contacting ? "Sending…" : "Request contact"}
+            </button>
+          </>
         )}
       </div>
     </article>
   );
 }
-

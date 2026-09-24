@@ -1,8 +1,22 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type ChangeEvent, type DragEvent, type FormEvent } from "react";
 
 import { errorMessage } from "@/api/client";
 import { certifications, kyc, reviews as reviewsApi, users } from "@/api/endpoints";
+import {
+  IconClock,
+  IconExternalLink,
+  IconFileText,
+  IconPlus,
+  IconShield,
+  IconStar,
+  IconUpload,
+  IconX,
+} from "@/components/icons";
+import { Menu } from "@/components/ui/Menu";
+import { Modal } from "@/components/ui/Modal";
 import { useAuth } from "@/context/useAuth";
+import { useFeedback } from "@/context/useFeedback";
+import { formatDate } from "@/utils/format";
 import type {
   Certificate,
   CertificateCreatePayload,
@@ -17,13 +31,54 @@ const ROLES: { value: UserRole; label: string; hint: string }[] = [
   { value: "both", label: "Both", hint: "Choose a side on each RFQ." },
 ];
 
+const ROLE_BADGE: Record<UserRole, string> = {
+  buyer: "Buyer",
+  seller: "Seller",
+  both: "Buyer & seller",
+};
+
 type Tab = "general" | "kyc" | "certificates" | "reviews";
+
+const TABS: { id: Tab; label: string }[] = [
+  { id: "general", label: "Account" },
+  { id: "kyc", label: "KYC & GST" },
+  { id: "certificates", label: "Certificates" },
+  { id: "reviews", label: "Reviews" },
+];
+
+const CERT_QUICK_TYPES = [
+  "ISO 9001:2015 Quality Management",
+  "ISO 14001 Environmental",
+  "CE Marking",
+  "FDA Registration",
+  "GMP Compliance",
+  "RoHS Declaration",
+];
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function getInitials(name?: string | null, email?: string | null): string {
+  const source = (name || email || "U").trim();
+  const parts = source.split(/[\s@]+/).filter(Boolean);
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+}
+
+function kycLabel(status: string): string {
+  if (status === "verified") return "Verified";
+  if (status === "pending") return "Pending review";
+  return "Unverified";
+}
 
 export function Profile() {
   const { user, refreshUser } = useAuth();
+  const { toast, confirm } = useFeedback();
   const [activeTab, setActiveTab] = useState<Tab>("general");
 
-  // General profile form
   const [form, setForm] = useState({
     name: "",
     company_name: "",
@@ -34,11 +89,9 @@ export function Profile() {
     country: "",
   });
   const [role, setRole] = useState<UserRole>("buyer");
-  const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
-  // KYC verification form
   const [kycForm, setKycForm] = useState<KYCVerificationPayload>({
     gst_number: "",
     legal_business_name: "",
@@ -51,7 +104,6 @@ export function Profile() {
   });
   const [kycSaving, setKycSaving] = useState(false);
 
-  // Certificates state
   const [certList, setCertList] = useState<Certificate[]>([]);
   const [loadingCerts, setLoadingCerts] = useState(false);
   const [showCertModal, setShowCertModal] = useState(false);
@@ -71,7 +123,16 @@ export function Profile() {
     document_url: "",
   });
 
-  // Reviews state
+  const [certDocMode, setCertDocMode] = useState<"upload" | "url">("upload");
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [uploadingCert, setUploadingCert] = useState(false);
+  const [isDragging, setIsDragging] = useState(false);
+  const [previewModalCert, setPreviewModalCert] = useState<Certificate | null>(null);
+  const [directUploadLoadingId, setDirectUploadLoadingId] = useState<string | null>(null);
+  const [directTargetCertId, setDirectTargetCertId] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const directFileInputRef = useRef<HTMLInputElement | null>(null);
+
   const [reviewStats, setReviewStats] = useState<UserReviewStats | null>(null);
   const [loadingReviews, setLoadingReviews] = useState(false);
 
@@ -103,7 +164,6 @@ export function Profile() {
     });
   }, [user]);
 
-  // Load certificates
   useEffect(() => {
     if (activeTab === "certificates" && user) {
       setLoadingCerts(true);
@@ -115,7 +175,6 @@ export function Profile() {
     }
   }, [activeTab, user]);
 
-  // Load reviews
   useEffect(() => {
     if (activeTab === "reviews" && user) {
       setLoadingReviews(true);
@@ -131,10 +190,20 @@ export function Profile() {
     setForm((current) => ({ ...current, [key]: value }));
   }
 
+  function clearAlerts() {
+    setError(null);
+  }
+
+  function closeCertModal() {
+    if (uploadingCert) return;
+    setShowCertModal(false);
+    setSelectedFile(null);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  }
+
   async function handleSubmit(event: FormEvent) {
     event.preventDefault();
-    setError(null);
-    setStatus(null);
+    clearAlerts();
     setSaving(true);
     try {
       const payload = Object.fromEntries(
@@ -143,7 +212,7 @@ export function Profile() {
       await users.updateProfile(payload);
       if (user && role !== user.role) await users.updateRole(role);
       await refreshUser();
-      setStatus("General profile updated successfully.");
+      toast("Profile saved.");
     } catch (err) {
       setError(errorMessage(err, "Could not save the profile"));
     } finally {
@@ -153,13 +222,12 @@ export function Profile() {
 
   async function handleKycSubmit(event: FormEvent) {
     event.preventDefault();
-    setError(null);
-    setStatus(null);
+    clearAlerts();
     setKycSaving(true);
     try {
       const res = await kyc.verify(kycForm);
       await refreshUser();
-      setStatus(res.message || "Company verification submitted successfully.");
+      toast(res.message || "Verification submitted.");
     } catch (err) {
       setError(errorMessage(err, "Could not verify company KYC"));
     } finally {
@@ -167,479 +235,815 @@ export function Profile() {
     }
   }
 
+  const ALLOWED_EXTS = [".pdf", ".png", ".jpg", ".jpeg", ".webp"];
+  const MAX_CERT_SIZE = 10 * 1024 * 1024; // 10 MB
+
+  function handleFileSelect(file: File) {
+    clearAlerts();
+    const ext = "." + file.name.split(".").pop()?.toLowerCase();
+    if (!ALLOWED_EXTS.includes(ext)) {
+      setError(
+        `Unsupported file format '${ext}'. Please select a valid PDF, PNG, JPG, or WebP document.`,
+      );
+      return;
+    }
+    if (file.size > MAX_CERT_SIZE) {
+      setError(`File size (${formatFileSize(file.size)}) exceeds the maximum 10 MB limit.`);
+      return;
+    }
+    setSelectedFile(file);
+  }
+
+  function handleDrop(e: DragEvent<HTMLDivElement>) {
+    e.preventDefault();
+    setIsDragging(false);
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+      handleFileSelect(e.dataTransfer.files[0]);
+    }
+  }
+
   async function handleAddCertificate(event: FormEvent) {
     event.preventDefault();
-    setError(null);
-    setStatus(null);
+    clearAlerts();
+    setUploadingCert(true);
     try {
+      let documentUrl: string | undefined = undefined;
+
+      if (certDocMode === "upload" && selectedFile) {
+        const uploadRes = await certifications.uploadDocument(selectedFile);
+        documentUrl = uploadRes.document_url;
+      } else if (certDocMode === "url" && certForm.document_url.trim()) {
+        documentUrl = certForm.document_url.trim();
+      }
+
       const payload: CertificateCreatePayload = {
         name: certForm.name.trim(),
         issuing_body: certForm.issuing_body.trim(),
         certificate_number: certForm.certificate_number.trim(),
         issue_date: new Date(certForm.issue_date).toISOString(),
         expiry_date: certForm.expiry_date ? new Date(certForm.expiry_date).toISOString() : undefined,
-        document_url: certForm.document_url.trim() || undefined,
+        document_url: documentUrl,
       };
       const created = await certifications.create(payload);
       setCertList((current) => [created, ...current]);
       setShowCertModal(false);
-      setStatus("Certificate added and verified!");
+      setSelectedFile(null);
+      setCertForm((current) => ({
+        ...current,
+        certificate_number: "",
+        document_url: "",
+      }));
+      toast("Certificate added.");
       await refreshUser();
     } catch (err) {
       setError(errorMessage(err, "Could not add certificate"));
+    } finally {
+      setUploadingCert(false);
     }
   }
 
+  async function handleDirectFileUpload(e: ChangeEvent<HTMLInputElement>) {
+    if (!e.target.files || !e.target.files[0] || !directTargetCertId) return;
+    const file = e.target.files[0];
+    const certId = directTargetCertId;
+    e.target.value = "";
+
+    clearAlerts();
+    const ext = "." + file.name.split(".").pop()?.toLowerCase();
+    if (!ALLOWED_EXTS.includes(ext)) {
+      setError(
+        `Unsupported file format '${ext}'. Please select a valid PDF, PNG, JPG, or WebP document.`,
+      );
+      return;
+    }
+    if (file.size > MAX_CERT_SIZE) {
+      setError(`File size (${formatFileSize(file.size)}) exceeds the maximum 10 MB limit.`);
+      return;
+    }
+
+    setDirectUploadLoadingId(certId);
+    try {
+      const updated = await certifications.uploadToCertificate(certId, file);
+      setCertList((current) => current.map((c) => (c.id === certId ? updated : c)));
+      toast("Document uploaded.");
+    } catch (err) {
+      setError(errorMessage(err, "Could not upload certificate document"));
+    } finally {
+      setDirectUploadLoadingId(null);
+      setDirectTargetCertId(null);
+    }
+  }
+
+  function triggerDirectUpload(certId: string) {
+    setDirectTargetCertId(certId);
+    directFileInputRef.current?.click();
+  }
+
   async function handleDeleteCertificate(id: string) {
-    if (!window.confirm("Are you sure you want to delete this certificate?")) return;
+    const ok = await confirm({
+      title: "Remove this certificate?",
+      message: "It will no longer count toward your trust score or appear to counterparties.",
+      confirmLabel: "Remove",
+      tone: "danger",
+    });
+    if (!ok) return;
     try {
       await certifications.delete(id);
       setCertList((current) => current.filter((c) => c.id !== id));
-      setStatus("Certificate removed.");
+      toast("Certificate removed.");
     } catch (err) {
       setError(errorMessage(err, "Could not delete certificate"));
     }
   }
 
-  const activeRole = ROLES.find((option) => option.value === role);
   const kycStatus = user?.profile?.kyc_status ?? "unverified";
   const trustScore = user?.profile?.trust_score ?? 20;
-
+  const displayName =
+    user?.profile?.company_name || user?.profile?.name || user?.email || "Your profile";
+  const contactName = user?.profile?.name || "Contact";
+  const initials = getInitials(user?.profile?.company_name || user?.profile?.name, user?.email);
   return (
-    <section className="profile-page">
-      <div className="section-head">
-        <div>
-          <h1>Enterprise Profile &amp; Trust</h1>
-          <p className="muted">Signed in as {user?.email}</p>
+    <section className="page page-narrow profile-page">
+      <header className="profile-hero">
+        <div className="profile-avatar" aria-hidden="true">
+          {initials}
         </div>
-        <div className="trust-meter-badge">
-          <span className="trust-score-title">Network Trust Score</span>
-          <div className="trust-score-val">
-            <span className="trust-num">{trustScore}</span> / 100
+        <div className="profile-hero-copy">
+          <h1>{displayName}</h1>
+          <p className="profile-hero-meta">
+            {contactName}
+            {user?.email ? ` · ${user.email}` : ""}
+          </p>
+          <div className="profile-hero-tags">
+            <span className={`badge badge-kyc-${kycStatus}`}>
+              {kycStatus === "verified" ? (
+                <IconShield size={12} />
+              ) : kycStatus === "pending" ? (
+                <IconClock size={12} />
+              ) : null}
+              {kycLabel(kycStatus)}
+            </span>
+            <span className="badge">{ROLE_BADGE[user?.role ?? "buyer"]}</span>
           </div>
-          <span className={`badge badge-kyc-${kycStatus}`}>
-            {kycStatus === "verified" ? "🛡️ GST Verified" : kycStatus === "pending" ? "⏳ KYC Pending" : "⚠️ Unverified"}
+        </div>
+
+        <div
+          className="profile-trust"
+          title="Built from verification, certificates and completed trades"
+          aria-label={`Trust score ${trustScore} out of 100`}
+        >
+          <span className="profile-trust-label">Trust score</span>
+          <span className="profile-trust-value">
+            {trustScore}
+            <span>/100</span>
+          </span>
+          <span className="profile-trust-bar" aria-hidden="true">
+            <span style={{ width: `${Math.min(100, Math.max(0, trustScore))}%` }} />
           </span>
         </div>
-      </div>
+      </header>
+
+      <nav className="tab-bar" aria-label="Profile sections">
+        {TABS.map((tab) => (
+          <button
+            key={tab.id}
+            type="button"
+            aria-current={activeTab === tab.id ? "page" : undefined}
+            className={activeTab === tab.id ? "tab active" : "tab"}
+            onClick={() => {
+              clearAlerts();
+              setActiveTab(tab.id);
+            }}
+          >
+            {tab.label}
+            {tab.id === "certificates" && certList.length > 0 && (
+              <span className="tab-count">{certList.length}</span>
+            )}
+          </button>
+        ))}
+      </nav>
 
       {error && <p className="error">{error}</p>}
-      {status && <p className="success">{status}</p>}
 
-      {/* Profile Navigation Tabs */}
-      <div className="tab-bar">
-        <button
-          type="button"
-          className={activeTab === "general" ? "tab active" : "tab"}
-          onClick={() => setActiveTab("general")}
-        >
-          General Account
-        </button>
-        <button
-          type="button"
-          className={activeTab === "kyc" ? "tab active" : "tab"}
-          onClick={() => setActiveTab("kyc")}
-        >
-          Company KYC &amp; GST Verification
-        </button>
-        <button
-          type="button"
-          className={activeTab === "certificates" ? "tab active" : "tab"}
-          onClick={() => setActiveTab("certificates")}
-        >
-          Certifications {certList.length > 0 && `(${certList.length})`}
-        </button>
-        <button
-          type="button"
-          className={activeTab === "reviews" ? "tab active" : "tab"}
-          onClick={() => setActiveTab("reviews")}
-        >
-          Ratings &amp; Reviews
-        </button>
-      </div>
-
-      {/* Tab 1: General Account */}
       {activeTab === "general" && (
-        <form className="card wide glass-card" onSubmit={handleSubmit}>
-          <h2>Account Details</h2>
-
-          <label htmlFor="p-role">I want to</label>
-          <select
-            id="p-role"
-            value={role}
-            onChange={(event) => setRole(event.target.value as UserRole)}
-          >
-            {ROLES.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
-          <small className="muted">{activeRole?.hint}</small>
-
-          <label htmlFor="p-name">Contact Person Name</label>
-          <input id="p-name" value={form.name} onChange={(e) => update("name", e.target.value)} />
-
-          <label htmlFor="p-company">Trade / Display Company Name</label>
-          <input
-            id="p-company"
-            value={form.company_name}
-            onChange={(e) => update("company_name", e.target.value)}
-          />
-
-          <label htmlFor="p-phone">Business Phone</label>
-          <input
-            id="p-phone"
-            type="tel"
-            autoComplete="tel"
-            value={form.phone}
-            onChange={(e) => update("phone", e.target.value)}
-          />
-
-          <label htmlFor="p-address">Warehouse / Registered Address</label>
-          <input
-            id="p-address"
-            value={form.address}
-            onChange={(e) => update("address", e.target.value)}
-          />
-          <small className="muted">
-            Your phone, email and address are revealed only after accepting connection requests.
-          </small>
-
-          <div className="row">
-            <div>
-              <label htmlFor="p-city">City</label>
-              <input id="p-city" value={form.city} onChange={(e) => update("city", e.target.value)} />
+        <form className="panel form-panel" onSubmit={handleSubmit}>
+          <div className="form-section">
+            <div className="form-section-head">
+              <h2>How you trade</h2>
+              <p>Decides which side of the market you can post on.</p>
             </div>
-            <div>
-              <label htmlFor="p-state">State / Province</label>
-              <input
-                id="p-state"
-                value={form.state}
-                onChange={(e) => update("state", e.target.value)}
-              />
-            </div>
-            <div>
-              <label htmlFor="p-country">Country</label>
-              <input
-                id="p-country"
-                value={form.country}
-                onChange={(e) => update("country", e.target.value)}
-              />
-            </div>
-          </div>
-          <small className="muted">
-            A recognized city fills in geographic coordinates for automatic freight and distance calculations.
-          </small>
-
-          <button type="submit" disabled={saving}>
-            {saving ? "Saving…" : "Save Account Profile"}
-          </button>
-        </form>
-      )}
-
-      {/* Tab 2: Company Verification (KYC & Anti-Fraud) */}
-      {activeTab === "kyc" && (
-        <form className="card wide glass-card" onSubmit={handleKycSubmit}>
-          <div className="form-header-badge">
-            <h2>Company Verification &amp; Anti-Fraud</h2>
-            <span className={`badge badge-kyc-${kycStatus}`}>
-              Status: {kycStatus.toUpperCase()}
-            </span>
-          </div>
-          <p className="muted">
-            Providing official tax identifiers (GSTIN) and business registration details safeguards
-            the platform against impersonation and awards a verified trust badge on your listings.
-          </p>
-
-          <div className="row">
-            <div>
-              <label htmlFor="kyc-gst">GST Number / Tax ID *</label>
-              <input
-                id="kyc-gst"
-                required
-                placeholder="e.g. 27AABCU9603R1ZM (15 chars) or International Tax ID"
-                value={kycForm.gst_number}
-                onChange={(e) => setKycForm({ ...kycForm, gst_number: e.target.value })}
-              />
-              <small className="muted">Valid 15-character GSTIN or international VAT/EIN format.</small>
-            </div>
-            <div>
-              <label htmlFor="kyc-legal-name">Legal Business Name (On Tax Certificate) *</label>
-              <input
-                id="kyc-legal-name"
-                required
-                placeholder="Official registered entity name"
-                value={kycForm.legal_business_name}
-                onChange={(e) => setKycForm({ ...kycForm, legal_business_name: e.target.value })}
-              />
+            <div className="role-picker" role="radiogroup" aria-label="Trading role">
+              {ROLES.map((option) => (
+                <button
+                  key={option.value}
+                  type="button"
+                  role="radio"
+                  aria-checked={role === option.value}
+                  className={`role-option ${role === option.value ? "selected" : ""}`}
+                  onClick={() => setRole(option.value)}
+                >
+                  <span className="role-option-label">{option.label}</span>
+                  <span className="role-option-hint">{option.hint}</span>
+                </button>
+              ))}
             </div>
           </div>
 
-          <div className="row">
-            <div>
-              <label htmlFor="kyc-type">Business Entity Type</label>
-              <select
-                id="kyc-type"
-                value={kycForm.business_type}
-                onChange={(e) => setKycForm({ ...kycForm, business_type: e.target.value })}
-              >
-                <option value="Private Limited">Private Limited (Pvt Ltd)</option>
-                <option value="Public Limited">Public Limited (Ltd)</option>
-                <option value="Proprietorship">Sole Proprietorship</option>
-                <option value="Partnership">Partnership / LLP</option>
-                <option value="LLC">LLC (Limited Liability Company)</option>
-                <option value="Corporation">Corporation / Corp</option>
-              </select>
+          <div className="form-section">
+            <div className="form-section-head">
+              <h2>Company &amp; contact</h2>
+              <p>Phone and address are only shared after you accept a connection.</p>
             </div>
-            <div>
-              <label htmlFor="kyc-cin">Company Registration / CIN Number</label>
-              <input
-                id="kyc-cin"
-                placeholder="e.g. U72200MH2020PTC123456"
-                value={kycForm.registration_number ?? ""}
-                onChange={(e) => setKycForm({ ...kycForm, registration_number: e.target.value })}
-              />
-            </div>
-          </div>
-
-          <div className="row">
-            <div>
-              <label htmlFor="kyc-year">Year Established</label>
-              <input
-                id="kyc-year"
-                type="number"
-                min="1850"
-                max="2026"
-                value={kycForm.year_established ?? 2020}
-                onChange={(e) => setKycForm({ ...kycForm, year_established: parseInt(e.target.value, 10) || 2020 })}
-              />
-            </div>
-            <div>
-              <label htmlFor="kyc-pan">Corporate PAN Number</label>
-              <input
-                id="kyc-pan"
-                placeholder="e.g. AABCU9603R"
-                value={kycForm.pan_number ?? ""}
-                onChange={(e) => setKycForm({ ...kycForm, pan_number: e.target.value })}
-              />
+            <div className="field-grid field-grid-2">
+              <div className="field">
+                <label htmlFor="p-company">Company name</label>
+                <input
+                  id="p-company"
+                  value={form.company_name}
+                  onChange={(e) => update("company_name", e.target.value)}
+                  placeholder="Trading name"
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="p-name">Contact person</label>
+                <input
+                  id="p-name"
+                  value={form.name}
+                  onChange={(e) => update("name", e.target.value)}
+                  placeholder="Full name"
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="p-phone">Business phone</label>
+                <input
+                  id="p-phone"
+                  type="tel"
+                  autoComplete="tel"
+                  value={form.phone}
+                  onChange={(e) => update("phone", e.target.value)}
+                  placeholder="+91 …"
+                />
+              </div>
+              <div className="field field-span">
+                <label htmlFor="p-address">Warehouse or registered address</label>
+                <input
+                  id="p-address"
+                  value={form.address}
+                  onChange={(e) => update("address", e.target.value)}
+                  placeholder="Street, building, landmark"
+                />
+              </div>
             </div>
           </div>
 
-          <div className="row">
-            <div>
-              <label htmlFor="kyc-website">Official Website URL</label>
-              <input
-                id="kyc-website"
-                type="url"
-                placeholder="https://company.example.com"
-                value={kycForm.website ?? ""}
-                onChange={(e) => setKycForm({ ...kycForm, website: e.target.value })}
-              />
+          <div className="form-section">
+            <div className="form-section-head">
+              <h2>Location</h2>
+              <p>A recognised city enables distance and freight estimates on matches.</p>
             </div>
-            <div>
-              <label htmlFor="kyc-signatory">Authorized Signatory / Director Name</label>
-              <input
-                id="kyc-signatory"
-                placeholder="Managing Director / Authorized Representative"
-                value={kycForm.signatory_name ?? ""}
-                onChange={(e) => setKycForm({ ...kycForm, signatory_name: e.target.value })}
-              />
+            <div className="field-grid">
+              <div className="field">
+                <label htmlFor="p-city">City</label>
+                <input id="p-city" value={form.city} onChange={(e) => update("city", e.target.value)} />
+              </div>
+              <div className="field">
+                <label htmlFor="p-state">State / province</label>
+                <input
+                  id="p-state"
+                  value={form.state}
+                  onChange={(e) => update("state", e.target.value)}
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="p-country">Country</label>
+                <input
+                  id="p-country"
+                  value={form.country}
+                  onChange={(e) => update("country", e.target.value)}
+                />
+              </div>
             </div>
           </div>
 
-          <button type="submit" disabled={kycSaving}>
-            {kycSaving ? "Authenticating GST & Credentials…" : "Submit & Verify Company"}
-          </button>
-        </form>
-      )}
-
-      {/* Tab 3: Certifications */}
-      {activeTab === "certificates" && (
-        <div className="card wide glass-card">
-          <div className="form-header-badge">
-            <div>
-              <h2>Compliance &amp; Quality Certificates</h2>
-              <p className="muted">
-                Add ISO, CE, FDA, GMP, or RoHS compliance credentials to prove product quality to buyers.
-              </p>
-            </div>
-            <button
-              type="button"
-              className="deal-room-btn"
-              onClick={() => setShowCertModal(true)}
-            >
-              + Add Certificate
+          <div className="form-footer">
+            <button type="submit" disabled={saving}>
+              {saving ? "Saving…" : "Save changes"}
             </button>
+          </div>
+        </form>
+      )}
+
+      {activeTab === "kyc" && (
+        <form className="panel form-panel" onSubmit={handleKycSubmit}>
+          <div className="form-section">
+            <div className="form-section-head form-section-head-row">
+              <div>
+                <h2>Business verification</h2>
+                <p>Verified businesses get a badge on every listing and rank higher in matches.</p>
+              </div>
+              <span className={`badge badge-kyc-${kycStatus}`}>{kycLabel(kycStatus)}</span>
+            </div>
+
+            <div className="field-grid field-grid-2">
+              <div className="field">
+                <label htmlFor="kyc-gst">GST or tax ID</label>
+                <input
+                  id="kyc-gst"
+                  required
+                  placeholder="15-character GSTIN or tax ID"
+                  value={kycForm.gst_number}
+                  onChange={(e) => setKycForm({ ...kycForm, gst_number: e.target.value })}
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="kyc-legal-name">Legal business name</label>
+                <input
+                  id="kyc-legal-name"
+                  required
+                  placeholder="As on the tax certificate"
+                  value={kycForm.legal_business_name}
+                  onChange={(e) => setKycForm({ ...kycForm, legal_business_name: e.target.value })}
+                />
+              </div>
+            </div>
+          </div>
+
+          <div className="form-section">
+            <div className="form-section-head">
+              <h2>
+                Company details <span className="optional">Optional</span>
+              </h2>
+            </div>
+            <div className="field-grid field-grid-2">
+              <div className="field">
+                <label htmlFor="kyc-type">Entity type</label>
+                <select
+                  id="kyc-type"
+                  value={kycForm.business_type}
+                  onChange={(e) => setKycForm({ ...kycForm, business_type: e.target.value })}
+                >
+                  <option value="Private Limited">Private Limited</option>
+                  <option value="Public Limited">Public Limited</option>
+                  <option value="Proprietorship">Sole Proprietorship</option>
+                  <option value="Partnership">Partnership / LLP</option>
+                  <option value="LLC">LLC</option>
+                  <option value="Corporation">Corporation</option>
+                </select>
+              </div>
+              <div className="field">
+                <label htmlFor="kyc-cin">Registration number (CIN)</label>
+                <input
+                  id="kyc-cin"
+                  placeholder="e.g. U72200MH2020PTC123456"
+                  value={kycForm.registration_number ?? ""}
+                  onChange={(e) => setKycForm({ ...kycForm, registration_number: e.target.value })}
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="kyc-year">Year established</label>
+                <input
+                  id="kyc-year"
+                  type="number"
+                  min="1850"
+                  max="2026"
+                  value={kycForm.year_established ?? 2020}
+                  onChange={(e) =>
+                    setKycForm({ ...kycForm, year_established: parseInt(e.target.value, 10) || 2020 })
+                  }
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="kyc-pan">Company PAN</label>
+                <input
+                  id="kyc-pan"
+                  placeholder="e.g. AABCU9603R"
+                  value={kycForm.pan_number ?? ""}
+                  onChange={(e) => setKycForm({ ...kycForm, pan_number: e.target.value })}
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="kyc-website">Website</label>
+                <input
+                  id="kyc-website"
+                  type="url"
+                  placeholder="https://company.example.com"
+                  value={kycForm.website ?? ""}
+                  onChange={(e) => setKycForm({ ...kycForm, website: e.target.value })}
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="kyc-signatory">Authorised signatory</label>
+                <input
+                  id="kyc-signatory"
+                  placeholder="Director or representative"
+                  value={kycForm.signatory_name ?? ""}
+                  onChange={(e) => setKycForm({ ...kycForm, signatory_name: e.target.value })}
+                />
+              </div>
+            </div>
+          </div>
+
+          <div className="form-footer">
+            <button type="submit" disabled={kycSaving}>
+              {kycSaving ? "Submitting…" : kycStatus === "unverified" ? "Submit for verification" : "Update details"}
+            </button>
+          </div>
+        </form>
+      )}
+
+      {activeTab === "certificates" && (
+        <div className="panel">
+          <div className="panel-head">
+            <div>
+              <h2>Certificates</h2>
+              <p className="panel-head-sub">ISO, CE, FDA, GMP or RoHS credentials strengthen your match ranking.</p>
+            </div>
+            {certList.length > 0 && (
+              <button type="button" className="primary small-btn" onClick={() => setShowCertModal(true)}>
+                <IconPlus size={14} />
+                Add certificate
+              </button>
+            )}
           </div>
 
           {loadingCerts ? (
-            <p className="muted">Loading certificates…</p>
+            <div className="loading-state">
+              <span className="spinner" />
+              Loading certificates…
+            </div>
           ) : certList.length === 0 ? (
-            <div className="empty-box">
-              <p className="muted">No certifications added yet.</p>
-              <small className="muted">
-                Sellers with verified certificates receive higher match priority and an enterprise trust badge.
-              </small>
+            <div className="empty-state">
+              <span className="empty-state-icon">
+                <IconFileText size={18} />
+              </span>
+              <strong>No certificates yet</strong>
+              <p>Add a verified credential to rank higher in matches and earn a trust badge.</p>
+              <button type="button" className="primary" onClick={() => setShowCertModal(true)}>
+                <IconPlus size={15} />
+                Add certificate
+              </button>
             </div>
           ) : (
-            <div className="cert-grid">
-              {certList.map((cert) => (
-                <div key={cert.id} className="cert-card">
-                  <div className="cert-head">
-                    <span className="cert-icon">📜</span>
-                    <strong>{cert.name}</strong>
-                    <span className="badge badge-accepted">{cert.verification_status}</span>
-                  </div>
-                  <div className="cert-body">
-                    <p><strong>Issuing Body:</strong> {cert.issuing_body}</p>
-                    <p><strong>Certificate #:</strong> {cert.certificate_number}</p>
-                    <p className="muted small">
-                      Issued: {new Date(cert.issue_date).toLocaleDateString()}
-                      {cert.expiry_date && ` · Expires: ${new Date(cert.expiry_date).toLocaleDateString()}`}
-                    </p>
-                    {cert.document_url && (
-                      <a href={cert.document_url} target="_blank" rel="noopener noreferrer" className="cert-link">
-                        View Certificate Document &rarr;
-                      </a>
-                    )}
-                  </div>
-                  <button
-                    type="button"
-                    className="secondary danger-btn small-btn"
-                    onClick={() => void handleDeleteCertificate(cert.id)}
-                  >
-                    Remove
-                  </button>
-                </div>
-              ))}
-            </div>
+            <>
+              <input
+                type="file"
+                ref={directFileInputRef}
+                hidden
+                accept=".pdf,.png,.jpg,.jpeg,.webp"
+                onChange={(e) => void handleDirectFileUpload(e)}
+              />
+              <ul className="cert-list">
+                {certList.map((cert) => (
+                  <li key={cert.id} className="cert-row">
+                    <span className="cert-row-icon" aria-hidden="true">
+                      <IconFileText size={17} />
+                    </span>
+                    <div className="cert-row-main">
+                      <span className="cert-row-title">{cert.name}</span>
+                      <span className="cert-row-meta">
+                        {cert.issuing_body} · No. {cert.certificate_number} · {formatDate(cert.issue_date)}
+                        {cert.expiry_date ? ` – ${formatDate(cert.expiry_date)}` : " · No expiry"}
+                      </span>
+                    </div>
+                    <span className={`badge badge-${cert.verification_status === "verified" ? "success" : cert.verification_status === "rejected" ? "danger" : "pending"}`}>
+                      {cert.verification_status === "verified"
+                        ? "Verified"
+                        : cert.verification_status === "rejected"
+                          ? "Rejected"
+                          : "In review"}
+                    </span>
+                    <div className="cert-row-actions">
+                      {cert.document_url ? (
+                        <button
+                          type="button"
+                          className="ghost small-btn"
+                          onClick={() => setPreviewModalCert(cert)}
+                        >
+                          View document
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          className="secondary small-btn"
+                          disabled={directUploadLoadingId === cert.id}
+                          onClick={() => triggerDirectUpload(cert.id)}
+                        >
+                          <IconUpload size={13} />
+                          {directUploadLoadingId === cert.id ? "Uploading…" : "Attach document"}
+                        </button>
+                      )}
+                      <Menu
+                        label={`More actions for ${cert.name}`}
+                        items={[
+                          {
+                            label: "Remove",
+                            tone: "danger",
+                            onSelect: () => void handleDeleteCertificate(cert.id),
+                          },
+                        ]}
+                      />
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </>
           )}
 
-          {/* Add Certificate Modal */}
-          {showCertModal && (
-            <div className="modal-backdrop" onClick={() => setShowCertModal(false)}>
-              <div className="modal-card" onClick={(e) => e.stopPropagation()}>
-                <div className="modal-header">
-                  <h3>Add Quality / Compliance Certificate</h3>
-                  <button type="button" className="close-btn" onClick={() => setShowCertModal(false)}>
-                    &times;
-                  </button>
+          <Modal
+            open={showCertModal}
+            onClose={closeCertModal}
+            busy={uploadingCert}
+            size="lg"
+            title="Add certificate"
+            description="Documents are reviewed for authenticity before they count toward your trust score."
+          >
+            <form className="cert-add-form" onSubmit={handleAddCertificate}>
+              <div className="field">
+                <span className="field-label">Common types</span>
+                <div className="cert-quick-types" role="group" aria-label="Common certificate types">
+                  {CERT_QUICK_TYPES.map((type) => (
+                    <button
+                      key={type}
+                      type="button"
+                      aria-pressed={certForm.name === type}
+                      className={`cert-quick-chip ${certForm.name === type ? "selected" : ""}`}
+                      onClick={() => setCertForm({ ...certForm, name: type })}
+                    >
+                      {type.replace(/ Quality Management| Environmental| Declaration| Compliance| Registration| Marking/g, "")}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="field-grid field-grid-2">
+                <div className="field field-span">
+                  <label htmlFor="c-name">Certificate name</label>
+                  <input
+                    id="c-name"
+                    required
+                    placeholder="e.g. ISO 9001:2015 Quality Management"
+                    value={certForm.name}
+                    onChange={(e) => setCertForm({ ...certForm, name: e.target.value })}
+                  />
+                </div>
+                <div className="field">
+                  <label htmlFor="c-body">Issuing body</label>
+                  <input
+                    id="c-body"
+                    required
+                    placeholder="e.g. SGS, TÜV, BSI"
+                    value={certForm.issuing_body}
+                    onChange={(e) => setCertForm({ ...certForm, issuing_body: e.target.value })}
+                  />
+                </div>
+                <div className="field">
+                  <label htmlFor="c-num">Certificate number</label>
+                  <input
+                    id="c-num"
+                    required
+                    placeholder="e.g. CERT-2026-X891"
+                    value={certForm.certificate_number}
+                    onChange={(e) => setCertForm({ ...certForm, certificate_number: e.target.value })}
+                  />
+                </div>
+                <div className="field">
+                  <label htmlFor="c-issue">Issue date</label>
+                  <input
+                    id="c-issue"
+                    type="date"
+                    required
+                    value={certForm.issue_date}
+                    onChange={(e) => setCertForm({ ...certForm, issue_date: e.target.value })}
+                  />
+                </div>
+                <div className="field">
+                  <label htmlFor="c-exp">
+                    Expiry date <span className="optional">Optional</span>
+                  </label>
+                  <input
+                    id="c-exp"
+                    type="date"
+                    value={certForm.expiry_date}
+                    onChange={(e) => setCertForm({ ...certForm, expiry_date: e.target.value })}
+                  />
+                </div>
+              </div>
+
+              <div className="field">
+                <div className="cert-doc-head">
+                  <span className="field-label">Document</span>
+                  <div className="tabs" role="tablist" aria-label="Document source">
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={certDocMode === "upload"}
+                      className={certDocMode === "upload" ? "tab active" : "tab"}
+                      onClick={() => setCertDocMode("upload")}
+                    >
+                      Upload file
+                    </button>
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={certDocMode === "url"}
+                      className={certDocMode === "url" ? "tab active" : "tab"}
+                      onClick={() => setCertDocMode("url")}
+                    >
+                      Link
+                    </button>
+                  </div>
                 </div>
 
-                <form onSubmit={handleAddCertificate}>
-                  <div>
-                    <label htmlFor="c-name">Certificate Name *</label>
+                {certDocMode === "upload" ? (
+                  <>
                     <input
-                      id="c-name"
-                      required
-                      placeholder="e.g. ISO 9001:2015, CE Mark, FDA Registration"
-                      value={certForm.name}
-                      onChange={(e) => setCertForm({ ...certForm, name: e.target.value })}
+                      type="file"
+                      ref={fileInputRef}
+                      hidden
+                      accept=".pdf,.png,.jpg,.jpeg,.webp"
+                      onChange={(e) => {
+                        if (e.target.files && e.target.files[0]) {
+                          handleFileSelect(e.target.files[0]);
+                        }
+                      }}
                     />
-                  </div>
-
-                  <div className="row">
-                    <div>
-                      <label htmlFor="c-body">Issuing Body / Registrar *</label>
-                      <input
-                        id="c-body"
-                        required
-                        placeholder="e.g. SGS, TÜV Rheinland, BSI, Bureau Veritas"
-                        value={certForm.issuing_body}
-                        onChange={(e) => setCertForm({ ...certForm, issuing_body: e.target.value })}
-                      />
-                    </div>
-                    <div>
-                      <label htmlFor="c-num">Certificate Number *</label>
-                      <input
-                        id="c-num"
-                        required
-                        placeholder="e.g. CERT-2026-X891"
-                        value={certForm.certificate_number}
-                        onChange={(e) => setCertForm({ ...certForm, certificate_number: e.target.value })}
-                      />
-                    </div>
-                  </div>
-
-                  <div className="row">
-                    <div>
-                      <label htmlFor="c-issue">Issue Date *</label>
-                      <input
-                        id="c-issue"
-                        type="date"
-                        required
-                        value={certForm.issue_date}
-                        onChange={(e) => setCertForm({ ...certForm, issue_date: e.target.value })}
-                      />
-                    </div>
-                    <div>
-                      <label htmlFor="c-exp">Expiry Date (Optional)</label>
-                      <input
-                        id="c-exp"
-                        type="date"
-                        value={certForm.expiry_date}
-                        onChange={(e) => setCertForm({ ...certForm, expiry_date: e.target.value })}
-                      />
-                    </div>
-                  </div>
-
-                  <div>
-                    <label htmlFor="c-doc">Document URL (Optional PDF/Verification link)</label>
+                    {!selectedFile ? (
+                      <div
+                        className={`cert-dropzone ${isDragging ? "dragover" : ""}`}
+                        onClick={() => fileInputRef.current?.click()}
+                        onDragOver={(e) => {
+                          e.preventDefault();
+                          setIsDragging(true);
+                        }}
+                        onDragLeave={() => setIsDragging(false)}
+                        onDrop={handleDrop}
+                        role="button"
+                        tabIndex={0}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" || e.key === " ") {
+                            e.preventDefault();
+                            fileInputRef.current?.click();
+                          }
+                        }}
+                      >
+                        <IconUpload size={18} />
+                        <span>
+                          <strong>Choose a file</strong> or drag it here
+                        </span>
+                        <span className="cert-dropzone-hint">PDF, PNG, JPG or WebP, up to 10 MB</span>
+                      </div>
+                    ) : (
+                      <div className="cert-file-pill">
+                        <IconFileText size={18} />
+                        <div className="cert-file-meta">
+                          <span className="cert-file-name">{selectedFile.name}</span>
+                          <span className="cert-file-size">{formatFileSize(selectedFile.size)}</span>
+                        </div>
+                        <button
+                          type="button"
+                          className="ghost small-btn"
+                          onClick={() => fileInputRef.current?.click()}
+                        >
+                          Replace
+                        </button>
+                        <button
+                          type="button"
+                          className="icon-btn"
+                          onClick={() => {
+                            setSelectedFile(null);
+                            if (fileInputRef.current) fileInputRef.current.value = "";
+                          }}
+                          title="Remove file"
+                          aria-label="Remove file"
+                        >
+                          <IconX size={16} />
+                        </button>
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <>
                     <input
                       id="c-doc"
                       type="url"
+                      aria-label="Document URL"
                       placeholder="https://certificates.example.com/iso9001.pdf"
                       value={certForm.document_url}
                       onChange={(e) => setCertForm({ ...certForm, document_url: e.target.value })}
                     />
-                  </div>
-
-                  <div className="modal-actions">
-                    <button type="submit">Verify &amp; Save Certificate</button>
-                    <button type="button" className="secondary" onClick={() => setShowCertModal(false)}>
-                      Cancel
-                    </button>
-                  </div>
-                </form>
+                    <small>A direct link to a PDF or image.</small>
+                  </>
+                )}
               </div>
-            </div>
-          )}
+
+              <div className="modal-actions">
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={closeCertModal}
+                  disabled={uploadingCert}
+                >
+                  Cancel
+                </button>
+                <button type="submit" disabled={uploadingCert}>
+                  {uploadingCert ? "Saving…" : "Add certificate"}
+                </button>
+              </div>
+            </form>
+          </Modal>
+
+          <Modal
+            open={previewModalCert !== null}
+            onClose={() => setPreviewModalCert(null)}
+            size="lg"
+            title={previewModalCert?.name ?? ""}
+            description={
+              previewModalCert &&
+              `Issued by ${previewModalCert.issuing_body} · No. ${previewModalCert.certificate_number}`
+            }
+            footer={
+              previewModalCert?.document_url && (
+                <a
+                  href={previewModalCert.document_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="button secondary"
+                >
+                  <IconExternalLink size={14} />
+                  Open in new tab
+                </a>
+              )
+            }
+          >
+            {previewModalCert && (
+              <div className="cert-preview-content">
+                {previewModalCert.document_url ? (
+                  previewModalCert.document_url.toLowerCase().endsWith(".pdf") ? (
+                    <iframe
+                      src={previewModalCert.document_url}
+                      title={previewModalCert.name}
+                      className="cert-preview-frame"
+                    />
+                  ) : (
+                    <img
+                      src={previewModalCert.document_url}
+                      alt={previewModalCert.name}
+                      className="cert-preview-img"
+                    />
+                  )
+                ) : (
+                  <p className="muted">No document attached.</p>
+                )}
+              </div>
+            )}
+          </Modal>
         </div>
       )}
 
-      {/* Tab 4: Ratings & Reviews */}
       {activeTab === "reviews" && (
-        <div className="card wide glass-card">
-          <h2>Network Reputation &amp; Counterparty Reviews</h2>
-          <p className="muted">
-            Reviews and ratings submitted by trading counterparties after completed and delivered transactions.
-          </p>
+        <div className="panel">
+          <div className="panel-head">
+            <div>
+              <h2>Ratings &amp; reviews</h2>
+              <p className="panel-head-sub">Left by counterparties after a completed delivery.</p>
+            </div>
+          </div>
 
           {loadingReviews ? (
-            <p className="muted">Loading reputation stats…</p>
+            <div className="loading-state">
+              <span className="spinner" />
+              Loading reviews…
+            </div>
           ) : !reviewStats || reviewStats.total_reviews === 0 ? (
-            <div className="empty-box">
-              <p className="muted">No ratings recorded yet.</p>
-              <small className="muted">
-                Complete and deliver your first B2B transaction in the Deal Room to earn verified star ratings.
-              </small>
+            <div className="empty-state">
+              <span className="empty-state-icon">
+                <IconStar size={18} />
+              </span>
+              <strong>No reviews yet</strong>
+              <p>Complete a trade in the deal room and your counterparty can rate it.</p>
             </div>
           ) : (
             <div className="reviews-overview">
               <div className="rating-summary-box">
                 <div className="big-stars">
                   <span className="big-star-num">{reviewStats.average_rating.toFixed(1)}</span>
-                  <span className="stars-icons">★★★★★</span>
-                  <span className="muted small">Based on {reviewStats.total_reviews} verified trade{reviewStats.total_reviews > 1 ? "s" : ""}</span>
+                  <span className="stars-icons" aria-hidden="true">
+                    {"★".repeat(Math.round(reviewStats.average_rating))}
+                    <span className="stars-empty">{"★".repeat(5 - Math.round(reviewStats.average_rating))}</span>
+                  </span>
+                  <span className="muted small">
+                    {reviewStats.total_reviews} {reviewStats.total_reviews === 1 ? "review" : "reviews"}
+                  </span>
                 </div>
                 <div className="rating-breakdown-bars">
                   {[5, 4, 3, 2, 1].map((stars) => {
                     const count = reviewStats.rating_breakdown[stars] || 0;
-                    const pct = reviewStats.total_reviews ? Math.round((count / reviewStats.total_reviews) * 100) : 0;
+                    const pct = reviewStats.total_reviews
+                      ? Math.round((count / reviewStats.total_reviews) * 100)
+                      : 0;
                     return (
                       <div key={stars} className="breakdown-bar-row">
-                        <span className="bar-label">{stars} ★</span>
+                        <span className="bar-label">{stars}</span>
                         <div className="bar-track">
                           <div className="bar-fill" style={{ width: `${pct}%` }} />
                         </div>
@@ -650,26 +1054,28 @@ export function Profile() {
                 </div>
               </div>
 
-              <div className="recent-reviews-list">
-                <h3>Recent Counterparty Feedback</h3>
+              <ul className="recent-reviews-list">
                 {reviewStats.recent_reviews.map((r) => (
-                  <article key={r.id} className="review-item">
+                  <li key={r.id} className="review-item">
                     <div className="review-item-head">
-                      <div>
-                        <strong>{r.reviewer_company || r.reviewer_name || "Verified Trader"}</strong>
-                        <span className="muted small"> &middot; {new Date(r.created_at).toLocaleDateString()}</span>
+                      <strong>{r.reviewer_company || r.reviewer_name || "Verified trader"}</strong>
+                      <span className="star-pill" aria-label={`${r.rating} out of 5`}>
+                        {"★".repeat(r.rating)}
+                        <span className="stars-empty">{"★".repeat(5 - r.rating)}</span>
+                      </span>
+                      <span className="review-date">{formatDate(r.created_at)}</span>
+                    </div>
+                    {r.comment && <p className="review-comment">{r.comment}</p>}
+                    {(r.communication_rating || r.delivery_rating || r.quality_rating) && (
+                      <div className="review-subratings">
+                        {r.communication_rating && <span>Communication {r.communication_rating}/5</span>}
+                        {r.delivery_rating && <span>Delivery {r.delivery_rating}/5</span>}
+                        {r.quality_rating && <span>Quality {r.quality_rating}/5</span>}
                       </div>
-                      <span className="star-pill">{"★".repeat(r.rating)}{"☆".repeat(5 - r.rating)}</span>
-                    </div>
-                    {r.comment && <p className="review-comment">&ldquo;{r.comment}&rdquo;</p>}
-                    <div className="review-subratings">
-                      {r.communication_rating && <span>Communication: {r.communication_rating}/5</span>}
-                      {r.delivery_rating && <span>Delivery: {r.delivery_rating}/5</span>}
-                      {r.quality_rating && <span>Quality: {r.quality_rating}/5</span>}
-                    </div>
-                  </article>
+                    )}
+                  </li>
                 ))}
-              </div>
+              </ul>
             </div>
           )}
         </div>

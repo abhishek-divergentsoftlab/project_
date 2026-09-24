@@ -4,6 +4,8 @@ import { BrowserRouter } from "react-router-dom";
 
 import App from "@/App";
 import { AuthProvider } from "@/context/AuthContext";
+import { FeedbackProvider } from "@/context/FeedbackContext";
+import { ThemeProvider } from "@/context/ThemeContext";
 import "@/index.css";
 
 const container = document.getElementById("root");
@@ -12,9 +14,13 @@ if (!container) throw new Error("#root is missing from index.html");
 createRoot(container).render(
   <StrictMode>
     <BrowserRouter>
-      <AuthProvider>
-        <App />
-      </AuthProvider>
+      <ThemeProvider>
+        <FeedbackProvider>
+          <AuthProvider>
+            <App />
+          </AuthProvider>
+        </FeedbackProvider>
+      </ThemeProvider>
     </BrowserRouter>
   </StrictMode>,
 );
