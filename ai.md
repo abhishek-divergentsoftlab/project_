@@ -95,7 +95,7 @@ Instead of a generic chatbot, the system utilizes a **Specialized Multi-Agent Pe
 - **Role**: Formulates tactical B2B counter-offers, payment terms (advance vs. LC vs. milestone-based), and volume discount requests.
 - **Principles**: Anchoring strategies, BATNA identification, and win-win trade terms.
 - **Tool Calling**:
-  - `send_counterparty_message`: Composes and directly dispatches formal business counter-proposals to counterparties.
+  - `draft_counterparty_message`: Prepares structured negotiation message drafts for user review before the user explicitly confirms and sends to counterparties.
 
 #### 4. Price Analyst Agent (`price_analyst` - 📊)
 - **Role**: Normalizes multi-currency quotes (USD, EUR, INR, GBP), computes distance-based shipping estimates, and calculates **Total Landed Cost of Ownership** (product price + freight + customs tariffs).

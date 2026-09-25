@@ -487,6 +487,17 @@
   background: var(--surface);
 }
 
+.ai-counterparty-msg-card.is-draft {
+  border-color: color-mix(in srgb, var(--warning) 35%, var(--border));
+  background: color-mix(in srgb, var(--warn-bg) 25%, var(--surface));
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--warning) 6%, transparent);
+}
+
+.ai-counterparty-msg-card.is-sent {
+  border-color: color-mix(in srgb, var(--success) 30%, var(--border));
+  background: color-mix(in srgb, var(--success-bg) 20%, var(--surface));
+}
+
 .ai-cp-card-header {
   display: flex;
   align-items: center;
@@ -494,6 +505,43 @@
   gap: var(--space-3);
   font-size: var(--text-sm);
   color: var(--muted);
+}
+
+.ai-cp-header-left {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.ai-cp-draft-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border-radius: var(--radius-full, 9999px);
+  background: var(--warn-bg);
+  color: var(--warn-text);
+  border: 1px solid color-mix(in srgb, var(--warning) 25%, transparent);
+}
+
+.ai-cp-recipient {
+  font-size: var(--text-sm);
+  color: var(--muted);
+}
+
+.ai-cp-recipient strong {
+  color: var(--text);
+}
+
+.ai-cp-header-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
 }
 
 .ai-cp-card-title strong {
@@ -506,6 +554,107 @@
   color: var(--text-secondary);
   font-size: var(--text-sm);
   line-height: 1.55;
+}
+
+.ai-cp-draft-editor {
+  width: 100%;
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--text-sm);
+  line-height: 1.5;
+  resize: vertical;
+  transition: border-color var(--transition-fast, 0.15s ease);
+}
+
+.ai-cp-draft-editor:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--focus-ring);
+}
+
+.ai-cp-card-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding-top: var(--space-2);
+  border-top: 1px dashed color-mix(in srgb, var(--warning) 25%, var(--border));
+  flex-wrap: wrap;
+}
+
+.ai-cp-send-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-weight: 500;
+  cursor: pointer;
+  transition: transform 0.12s ease, filter 0.12s ease;
+}
+
+.ai-cp-send-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+}
+
+.ai-cp-hint-text {
+  font-size: 11px;
+  color: var(--muted);
+  font-style: italic;
+}
+
+.ai-sent-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* Counterparty live pane draft banner */
+.counterparty-draft-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  background: color-mix(in srgb, var(--warn-bg) 60%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--warning) 30%, transparent);
+  border-radius: var(--radius-md);
+  margin-bottom: var(--space-2);
+  font-size: var(--text-xs, 12px);
+}
+
+.counterparty-draft-text {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  flex: 1;
+}
+
+.draft-preview-snippet {
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.counterparty-use-draft-btn {
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 500;
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: var(--accent-text);
+  border: none;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.counterparty-use-draft-btn:hover {
+  background: var(--accent-hover);
 }
 
 .ai-created-rfq-badge-row {

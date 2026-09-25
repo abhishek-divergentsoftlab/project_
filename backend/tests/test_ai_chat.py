@@ -879,29 +879,30 @@ def test_counterparty_message_intent_detection():
 
 @pytest.mark.asyncio
 async def test_execute_send_counterparty_message_simulation():
-    """Verify execute_send_counterparty_message_call formats and simulates message dispatch when without db."""
-    from services.ai_chat_service import execute_send_counterparty_message_call, format_counterparty_message_text
+    """Verify execute_draft_counterparty_message_call formats and simulates message drafting when without db."""
+    from services.ai_chat_service import execute_draft_counterparty_message_call, format_counterparty_message_text
 
     tool_args = {
         "recipient_name": "Agro Fresh Ltd",
         "message": "Dear Agro Fresh team, could you please consider reducing the unit price from $1.00 to $0.90 for this 1,299 kg order? We would appreciate your best offer.",
         "negotiation_objective": "Price reduction to $0.90",
     }
-    result, err = await execute_send_counterparty_message_call(tool_args)
+    result, err = await execute_draft_counterparty_message_call(tool_args)
     assert err is None
     assert result is not None
-    assert result["status"] == "delivered"
+    assert result["status"] == "draft"
     assert result["counterparty_name"] == "Agro Fresh Ltd"
     assert "$0.90" in result["message"]
 
     formatted = format_counterparty_message_text(result)
     assert "Agro Fresh Ltd" in formatted
     assert "$0.90" in formatted
+    assert "Drafted for Agro Fresh Ltd" in formatted
 
 
 @pytest.mark.asyncio
 async def test_ai_chat_message_endpoint_handles_send_counterparty_message(client: AsyncClient, make_actor, make_rfq):
-    """Verify /ai-chat/message handles send_counterparty_message tool call and returns structured counterparty_message."""
+    """Verify /ai-chat/message handles draft_counterparty_message tool call and returns draft without directly sending."""
     buyer = await make_actor("buyer", name="Anil Buyer", company_name="Anil Traders")
     seller = await make_actor("seller", name="Rekha Seller", company_name="Premium Agro Supplies")
     listing = await make_rfq(seller, role="seller", title="Supplying 5000 kg Fresh Fuji Apples")
@@ -926,7 +927,7 @@ async def test_ai_chat_message_endpoint_handles_send_counterparty_message(client
                     "tool_calls": [
                         {
                             "function": {
-                                "name": "send_counterparty_message",
+                                "name": "draft_counterparty_message",
                                 "arguments": {
                                     "recipient_name": "Premium Agro Supplies",
                                     "message": "Dear team, would it be possible to adjust the unit price from $1.00 to $0.90 for this order? Thank you.",
@@ -949,7 +950,7 @@ async def test_ai_chat_message_endpoint_handles_send_counterparty_message(client
                 "messages": [
                     {
                         "role": "user",
-                        "content": "send message to the seller and the behaviour should be like politely and ask can you reduce the price from 1 dollar to 0.9",
+                        "content": "send natotiation message to the counter user and ask can you reduce the price from 1 dollar to 0.9",
                     }
                 ]
             },
@@ -960,10 +961,16 @@ async def test_ai_chat_message_endpoint_handles_send_counterparty_message(client
         cp_msg = data["counterparty_message"]
         assert cp_msg["counterparty_name"] == "Premium Agro Supplies"
         assert "$0.90" in cp_msg["message"]
-        assert "Message Sent to Premium Agro Supplies" in data["reply"]
+        assert cp_msg["status"] == "draft"
+        assert "Negotiation Message Drafted for Premium Agro Supplies" in data["reply"]
         assert data["conversation_id"] is not None
 
-        # Check conversation history contains counterparty_message metadata
+        # Verify that the message was NOT directly sent to the connection messages table!
+        conn_msgs_res = await buyer.get(f"/connections/{conn_id}/messages")
+        assert conn_msgs_res.status_code == 200
+        assert len(conn_msgs_res.json()) == 0, "AI must NOT directly send message; it should remain a draft"
+
+        # Check conversation history contains counterparty_message metadata with draft status
         conv_id = data["conversation_id"]
         detail_res = await buyer.get(f"/ai-chat/conversations/{conv_id}")
         assert detail_res.status_code == 200
@@ -972,6 +979,28 @@ async def test_ai_chat_message_endpoint_handles_send_counterparty_message(client
         assert last_msg["role"] == "assistant"
         assert last_msg.get("counterparty_message") is not None
         assert last_msg["counterparty_message"]["counterparty_name"] == "Premium Agro Supplies"
+        assert last_msg["counterparty_message"]["status"] == "draft"
+
+        # Now simulate user clicking "Send" button on the draft card:
+        # 1. User sends message via connection service
+        send_res = await buyer.post(
+            f"/connections/{conn_id}/messages",
+            json={"content": cp_msg["message"]},
+        )
+        assert send_res.status_code == 201
+        sent_data = send_res.json()
+
+        # 2. Mark draft as sent in AI chat conversation
+        mark_res = await buyer.post(
+            f"/ai-chat/conversations/{conv_id}/messages/{last_msg['id']}/mark-sent",
+            json={"sent_message_id": sent_data["id"]},
+        )
+        assert mark_res.status_code == 200
+
+        # Verify conversation message now shows delivered
+        detail_res2 = await buyer.get(f"/ai-chat/conversations/{conv_id}")
+        detail2 = detail_res2.json()
+        assert detail2["messages"][-1]["counterparty_message"]["status"] == "delivered"
 
 
 @pytest.mark.asyncio
@@ -1070,7 +1099,7 @@ async def test_counterparty_followup_deterministic_fallback(client: AsyncClient,
         cp_msg = data["counterparty_message"]
         assert cp_msg["counterparty_name"] == "Aurora Enterprises"
         assert "10 km away from Indore" in cp_msg["message"]
-        assert cp_msg["status"] == "delivered"
+        assert cp_msg["status"] == "draft"
         # Product draft is not corrupted to "aslo mantion location"
         assert data["rfq_draft"]["product_details"]["name"] == "Fuji apples"
 

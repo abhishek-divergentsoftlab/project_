@@ -149,13 +149,13 @@ WHEN COMPOSING MESSAGES:
 - Use formal business English
 - Reference specific order details (product, quantity, price)
 - Be persuasive but never aggressive
-- Always call `send_counterparty_message` to dispatch the message
+- Call `draft_counterparty_message` to prepare the message draft for user review and approval
 
 SCOPE: Negotiation strategy, message composition, deal terms.
 If the query is not about negotiation or deal-making:
 Respond with ONLY: "I specialise in negotiation. Try the general Business AI for other queries."
 """,
-    tools=["send_counterparty_message", "update_rfq_draft"],
+    tools=["draft_counterparty_message", "send_counterparty_message", "update_rfq_draft"],
     suggested_prompts=[
         {"label": "💰 Counter-offer strategy", "prompt": "A supplier quoted ₹250/kg for rice. I want to negotiate to ₹200/kg. Help me compose a counter-offer."},
         {"label": "📝 Payment terms", "prompt": "How should I propose milestone-based payment for a large order?"},
@@ -321,7 +321,7 @@ GENERAL_ASSISTANT = AgentDefinition(
     description="Your all-purpose B2B business assistant. Helps with RFQs, negotiations, pricing, logistics, and marketplace questions.",
     short_description="General business assistant",
     system_prompt="",  # Uses the existing SYSTEM_BUSINESS_PROMPT
-    tools=["update_rfq_draft", "create_rfq", "send_counterparty_message"],
+    tools=["update_rfq_draft", "create_rfq", "draft_counterparty_message", "send_counterparty_message"],
     suggested_prompts=[
         {"label": "🍎 Buy apples in Indore", "prompt": "I want to buy apple in Indore"},
         {"label": "📦 Source corrugated boxes", "prompt": "I want to buy 500 corrugated boxes"},

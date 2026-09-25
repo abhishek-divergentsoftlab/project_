@@ -344,7 +344,7 @@ export interface AICounterpartyMessage {
   connection_id: string;
   counterparty_name: string;
   message: string;
-  message_id: string;
+  message_id?: string;
   status: string;
   created_at: string;
 }
@@ -436,6 +436,12 @@ export const aiChat = {
 
   async deleteConversation(id: string): Promise<void> {
     await api.delete(`/ai-chat/conversations/${id}`);
+  },
+
+  async markDraftSent(conversationId: string, messageId: string, sentMessageId?: string): Promise<void> {
+    await api.post(`/ai-chat/conversations/${conversationId}/messages/${messageId}/mark-sent`, {
+      sent_message_id: sentMessageId,
+    });
   },
 
   async sendMessage(
@@ -659,7 +665,16 @@ export const escrow = {
 
 export const logistics = {
   async estimateFreight(payload: FreightEstimateRequest): Promise<FreightEstimateResponse> {
-    const { data } = await api.post<FreightEstimateResponse>("/logistics/estimate", payload);
+    const weight = payload.weight_kg ?? payload.gross_weight_kg ?? 1000;
+    const vol = payload.volume_cbm ?? payload.cbm ?? 1.2;
+    const body: FreightEstimateRequest = {
+      ...payload,
+      weight_kg: weight,
+      gross_weight_kg: weight,
+      volume_cbm: vol,
+      cbm: vol,
+    };
+    const { data } = await api.post<FreightEstimateResponse>("/logistics/estimate", body);
     return data;
   },
   async getConnectionShipment(connectionId: string): Promise<Shipment | null> {

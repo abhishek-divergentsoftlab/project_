@@ -290,7 +290,7 @@ def build_rfq_system_prompt(
             f"  \"{last_msg_text}\"\n"
             "- CRITICAL RULES FOR FOLLOW-UPS & AMENDMENTS:\n"
             "  * When the user gives additions or amendments (e.g. 'also mention that...', 'aslo mantion that the location is not indore its 10kg away', 'tell them we can pay cash', 'and add that...'):\n"
-            "    1. You MUST call the `send_counterparty_message` tool to dispatch the updated/amended message to the counterparty!\n"
+            "    1. You MUST call the `draft_counterparty_message` tool to draft the updated/amended message for the counterparty!\n"
             "    2. NEVER call `update_rfq_draft` with amendment text phrases (e.g. NEVER set product to 'aslo mantion location')!\n"
             "    3. In your amended message, preserve the polite quotation context and accurately integrate the user's specific addition or correction without hallucinating unrelated distant cities or terms.\n"
             "    4. Do not invent cities like Nagpur when user only specifies a distance from Indore; state '10 km outside Indore'.\n"
@@ -298,15 +298,15 @@ def build_rfq_system_prompt(
 
     negotiation_directive = (
         "\nNEGOTIATION & COUNTERPARTY MESSAGING DIRECTIVES:\n"
-        "- When the user instructs to send a message to a seller or negotiate (e.g. 'send nagitiation message to that user', 'message the supplier', 'ask for discount', 'negotiate with Himalaya Orchards'):\n"
+        "- When the user instructs to send a message to a seller or negotiate (e.g. 'send negotiation message to the counter user', 'message the supplier', 'ask for discount', 'negotiate with Himalaya Orchards'):\n"
         "  * ALWAYS adopt an exceptionally polite, courteous, and commercially persuasive tone on behalf of the user.\n"
         "  * Formulate a complete, polite business communication stating appreciation for their quotation, referencing the order details (quantity, delivery location), and politely requesting the specific adjustment (e.g. price reduction to 180 INR per kg).\n"
-        "  * Call the `send_counterparty_message` tool with `message`, `recipient_name`, and optional `proposed_price` / `proposed_currency`.\n"
-        "  * In your reply to the user, confirm that the polite negotiation message was dispatched and inform them they can watch the live conversation in the seller chat pane on the right.\n"
+        "  * Call the `draft_counterparty_message` tool with `message`, `recipient_name`, and optional `proposed_price` / `proposed_currency`.\n"
+        "  * IMPORTANT: The message is drafted for user review. Inform the user that you have drafted the negotiation proposal for their review, and invite them to click the Send button on the card to dispatch it.\n"
         "- When the user provides follow-up additions, notes, or amendments (e.g. 'also mention that...', 'tell them that...', 'aslo mantion that the location is not indore its 10kg away'):\n"
-        "  * You MUST call the `send_counterparty_message` tool with the amended/updated message.\n"
+        "  * You MUST call the `draft_counterparty_message` tool with the amended/updated message.\n"
         "  * Do NOT call `update_rfq_draft` or update the product name with conversational directives.\n"
-        "  * The `message` argument in `send_counterparty_message` MUST contain the full and complete letter from start to finish. Never truncate the tool argument mid-sentence.\n"
+        "  * The `message` argument in `draft_counterparty_message` MUST contain the full and complete letter from start to finish. Never truncate the tool argument mid-sentence.\n"
     ) + active_thread_section
 
     return f"""{SYSTEM_BUSINESS_PROMPT}
@@ -324,7 +324,7 @@ IMPORTANT RULES:
 - Required fields MUST be prioritized first.
 - Always call `update_rfq_draft(**kwargs)` when business details are mentioned.
 - When the user confirms or requests to create/post the RFQ (e.g. 'create rfq', 'yes create it', 'proceed', 'post it') and both Role and Product are known, call `create_rfq(...)` to publish it into the marketplace!
-- When the user instructs to send a message to the seller or negotiate, call `send_counterparty_message(...)`.
+- When the user instructs to send a message to the seller or negotiate, call `draft_counterparty_message(...)`.
 - Keep all questions and responses extremely short and informative.
 """
 
@@ -468,17 +468,17 @@ async def execute_close_rfq_call(
         return None, f"Failed to close RFQ: {str(exc)}"
 
 
-async def execute_send_counterparty_message_call(
+async def execute_draft_counterparty_message_call(
     tool_args: dict[str, Any],
     db: Optional[AsyncSession] = None,
     user: Optional[User] = None,
     matched_candidates: Optional[list[dict[str, Any]]] = None,
     active_connection_id: Optional[Union[str, uuid.UUID]] = None,
 ) -> tuple[Optional[dict[str, Any]], Optional[str]]:
-    """Execute send_counterparty_message tool call, dispatching message to seller/counterparty."""
+    """Execute draft_counterparty_message tool call, preparing a negotiation draft for user confirmation."""
     message = tool_args.get("message")
     if not message or not str(message).strip():
-        return None, "Message content is required to send to the counterparty."
+        return None, "Message content is required to draft for the counterparty."
     message_content = str(message).strip()
 
     if db is not None and user is not None:
@@ -486,7 +486,6 @@ async def execute_send_counterparty_message_call(
             from services import connection_service
             from models.connection import Connection
             from models.enums import ConnectionStatus
-            from schemas.connection import ConnectionMessageCreate
 
             conn = None
             target_conn_id = tool_args.get("connection_id") or active_connection_id
@@ -556,15 +555,11 @@ async def execute_send_counterparty_message_call(
             if not conn:
                 return None, "No active seller connection found to send the message. Please view matches or connect with a seller first."
 
-            # Ensure connection is ACCEPTED so communication can proceed
+            # Ensure connection is ACCEPTED so communication can proceed when user clicks Send
             if conn.status != ConnectionStatus.ACCEPTED:
                 conn.status = ConnectionStatus.ACCEPTED
                 await db.commit()
                 await db.refresh(conn)
-
-            # Send message via connection_service
-            msg_payload = ConnectionMessageCreate(content=message_content)
-            sent_msg = await connection_service.send_message(db, conn.id, user.id, msg_payload)
 
             # Resolve counterparty name
             other_user = conn.receiver if conn.sender_id == user.id else conn.sender
@@ -578,43 +573,85 @@ async def execute_send_counterparty_message_call(
                 or "Seller"
             )
 
+            # Prepared as a draft for user confirmation - NOT sent directly
             return {
                 "connection_id": str(conn.id),
                 "counterparty_name": company_name,
                 "message": message_content,
-                "message_id": str(sent_msg.id),
-                "status": "delivered",
-                "created_at": sent_msg.created_at.isoformat(),
+                "status": "draft",
+                "created_at": datetime.now(timezone.utc).isoformat(),
             }, None
 
         except Exception as exc:
-            logger.exception("Failed to send counterparty message: %s", exc)
-            return None, f"Failed to send counterparty message: {str(exc)}"
+            logger.exception("Failed to draft counterparty message: %s", exc)
+            return None, f"Failed to draft counterparty message: {str(exc)}"
     else:
         # Fallback simulation (for tests without db session)
         sim_conn_id = str(active_connection_id or uuid.uuid4())
-        sim_msg_id = str(uuid.uuid4())
         c_name = tool_args.get("recipient_name") or "Seller"
         return {
             "connection_id": sim_conn_id,
             "counterparty_name": c_name,
             "message": message_content,
-            "message_id": sim_msg_id,
-            "status": "delivered",
+            "status": "draft",
             "created_at": datetime.now(timezone.utc).isoformat(),
         }, None
 
 
+execute_send_counterparty_message_call = execute_draft_counterparty_message_call
+
+
 def format_counterparty_message_text(result: dict[str, Any]) -> str:
-    """Format confirmation message when a counterparty message is dispatched."""
+    """Format confirmation message when a counterparty message is drafted or dispatched."""
     recipient = result.get("counterparty_name") or "Seller"
     msg_text = result.get("message") or ""
+    status = result.get("status", "draft")
+    if status == "draft":
+        return (
+            f"📝 **Negotiation Message Drafted for {recipient}**\n\n"
+            f"> *\"{msg_text}\"*\n\n"
+            f"Review the draft above and click the **Send to {recipient}** button on the card to dispatch it to their chat."
+        )
     return (
         f"✉️ **Message Sent to {recipient}**\n\n"
         f"> *\"{msg_text}\"*\n\n"
-        f"The message has been delivered directly into your active chat thread with {recipient}. "
-        f"You can monitor the live conversation and counterparty replies in the seller chat pane on the right."
+        f"The message has been delivered directly into your active chat thread with {recipient}."
     )
+
+
+async def mark_counterparty_message_sent(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    message_id: uuid.UUID,
+    sent_message_id: Optional[str] = None,
+) -> bool:
+    """Mark a drafted counterparty message in an AI conversation as delivered/sent."""
+    stmt = (
+        select(Message)
+        .join(Conversation, Conversation.id == Message.conversation_id)
+        .where(
+            Message.id == message_id,
+            Message.conversation_id == conversation_id,
+            Conversation.user_id == user_id,
+        )
+    )
+    msg = await db.scalar(stmt)
+    if not msg:
+        return False
+    meta = dict(msg.msg_metadata or {})
+    cp = meta.get("counterparty_message")
+    if cp:
+        cp["status"] = "delivered"
+        if sent_message_id:
+            cp["message_id"] = str(sent_message_id)
+        meta["counterparty_message"] = cp
+        msg.msg_metadata = meta
+        from sqlalchemy.orm.attributes import flag_modified
+        flag_modified(msg, "msg_metadata")
+        await db.commit()
+        return True
+    return False
 
 
 def extract_or_compose_counterparty_message(
@@ -1134,7 +1171,7 @@ async def generate_business_chat_reply(
     tools = [] if is_match_query else [
         rfq_tool_service.UPDATE_RFQ_DRAFT_TOOL,
         rfq_tool_service.CREATE_RFQ_TOOL,
-        rfq_tool_service.SEND_COUNTERPARTY_MESSAGE_TOOL,
+        rfq_tool_service.DRAFT_COUNTERPARTY_MESSAGE_TOOL,
         rfq_tool_service.CLOSE_RFQ_TOOL,
     ]
 
@@ -1191,8 +1228,8 @@ async def generate_business_chat_reply(
                 created_rfq_obj, err = await execute_create_rfq_call(draft, raw_args, db=db, user=user)
                 if err and not reply:
                     reply = f"⚠️ {err}"
-            elif tc_name == "send_counterparty_message":
-                counterparty_msg_obj, err = await execute_send_counterparty_message_call(
+            elif tc_name in ("draft_counterparty_message", "send_counterparty_message"):
+                counterparty_msg_obj, err = await execute_draft_counterparty_message_call(
                     raw_args,
                     db=db,
                     user=user,
@@ -1223,7 +1260,7 @@ async def generate_business_chat_reply(
                     reply = f"⚠️ {err}"
 
         # Deterministic fallback for counterparty message if tool was not called explicitly
-        is_dispatch_reply = bool(re.search(r"(✉️|message\s+sent\s+to|dispatched|dear\s+[\w\s]+,)", reply, re.IGNORECASE))
+        is_dispatch_reply = bool(re.search(r"(✉️|📝|message\s+sent\s+to|dispatched|drafted|dear\s+[\w\s]+,)", reply, re.IGNORECASE))
         if not counterparty_msg_obj and (is_counterparty_msg or is_dispatch_reply):
             msg_to_send = extract_or_compose_counterparty_message(
                 reply_text=reply,
@@ -1236,7 +1273,7 @@ async def generate_business_chat_reply(
                 last_counterparty_info=last_counterparty_msg,
                 matched_candidates=matched_candidates,
             )
-            counterparty_msg_obj, err = await execute_send_counterparty_message_call(
+            counterparty_msg_obj, err = await execute_draft_counterparty_message_call(
                 tool_args={"message": msg_to_send, "recipient_name": recipient_name},
                 db=db,
                 user=user,
@@ -1587,7 +1624,7 @@ async def stream_business_chat_reply(
     tools = [] if is_match_query else [
         rfq_tool_service.UPDATE_RFQ_DRAFT_TOOL,
         rfq_tool_service.CREATE_RFQ_TOOL,
-        rfq_tool_service.SEND_COUNTERPARTY_MESSAGE_TOOL,
+        rfq_tool_service.DRAFT_COUNTERPARTY_MESSAGE_TOOL,
         rfq_tool_service.CLOSE_RFQ_TOOL,
     ]
 
@@ -1696,8 +1733,8 @@ async def stream_business_chat_reply(
                                 "counterparty_message": None,
                                 "done": False,
                             })
-                        elif tc_name == "send_counterparty_message":
-                            counterparty_msg_obj, err = await execute_send_counterparty_message_call(
+                        elif tc_name in ("draft_counterparty_message", "send_counterparty_message"):
+                            counterparty_msg_obj, err = await execute_draft_counterparty_message_call(
                                 raw_args,
                                 db=db,
                                 user=user,
@@ -1706,8 +1743,8 @@ async def stream_business_chat_reply(
                             )
                             c_name = counterparty_msg_obj.get("counterparty_name", "Counterparty") if counterparty_msg_obj else "Counterparty"
                             captured_tool_step = {
-                                "name": "send_counterparty_message",
-                                "title": f"Dispatching Message to {c_name}" if counterparty_msg_obj else "Messaging Counterparty",
+                                "name": "draft_counterparty_message",
+                                "title": f"Drafting Message for {c_name}" if counterparty_msg_obj else "Drafting Negotiation Message",
                                 "status": "completed" if counterparty_msg_obj else "failed",
                                 "args": (
                                     {"recipient": c_name, "message": counterparty_msg_obj["message"]}
@@ -1818,7 +1855,7 @@ async def stream_business_chat_reply(
                 })
 
         # Check deterministic counterparty messaging fallback if tool was not called explicitly
-        is_dispatch_reply = bool(re.search(r"(✉️|message\s+sent\s+to|dispatched|dear\s+[\w\s]+,)", total_content, re.IGNORECASE))
+        is_dispatch_reply = bool(re.search(r"(✉️|📝|message\s+sent\s+to|dispatched|drafted|dear\s+[\w\s]+,)", total_content, re.IGNORECASE))
         if not counterparty_msg_obj and (is_counterparty_msg or is_dispatch_reply):
             msg_to_send = extract_or_compose_counterparty_message(
                 reply_text=total_content,
@@ -1831,7 +1868,7 @@ async def stream_business_chat_reply(
                 last_counterparty_info=last_counterparty_msg,
                 matched_candidates=matched_candidates,
             )
-            counterparty_msg_obj, err = await execute_send_counterparty_message_call(
+            counterparty_msg_obj, err = await execute_draft_counterparty_message_call(
                 tool_args={"message": msg_to_send, "recipient_name": recipient_name},
                 db=db,
                 user=user,
@@ -1841,8 +1878,8 @@ async def stream_business_chat_reply(
             if counterparty_msg_obj:
                 c_name = counterparty_msg_obj.get("counterparty_name", recipient_name)
                 captured_tool_step = {
-                    "name": "send_counterparty_message",
-                    "title": f"Dispatching Message to {c_name}",
+                    "name": "draft_counterparty_message",
+                    "title": f"Drafting Message for {c_name}",
                     "status": "completed",
                     "args": {"recipient": c_name, "message": counterparty_msg_obj["message"]},
                 }

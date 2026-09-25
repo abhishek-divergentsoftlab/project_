@@ -203,20 +203,21 @@ CREATE_RFQ_TOOL: dict[str, Any] = {
 }
 
 
-SEND_COUNTERPARTY_MESSAGE_TOOL: dict[str, Any] = {
+DRAFT_COUNTERPARTY_MESSAGE_TOOL: dict[str, Any] = {
     "type": "function",
     "function": {
-        "name": "send_counterparty_message",
+        "name": "draft_counterparty_message",
         "description": (
-            "Draft and send a professional, polite trade message or price negotiation directly to a seller/supplier or buyer counterparty. "
-            "Use this tool whenever the user instructs to send a message to a seller or negotiate (e.g. 'send message to the seller to reduce price to 0.9', 'message the supplier politely', 'ask seller for discount', 'tell the seller we need 10% off')."
+            "Draft a professional, polite trade message or price negotiation for the user to review before sending to a seller/supplier or buyer counterparty. "
+            "Use this tool whenever the user instructs to send a message to a seller or negotiate (e.g. 'send negotiation message to the counter user', 'message the supplier politely', 'ask seller for discount', 'tell the seller we need 10% off'). "
+            "This drafts the message for the user to review, and the user must click the Send button to actually deliver it to the counterparty."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "message": {
                     "type": "string",
-                    "description": "[REQUIRED] The complete, polite, and professional message text to send to the counterparty.",
+                    "description": "[REQUIRED] The complete, polite, and professional message text to draft for the counterparty.",
                 },
                 "recipient_name": {
                     "type": "string",
@@ -243,6 +244,8 @@ SEND_COUNTERPARTY_MESSAGE_TOOL: dict[str, Any] = {
         },
     },
 }
+
+SEND_COUNTERPARTY_MESSAGE_TOOL: dict[str, Any] = DRAFT_COUNTERPARTY_MESSAGE_TOOL
 
 
 CLOSE_RFQ_TOOL: dict[str, Any] = {
@@ -684,21 +687,22 @@ def check_close_rfq_intent(user_message: str) -> bool:
 COUNTERPARTY_MESSAGE_INTENT_REGEXES = [
     re.compile(p, re.IGNORECASE)
     for p in [
-        # Negotiation keywords and typos: negotiate, nagitiation, nagotiation, negociate, bargain, deal
-        r"\b(send|write|drop|deliver)\s+(a\s+)?(nagitiation|nagotiation|negotiation|bargain|counter|offer|proposal|deal|discount)?\s*(message|msg|text|note|email|mail)?\s*(to\s+)?(the\s+)?(seller|supplier|buyer|counterparty|vendor|them|him|her|user|that\s+user|this\s+user)\b",
-        r"\b(message|contact|reach\s+out\s+to|notify|ping|chat\s+with)\s+(the\s+)?(seller|supplier|buyer|counterparty|vendor|them|user|that\s+user|this\s+user)\b",
-        r"\b(ask|tell|request|inquire|inform)\s+(the\s+)?(seller|supplier|buyer|counterparty|vendor|them|user|that\s+user|this\s+user)\b",
-        r"\b(negotiate|nagitiate|nagotiate|negociate|bargain|deal)\s+(with\s+)?(the\s+)?(seller|supplier|buyer|counterparty|vendor|them|user|that\s+user|this\s+user)?\b",
+        # Negotiation keywords and typos: negotiate, nagitiation, nagotiation, natotiation, natogiation, draft, negociate, bargain, deal
+        r"\b(send|write|drop|deliver|draft|compose|prepare)\s+(a\s+)?(nagitiation|nagotiation|natotiation|natogiation|negotiation|bargain|counter|offer|proposal|deal|discount)?\s*(message|msg|text|note|email|mail)?\s*(to|for)\s+(the\s+)?(seller|supplier|buyer|counterparty|vendor|them|him|her|user|that\s+user|this\s+user|counter\s+user)\b",
+        r"\b(draft|compose|prepare|write)\s+(a\s+)?(message|msg|proposal|counter-offer|offer|negotiation|natotiation)\s+(for|to)\s+(the\s+)?(seller|supplier|buyer|counterparty|vendor|them|user|counter\s+user)\b",
+        r"\b(message|contact|reach\s+out\s+to|notify|ping|chat\s+with)\s+(the\s+)?(seller|supplier|buyer|counterparty|vendor|them|user|that\s+user|this\s+user|counter\s+user)\b",
+        r"\b(ask|tell|request|inquire|inform)\s+(the\s+)?(seller|supplier|buyer|counterparty|vendor|them|user|that\s+user|this\s+user|counter\s+user)\b",
+        r"\b(negotiate|nagitiate|nagotiate|natotiate|natogiate|negociate|bargain|deal)\s+(with\s+)?(the\s+)?(seller|supplier|buyer|counterparty|vendor|them|user|that\s+user|this\s+user|counter\s+user)?\b",
         r"\b(can\s+we|can\s+you)\s+deal\s+(it\s+)?(in|at|for)\b",
         r"\b(can\s+you\s+)?(reduce|decrease|lower|discount)\s+(the\s+)?price\b.*\b(to|by|in|for)\b",
-        r"\b(send|say|write)\s+to\s+(the\s+)?(seller|supplier|buyer|user|that\s+user)\b",
+        r"\b(send|say|write|draft)\s+to\s+(the\s+)?(seller|supplier|buyer|user|that\s+user|counter\s+user)\b",
         r"\b(behaviour|behavior|tone)\s+should\s+be\s+(like\s+)?polite\b",
         # Follow-up amendments and additions (e.g., "also mention that...", "aslo mantion that...")
         r"\b(also|aslo|and|please)?\s*(mention|mantion|state|note|clarify|specify|include|highlight)\s+(that|the|to|about|it|is|location|price|qty|delivery|address)?\b",
-        r"\b(also|aslo|and|please)?\s*(tell|ask|inform|let)\s+(them|him|her|the\s+seller|the\s+supplier|the\s+buyer|the\s+user|that\s+user)\b",
+        r"\b(also|aslo|and|please)?\s*(tell|ask|inform|let)\s+(them|him|her|the\s+seller|the\s+supplier|the\s+buyer|the\s+user|that\s+user|counter\s+user)\b",
         r"\b(also|aslo|and)?\s*(say|write)\s+that\b",
         r"\b(also|aslo|and)?\s*(add|put)\s+(that|in\s+the\s+message|to\s+the\s+message)\b",
-        r"\b(update|amend|revise|edit|change)\s+(the\s+)?(message|msg|note|text)\b",
+        r"\b(update|amend|revise|edit|change)\s+(the\s+)?(message|msg|note|text|draft)\b",
         r"\b(send|dispatch)\s+(an?\s+)?(updated|new|another|follow-up|followup)\s+(message|msg)\b",
         # Counterparty location / terms corrections
         r"\b(location|address|delivery\s+place)\s+is\s+not\b",

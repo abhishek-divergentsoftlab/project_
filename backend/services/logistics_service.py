@@ -47,29 +47,42 @@ USD_CONVERSIONS: dict[str, float] = {
 
 def _get_city_coords(city_name: str, country_name: str = "") -> tuple[float, float]:
     """Resolve coordinates for a city or country fallback."""
-    c_lower = city_name.strip().lower()
+    c_lower = (city_name or "").strip().lower()
     if c_lower in CITIES:
         c = CITIES[c_lower]
         return c.latitude, c.longitude
 
-    matched = find_city(city_name)
-    if matched:
-        return matched.latitude, matched.longitude
+    if c_lower:
+        matched = find_city(city_name)
+        if matched:
+            return matched.latitude, matched.longitude
 
     # Fallback coordinate heuristics
-    country_lower = country_name.lower()
-    if "india" in country_lower:
+    country_lower = (country_name or "").strip().lower()
+    if country_lower in ("india", "in"):
         return 20.5937, 78.9629
-    if "united states" in country_lower or "usa" in country_lower:
+    if country_lower in ("united states", "usa", "us"):
         return 37.0902, -95.7129
-    if "china" in country_lower:
+    if country_lower in ("china", "cn"):
         return 35.8617, 104.1954
-    if "germany" in country_lower:
+    if country_lower in ("germany", "de"):
         return 51.1657, 10.4515
-    if "uae" in country_lower or "dubai" in country_lower:
+    if country_lower in ("netherlands", "holland", "nl"):
+        return 52.1326, 5.2913
+    if country_lower in ("uae", "dubai", "ae"):
         return 25.2048, 55.2708
-    if "uk" in country_lower or "kingdom" in country_lower:
+    if country_lower in ("uk", "united kingdom", "gb"):
         return 55.3781, -3.4360
+    if country_lower in ("singapore", "sg"):
+        return 1.3521, 103.8198
+    if country_lower in ("japan", "jp"):
+        return 36.2048, 138.2529
+    if country_lower in ("australia", "au"):
+        return -25.2744, 133.7751
+    if country_lower in ("canada", "ca"):
+        return 56.1304, -106.3468
+    if country_lower in ("brazil", "br"):
+        return -14.2350, -51.9253
 
     return 22.0, 78.0
 
@@ -135,17 +148,29 @@ def estimate_freight_rates(request: FreightEstimateRequest) -> FreightEstimateRe
         days_min = max(1, int(distance_km / 500))
         days_max = days_min + (2 if distance_km > 300 else 1)
 
+        base_amt = round(Decimal(str(max(45.0, 40.0 + ton_km * 0.085) * fx)), 2)
+        fuel_amt = round(Decimal(str(float(road_converted) * 0.12)), 2)
+        cust_amt = Decimal("0.00") if not is_cross_border else round(Decimal(str(45.0 * fx)), 2)
+
         rate_options.append(
             FreightRateOption(
                 mode_id="road_freight",
+                mode="road",
                 mode_name="Road Freight (FTL / LTL Trucking)",
+                mode_label="Road Freight (FTL / LTL Trucking)",
                 carrier_sample="Safexpress / TCI Freight / DHL Freight",
                 rate_amount=road_converted,
+                total_estimated_usd=road_converted,
+                base_freight_usd=base_amt,
+                fuel_surcharge_usd=fuel_amt,
+                customs_clearance_usd=cust_amt,
+                basis="Per Ton-Km / Lane Matrix",
                 currency=target_currency,
                 transit_days_min=days_min,
                 transit_days_max=days_max,
                 chargeable_weight_kg=chargeable_wt,
                 is_recommended=(not is_cross_border and float(gross_wt) >= 50.0),
+                recommended=(not is_cross_border and float(gross_wt) >= 50.0),
                 description=f"Direct surface freight via dedicated fleet ({round(distance_km)} km scheduled lane).",
             )
         )
@@ -166,18 +191,30 @@ def estimate_freight_rates(request: FreightEstimateRequest) -> FreightEstimateRe
         ocean_converted = round(Decimal(str(ocean_usd * fx)), 2)
         days_min = max(7, int(distance_km / 350))
         days_max = days_min + 7
+        base_amt = round(ocean_converted * Decimal("0.80"), 2)
+        fuel_amt = round(ocean_converted * Decimal("0.12"), 2)
+        cust_amt = round(Decimal(str(150.0 * fx)), 2)
+        basis_str = "Per CBM Consolidated (LCL)" if (cbm_calc <= 15.0 and float(gross_wt) <= 7500) else "Per 20ft/40ft Container (FCL)"
 
         rate_options.append(
             FreightRateOption(
                 mode_id="ocean_freight",
+                mode="ocean",
                 mode_name=mode_label,
+                mode_label=mode_label,
                 carrier_sample="Maersk Line / CMA CGM / MSC Mediterranean",
                 rate_amount=ocean_converted,
+                total_estimated_usd=ocean_converted,
+                base_freight_usd=base_amt,
+                fuel_surcharge_usd=fuel_amt,
+                customs_clearance_usd=cust_amt,
+                basis=basis_str,
                 currency=target_currency,
                 transit_days_min=days_min,
                 transit_days_max=days_max,
                 chargeable_weight_kg=chargeable_wt,
                 is_recommended=(is_cross_border and float(gross_wt) >= 250.0),
+                recommended=(is_cross_border and float(gross_wt) >= 250.0),
                 description=f"Port-to-port maritime shipment with Bill of Lading documentation ({days_min}–{days_max} days ETA).",
             )
         )
@@ -189,18 +226,29 @@ def estimate_freight_rates(request: FreightEstimateRequest) -> FreightEstimateRe
     air_converted = round(Decimal(str(air_usd * fx)), 2)
     air_days_min = 2 if is_cross_border else 1
     air_days_max = 5 if is_cross_border else 3
+    base_amt = round(air_converted * Decimal("0.75"), 2)
+    fuel_amt = round(air_converted * Decimal("0.15"), 2)
+    cust_amt = round(Decimal(str(95.0 * fx)), 2)
 
     rate_options.append(
         FreightRateOption(
             mode_id="air_cargo",
+            mode="air",
             mode_name="Air Cargo (Scheduled Commercial Flight)",
+            mode_label="Air Cargo (Scheduled Commercial Flight)",
             carrier_sample="Emirates SkyCargo / Qatar Cargo / Lufthansa Cargo",
             rate_amount=air_converted,
+            total_estimated_usd=air_converted,
+            base_freight_usd=base_amt,
+            fuel_surcharge_usd=fuel_amt,
+            customs_clearance_usd=cust_amt,
+            basis="Per Chargeable Kg",
             currency=target_currency,
             transit_days_min=air_days_min,
             transit_days_max=air_days_max,
             chargeable_weight_kg=chargeable_wt,
             is_recommended=(is_cross_border and float(gross_wt) < 250.0),
+            recommended=(is_cross_border and float(gross_wt) < 250.0),
             description=f"Priority airport-to-airport air cargo with customs clearance fast-track ({air_days_min}–{air_days_max} days ETA).",
         )
     )
@@ -211,18 +259,29 @@ def estimate_freight_rates(request: FreightEstimateRequest) -> FreightEstimateRe
         courier_converted = round(Decimal(str(courier_usd * fx)), 2)
         c_min = 1 if not is_cross_border else 2
         c_max = 3 if not is_cross_border else 5
+        base_amt = round(courier_converted * Decimal("0.80"), 2)
+        fuel_amt = round(courier_converted * Decimal("0.10"), 2)
+        cust_amt = round(courier_converted * Decimal("0.10"), 2)
 
         rate_options.append(
             FreightRateOption(
                 mode_id="express_courier",
+                mode="courier",
                 mode_name="Express Courier (Door-to-Door)",
+                mode_label="Express Courier (Door-to-Door)",
                 carrier_sample="DHL Express / FedEx Priority / BlueDart",
                 rate_amount=courier_converted,
+                total_estimated_usd=courier_converted,
+                base_freight_usd=base_amt,
+                fuel_surcharge_usd=fuel_amt,
+                customs_clearance_usd=cust_amt,
+                basis="Doorstep Express",
                 currency=target_currency,
                 transit_days_min=c_min,
                 transit_days_max=c_max,
                 chargeable_weight_kg=chargeable_wt,
                 is_recommended=(float(gross_wt) < 50.0),
+                recommended=(float(gross_wt) < 50.0),
                 description=f"End-to-end tracked courier pickup & delivery directly to facility ({c_min}–{c_max} days ETA).",
             )
         )
@@ -252,8 +311,10 @@ def estimate_freight_rates(request: FreightEstimateRequest) -> FreightEstimateRe
         volumetric_weight_kg=vol_wt,
         chargeable_weight_kg=chargeable_wt,
         volume_cbm=cbm,
+        cbm=cbm,
         currency=target_currency,
         rate_options=rate_options,
+        rates=rate_options,
         incoterm_breakdown=breakdown,
     )
 
@@ -361,12 +422,31 @@ def compute_incoterms_breakdown(
         buyer_cost = import_tariffs + last_mile
         risk_point = "First carrier handover at origin"
 
+    INCOTERM_NAMES = {
+        "EXW": "Ex Works",
+        "FCA": "Free Carrier",
+        "CPT": "Carriage Paid To",
+        "CIP": "Carriage and Insurance Paid To",
+        "DAP": "Delivered at Place",
+        "DPU": "Delivered at Place Unloaded",
+        "DDP": "Delivered Duty Paid",
+        "FAS": "Free Alongside Ship",
+        "FOB": "Free On Board",
+        "CFR": "Cost and Freight",
+        "CIF": "Cost, Insurance and Freight",
+    }
+
     return IncotermCostBreakdown(
         incoterm=incoterm,
+        full_name=INCOTERM_NAMES.get(incoterm, incoterm),
         seller_pays=seller_items,
         buyer_pays=buyer_items,
+        seller_responsibility="; ".join(seller_items) if seller_items else "None",
+        buyer_responsibility="; ".join(buyer_items) if buyer_items else "None",
         seller_estimated_cost=round(seller_cost, 2),
         buyer_estimated_cost=round(buyer_cost, 2),
+        estimated_seller_logistics_usd=round(seller_cost, 2),
+        estimated_buyer_logistics_usd=round(buyer_cost, 2),
         currency=currency,
         risk_transfer_point=risk_point,
     )

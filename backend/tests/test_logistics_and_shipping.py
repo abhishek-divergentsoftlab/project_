@@ -131,6 +131,27 @@ async def test_freight_estimation_multi_modal(client: AsyncClient):
     assert float(ocean_opt["rate_amount"]) > 0
     assert ocean_opt["transit_days_min"] >= 7
 
+    # 3. Frontend UI payload format (using gross_weight_kg, cbm, country codes, no explicit weight_kg)
+    payload_frontend = {
+        "origin_country": "IN",
+        "destination_country": "NL",
+        "gross_weight_kg": 1000.0,
+        "cbm": 1.2,
+        "incoterm": "FOB",
+    }
+    res_frontend = await client.post("/logistics/estimate", json=payload_frontend)
+    assert res_frontend.status_code == 200
+    data_frontend = res_frontend.json()
+    assert float(data_frontend["gross_weight_kg"]) == 1000.0
+    assert float(data_frontend["volume_cbm"]) == 1.2
+    assert float(data_frontend["cbm"]) == 1.2
+    assert "rates" in data_frontend and len(data_frontend["rates"]) > 0
+    first_rate = data_frontend["rates"][0]
+    assert "mode_label" in first_rate
+    assert "total_estimated_usd" in first_rate
+    assert "incoterm_breakdown" in data_frontend
+    assert "seller_responsibility" in data_frontend["incoterm_breakdown"]
+
 
 @pytest.mark.asyncio
 async def test_shipment_dispatch_and_tracking_lifecycle(client: AsyncClient, db):

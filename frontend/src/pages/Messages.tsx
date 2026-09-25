@@ -269,7 +269,9 @@ function ChatAndDealMain({
     destination_country: "NL",
     destination_city: "Rotterdam",
     gross_weight_kg: 1000,
+    weight_kg: 1000,
     cbm: 1.2,
+    volume_cbm: 1.2,
     incoterm: "FOB",
   });
 
@@ -863,7 +865,16 @@ function ChatAndDealMain({
     setCalculatingFreight(true);
     setError(null);
     try {
-      const res = await logisticsApi.estimateFreight(freightForm);
+      const weightVal = Number(freightForm.weight_kg ?? freightForm.gross_weight_kg ?? 1000);
+      const cbmVal = Number(freightForm.volume_cbm ?? freightForm.cbm ?? 1.2);
+      const payload: FreightEstimateRequest = {
+        ...freightForm,
+        weight_kg: weightVal,
+        gross_weight_kg: weightVal,
+        volume_cbm: cbmVal,
+        cbm: cbmVal,
+      };
+      const res = await logisticsApi.estimateFreight(payload);
       setFreightEstimate(res);
       setNotice("Freight estimates ready.");
     } catch (err) {
@@ -2540,8 +2551,11 @@ function ChatAndDealMain({
                           step="0.1"
                           className="form-input"
                           placeholder="1000"
-                          value={freightForm.gross_weight_kg || ""}
-                          onChange={(e) => setFreightForm({ ...freightForm, gross_weight_kg: parseFloat(e.target.value) || 0 })}
+                          value={freightForm.gross_weight_kg || freightForm.weight_kg || ""}
+                          onChange={(e) => {
+                            const val = parseFloat(e.target.value) || 0;
+                            setFreightForm({ ...freightForm, gross_weight_kg: val, weight_kg: val });
+                          }}
                           required
                         />
                       </div>
@@ -2553,8 +2567,11 @@ function ChatAndDealMain({
                           step="0.01"
                           className="form-input"
                           placeholder="1.2"
-                          value={freightForm.cbm || ""}
-                          onChange={(e) => setFreightForm({ ...freightForm, cbm: parseFloat(e.target.value) || 0 })}
+                          value={freightForm.cbm ?? freightForm.volume_cbm ?? ""}
+                          onChange={(e) => {
+                            const val = parseFloat(e.target.value) || 0;
+                            setFreightForm({ ...freightForm, cbm: val, volume_cbm: val });
+                          }}
                         />
                       </div>
                       <div>
@@ -2582,70 +2599,86 @@ function ChatAndDealMain({
                   </form>
 
                   {/* Freight Estimate Rates Display */}
-                  {freightEstimate && (
-                    <div className="freight-estimate-results">
-                      <div className="results-route-header">
-                        <span>{freightEstimate.origin} &rarr; {freightEstimate.destination}</span>
-                        <span>{freightEstimate.gross_weight_kg.toLocaleString()} kg · {freightEstimate.cbm} m³</span>
-                      </div>
+                  {freightEstimate && (() => {
+                    const ratesList = freightEstimate.rates || freightEstimate.rate_options || [];
+                    const displayCbm = freightEstimate.cbm ?? freightEstimate.volume_cbm ?? 0;
+                    const breakdown = freightEstimate.incoterm_breakdown;
+                    const sellerDesc = breakdown?.seller_responsibility || (Array.isArray(breakdown?.seller_pays) ? breakdown.seller_pays.join(", ") : "—");
+                    const buyerDesc = breakdown?.buyer_responsibility || (Array.isArray(breakdown?.buyer_pays) ? breakdown.buyer_pays.join(", ") : "—");
+                    const sellerCost = breakdown?.estimated_seller_logistics_usd ?? breakdown?.seller_estimated_cost ?? 0;
+                    const buyerCost = breakdown?.estimated_buyer_logistics_usd ?? breakdown?.buyer_estimated_cost ?? 0;
 
-                      <div className="freight-rates-stack">
-                        {freightEstimate.rates.map((rate) => (
-                          <div
-                            key={rate.mode}
-                            className={`rate-option-card ${rate.recommended ? "recommended" : ""}`}
-                          >
-                            <div className="rate-card-top">
-                              <div className="rate-card-mode">
-                                <div>
-                                  <strong>{rate.mode_label}</strong>
-                                  <div className="rate-transit-days">
-                                    {rate.transit_days_min}–{rate.transit_days_max} days in transit
+                    return (
+                      <div className="freight-estimate-results">
+                        <div className="results-route-header">
+                          <span>{freightEstimate.origin} &rarr; {freightEstimate.destination}</span>
+                          <span>{(freightEstimate.gross_weight_kg || 0).toLocaleString()} kg · {displayCbm} m³</span>
+                        </div>
+
+                        <div className="freight-rates-stack">
+                          {ratesList.map((rate) => {
+                            const isRec = rate.recommended ?? rate.is_recommended ?? false;
+                            const totalAmount = rate.total_estimated_usd ?? rate.rate_amount ?? 0;
+                            const label = rate.mode_label || rate.mode_name || rate.mode;
+                            const key = rate.mode || rate.mode_id || label;
+                            return (
+                              <div
+                                key={key}
+                                className={`rate-option-card ${isRec ? "recommended" : ""}`}
+                              >
+                                <div className="rate-card-top">
+                                  <div className="rate-card-mode">
+                                    <div>
+                                      <strong>{label}</strong>
+                                      <div className="rate-transit-days">
+                                        {rate.transit_days_min}–{rate.transit_days_max} days in transit
+                                      </div>
+                                    </div>
+                                  </div>
+                                  <div className="rate-card-total">
+                                    <div className="rate-total-amount">${Number(totalAmount).toLocaleString()}</div>
+                                    {isRec && <span className="rate-rec-badge">Best value</span>}
                                   </div>
                                 </div>
+                                <div className="rate-breakdown-row">
+                                  <span>Freight: ${Number(rate.base_freight_usd ?? totalAmount).toLocaleString()}</span>
+                                  {rate.fuel_surcharge_usd !== undefined && <span>Fuel: ${Number(rate.fuel_surcharge_usd)}</span>}
+                                  {rate.customs_clearance_usd !== undefined && <span>Customs: ${Number(rate.customs_clearance_usd)}</span>}
+                                  <span>Basis: {rate.basis || "Standard"}</span>
+                                </div>
                               </div>
-                              <div className="rate-card-total">
-                                <div className="rate-total-amount">${rate.total_estimated_usd.toLocaleString()}</div>
-                                {rate.recommended && <span className="rate-rec-badge">Best value</span>}
-                              </div>
-                            </div>
-                            <div className="rate-breakdown-row">
-                              <span>Freight: ${rate.base_freight_usd.toLocaleString()}</span>
-                              <span>Fuel: ${rate.fuel_surcharge_usd}</span>
-                              <span>Customs: ${rate.customs_clearance_usd}</span>
-                              <span>Basis: {rate.basis}</span>
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-
-                      {/* Incoterms Cost Allocation Card */}
-                      {freightEstimate.incoterm_breakdown && (
-                        <div className="incoterms-breakdown-card">
-                          <div className="incoterms-card-title">
-                            <span>
-                              {freightEstimate.incoterm_breakdown.incoterm} · {freightEstimate.incoterm_breakdown.full_name}
-                            </span>
-                          </div>
-                          <div className="incoterm-allocation-grid">
-                            <div className="allocation-party seller-party">
-                              <span className="party-title">Seller pays for</span>
-                              <p className="party-desc">{freightEstimate.incoterm_breakdown.seller_responsibility}</p>
-                              <div className="party-cost-tag">About ${freightEstimate.incoterm_breakdown.estimated_seller_logistics_usd.toLocaleString()}</div>
-                            </div>
-                            <div className="allocation-party buyer-party">
-                              <span className="party-title">Buyer pays for</span>
-                              <p className="party-desc">{freightEstimate.incoterm_breakdown.buyer_responsibility}</p>
-                              <div className="party-cost-tag">About ${freightEstimate.incoterm_breakdown.estimated_buyer_logistics_usd.toLocaleString()}</div>
-                            </div>
-                          </div>
-                          <div className="risk-transfer-note">
-                            <strong>Risk transfers:</strong> {freightEstimate.incoterm_breakdown.risk_transfer_point}
-                          </div>
+                            );
+                          })}
                         </div>
-                      )}
-                    </div>
-                  )}
+
+                        {/* Incoterms Cost Allocation Card */}
+                        {breakdown && (
+                          <div className="incoterms-breakdown-card">
+                            <div className="incoterms-card-title">
+                              <span>
+                                {breakdown.incoterm} {breakdown.full_name ? `· ${breakdown.full_name}` : ""}
+                              </span>
+                            </div>
+                            <div className="incoterm-allocation-grid">
+                              <div className="allocation-party seller-party">
+                                <span className="party-title">Seller pays for</span>
+                                <p className="party-desc">{sellerDesc}</p>
+                                <div className="party-cost-tag">About ${Number(sellerCost).toLocaleString()}</div>
+                              </div>
+                              <div className="allocation-party buyer-party">
+                                <span className="party-title">Buyer pays for</span>
+                                <p className="party-desc">{buyerDesc}</p>
+                                <div className="party-cost-tag">About ${Number(buyerCost).toLocaleString()}</div>
+                              </div>
+                            </div>
+                            <div className="risk-transfer-note">
+                              <strong>Risk transfers:</strong> {breakdown.risk_transfer_point}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
                 </details>
               </div>
             )}

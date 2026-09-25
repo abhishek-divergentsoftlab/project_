@@ -128,9 +128,66 @@ B2B_PHRASE_DICTIONARY: dict[str, dict[str, str]] = {
 }
 
 
+# Latin language distinctive stopword and commercial vocabulary sets
+_LATIN_STOPWORDS: dict[str, set[str]] = {
+    "es": {
+        "de", "la", "que", "el", "en", "y", "a", "los", "se", "del", "las", "por", "un", "para",
+        "con", "no", "una", "su", "al", "lo", "como", "más", "pero", "sus", "le", "ya", "o", "este",
+        "sí", "porque", "esta", "son", "entre", "está", "cuando", "muy", "sin", "sobre", "también",
+        "me", "hasta", "hay", "donde", "quien", "desde", "todo", "nos", "durante", "todos", "uno",
+        "les", "ni", "contra", "otros", "ese", "eso", "ante", "ellos", "esto", "mí", "antes", "algunos",
+        "qué", "unos", "yo", "otro", "otras", "otra", "él", "tanto", "esa", "estos", "mucho", "quienes",
+        "nada", "muchos", "cual", "sea", "poco", "ella", "estar", "haber", "estas", "estaba", "estamos",
+        "están", "precio", "cantidad", "hola", "gracias", "favor", "necesitamos", "producto", "muestras",
+        "envío", "cotización", "pedido", "entrega", "pago", "plazo", "factura", "unidades", "detalles"
+    },
+    "de": {
+        "der", "die", "das", "und", "in", "den", "von", "zu", "mit", "sich", "des", "auf", "für",
+        "ist", "im", "dem", "nicht", "ein", "eine", "als", "auch", "es", "an", "werden", "aus",
+        "er", "hat", "dass", "sie", "nach", "wird", "bei", "einer", "um", "am", "sind", "noch",
+        "wie", "einem", "über", "einen", "so", "zum", "war", "haben", "nur", "oder", "aber", "vor",
+        "zur", "bis", "mehr", "durch", "man", "sein", "wurde", "sei", "wir", "danke", "bitte",
+        "preis", "lieferung", "angebot", "brauchen", "bestellung", "muster", "stück", "kosten", "hallo"
+    },
+    "fr": {
+        "de", "la", "le", "et", "les", "des", "en", "un", "du", "une", "que", "est", "pour", "qui",
+        "dans", "par", "plus", "pas", "au", "sur", "ne", "ce", "avec", "sont", "se", "ou", "son",
+        "nous", "vous", "il", "elle", "ont", "été", "mais", "comme", "on", "tout", "merci", "prix",
+        "devis", "commande", "livraison", "pièces", "échantillons", "besoin", "bonjour", "combien",
+        "produit", "délai", "facture", "veuillez", "salutations"
+    },
+    "pt": {
+        "de", "a", "o", "que", "e", "do", "da", "em", "um", "para", "é", "com", "não", "uma",
+        "os", "no", "se", "na", "por", "mais", "as", "dos", "como", "mas", "foi", "ao", "ele",
+        "das", "tem", "à", "seu", "sua", "ou", "ser", "quando", "muito", "há", "nos", "já",
+        "está", "eu", "também", "só", "pelo", "pela", "até", "isso", "ela", "entre", "era", "depois",
+        "sem", "mesmo", "aos", "ter", "seus", "quem", "obrigado", "obrigada", "preço", "orçamento",
+        "entrega", "amostras", "quantidade", "precisamos", "pedido", "olá", "favor"
+    },
+    "it": {
+        "di", "e", "il", "la", "che", "in", "a", "per", "una", "un", "sono", "mi", "si", "ho",
+        "ma", "ha", "del", "da", "al", "le", "dei", "non", "lo", "con", "ed", "della", "nel",
+        "anche", "come", "ci", "io", "se", "noi", "voi", "loro", "questo", "questa", "questi",
+        "queste", "grazie", "prezzo", "preventivo", "ordine", "consegna", "campioni", "pezzi",
+        "buongiorno", "spedizione", "fattura"
+    },
+    "en": {
+        "the", "be", "to", "of", "and", "a", "in", "that", "have", "i", "it", "for", "not", "on",
+        "with", "he", "as", "you", "do", "at", "this", "but", "his", "by", "from", "they", "we",
+        "say", "her", "she", "or", "an", "will", "my", "one", "all", "would", "there", "their",
+        "what", "so", "up", "out", "if", "about", "who", "get", "which", "go", "me", "when", "make",
+        "can", "like", "time", "no", "just", "him", "know", "take", "people", "into", "year", "your",
+        "good", "some", "could", "them", "see", "other", "than", "then", "now", "look", "only", "come",
+        "its", "over", "think", "also", "back", "after", "use", "two", "how", "our", "work", "first",
+        "well", "way", "even", "new", "want", "because", "any", "these", "give", "day", "most", "us",
+        "please", "price", "order", "delivery", "samples", "quote", "quantity", "need", "units", "thanks"
+    },
+}
+
+
 def detect_language(text: str) -> str:
-    """Heuristic language detection based on Unicode script ranges and character sets."""
-    sample = text.strip()[:300]
+    """Robust heuristic language detection based on Unicode script ranges and token frequency."""
+    sample = text.strip()[:400]
     if not sample:
         return "en"
 
@@ -165,21 +222,36 @@ def detect_language(text: str) -> str:
             return lang
 
     if counts["zh"] >= 2 and counts["zh"] > counts["latin"]:
-        # Japanese may have Kanji (CJK), but if Hiragana/Katakana present it was matched as ja
         return "ja" if counts["ja"] > 0 else "zh"
 
-    # Latin-based languages heuristics (check common diacritics / markers)
-    lower = sample.lower()
-    if any(word in lower for word in [" gracias", " por favor", "¿", "¡", "precio", "cantidad", "hola"]):
-        return "es"
-    if any(word in lower for word in [" danke", " bitte", "guten", "preis", "lieferung", "hallo"]):
-        return "de"
-    if any(word in lower for word in [" merci", " s'il vous plaît", "bonjour", "prix", "devis"]):
-        return "fr"
-    if any(word in lower for word in [" obrigado", " por favor", "preço", "orçamento", "olá"]):
-        return "pt"
-    if any(word in lower for word in [" grazie", " per favore", "prezzo", "preventivo", "buongiorno"]):
-        return "it"
+    # Latin-based languages: Tokenize words
+    words = re.findall(r"[a-zA-Záéíóúüñäößàèùâêîôûçãõìò]+", sample.lower())
+    if not words:
+        return "en"
+
+    scores: dict[str, float] = {lang: 0.0 for lang in _LATIN_STOPWORDS}
+    for w in words:
+        for lang, vocab in _LATIN_STOPWORDS.items():
+            if w in vocab:
+                scores[lang] += 1.0
+
+    # Diacritics weighting bonus
+    lower_sample = sample.lower()
+    if any(c in lower_sample for c in ["¿", "¡", "ñ", "á", "í", "ó", "ú"]):
+        scores["es"] += 2.0
+    if any(c in lower_sample for c in ["ä", "ö", "ü", "ß"]):
+        scores["de"] += 2.5
+    if any(c in lower_sample for c in ["œ", "ê", "ë", "è", "ç"]):
+        scores["fr"] += 2.0
+    if any(c in lower_sample for c in ["ã", "õ"]):
+        scores["pt"] += 2.5
+    if any(c in lower_sample for c in ["ì", "ò", "ù"]):
+        scores["it"] += 1.5
+
+    best_lang, best_score = max(scores.items(), key=lambda item: item[1])
+    # If the non-English score clearly outweighs English or has at least 1 match, choose it
+    if best_score > 0 and (best_lang != "en" or scores["en"] >= max(scores[l] for l in scores if l != "en")):
+        return best_lang
 
     return "en"
 
@@ -196,7 +268,6 @@ def _normalize_lang_code(code: str) -> str:
 def get_cached_translation(text: str, source_lang: str, target_lang: str) -> Optional[str]:
     key = (source_lang, target_lang, text.strip())
     if key in _translation_cache:
-        # Move to end (most recently used)
         _translation_cache.move_to_end(key)
         return _translation_cache[key]
     return None
@@ -223,21 +294,22 @@ async def translate_via_ollama(text: str, source_lang: str, target_lang: str) ->
         f"3. Do NOT wrap the translation in quotes. Do NOT add any preamble, conversational filler, pronunciation guides, or explanation."
     )
 
+    model_name = getattr(settings, "TRANSLATION_MODEL", "qwen2.5:1.5b")
     payload = {
-        "model": "qwen2.5:1.5b",  # Fast local model
+        "model": model_name,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": text},
         ],
         "stream": False,
         "options": {
-            "temperature": 0.1,  # Low temperature for deterministic, accurate translations
+            "temperature": 0.1,
             "num_predict": 1024,
         },
     }
 
     url = f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/chat"
-    timeout = 10.0  # Rapid timeout for chat translation
+    timeout = float(getattr(settings, "TRANSLATION_TIMEOUT_SECONDS", 10.0))
 
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -246,12 +318,51 @@ async def translate_via_ollama(text: str, source_lang: str, target_lang: str) ->
                 data = resp.json()
                 msg = data.get("message") or {}
                 content = (msg.get("content") or "").strip()
-                # Clean up any surrounding quotes or backticks if generated
                 content = re.sub(r'^["\'`]+|["\'`]+$', '', content).strip()
                 if content:
                     return content
     except Exception as exc:  # noqa: BLE001
-        logger.debug("Ollama translation unavailable (%s), using fallback", exc)
+        logger.debug("Ollama translation unavailable (%s), trying online fallback", exc)
+
+    return None
+
+
+async def translate_via_service(
+    text: str,
+    target_lang: str,
+    source_lang: Optional[str] = None,
+) -> Optional[tuple[str, str]]:
+    """Instant, highly accurate translation via public translation service with language detection.
+    
+    Returns tuple of (translated_text, detected_source_lang) on success, or None on failure.
+    """
+    sl = source_lang if (source_lang and source_lang != "auto") else "auto"
+    tl = target_lang
+    url = "https://translate.googleapis.com/translate_a/single"
+    params = {
+        "client": "gtx",
+        "sl": sl,
+        "tl": tl,
+        "dt": "t",
+        "q": text,
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(url, params=params, headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data and isinstance(data, list) and len(data) > 0 and isinstance(data[0], list):
+                    translated_chunks = [part[0] for part in data[0] if part and len(part) > 0 and part[0]]
+                    translated_result = "".join(translated_chunks).strip()
+                    detected_sl = data[2] if len(data) > 2 and isinstance(data[2], str) else (source_lang or "en")
+                    if translated_result:
+                        return translated_result, _normalize_lang_code(detected_sl)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Public translation service unavailable (%s)", exc)
 
     return None
 
@@ -271,12 +382,11 @@ def translate_fallback(text: str, source_lang: str, target_lang: str) -> str:
     if clean_norm in B2B_PHRASE_DICTIONARY:
         dict_trans = B2B_PHRASE_DICTIONARY[clean_norm].get(target_lang)
         if dict_trans:
-            # Preserve original question mark if present
             if text.strip().endswith("?") and not dict_trans.endswith("?"):
                 return f"{dict_trans}?"
             return dict_trans
 
-    # Clean fallback: Return text with target language indicator in offline mode
+    # Offline marker (DO NOT CACHE THIS)
     target_info = LANGUAGE_MAP.get(target_lang) or LANGUAGE_MAP["en"]
     if target_lang == "es":
         return f"[ES] {text}"
@@ -297,7 +407,15 @@ async def translate_text(
     target_language: str,
     source_language: Optional[str] = None,
 ) -> TranslationResponse:
-    """Translate text from source_language (or auto-detected) into target_language."""
+    """Translate text from source_language (or auto-detected) into target_language.
+    
+    Order of operations:
+    1. Check LRU Cache
+    2. Check B2B phrase dictionary (instant zero-latency)
+    3. Try local Ollama LLM translation
+    4. Try real-time Google Translation service
+    5. Fallback to dictionary or indicator
+    """
     clean_text = text.strip()
     target_lang = _normalize_lang_code(target_language)
 
@@ -345,16 +463,39 @@ async def translate_text(
         dict_trans = B2B_PHRASE_DICTIONARY[clean_norm][target_lang]
         translated = f"{dict_trans}?" if clean_text.endswith("?") and not dict_trans.endswith("?") else dict_trans
 
-    # 3. Try Ollama LLM Translation if not in phrase dictionary
-    if not translated:
-        translated = await translate_via_ollama(clean_text, source_lang, target_lang)
+    if translated:
+        set_cached_translation(clean_text, source_lang, target_lang, translated)
+        return TranslationResponse(
+            original_text=text,
+            translated_text=translated,
+            source_language=source_lang,
+            target_language=target_lang,
+            cached=False,
+        )
 
-    # 4. If Ollama was unavailable or timed out, use fallback translator
+    # 3. Try Ollama LLM Translation
+    translated = await translate_via_ollama(clean_text, source_lang, target_lang)
+
+    # 4. If Ollama was unavailable or timed out, try translation service
+    if not translated:
+        service_res = await translate_via_service(clean_text, target_lang, source_lang)
+        if service_res:
+            translated, actual_detected_source = service_res
+            # Update source language if it was refined by the service
+            if not source_language and actual_detected_source:
+                source_lang = actual_detected_source
+
+    # 5. Last resort fallback
+    is_genuine_translation = True
     if not translated:
         translated = translate_fallback(clean_text, source_lang, target_lang)
+        # If it returned a dummy bracketed string like "[ES] ...", don't mark as genuine
+        if translated.startswith("[") and "]" in translated[:5]:
+            is_genuine_translation = False
 
-    # Store in cache
-    set_cached_translation(clean_text, source_lang, target_lang, translated)
+    # Store genuine translations in cache so future requests are instantaneous
+    if is_genuine_translation and translated:
+        set_cached_translation(clean_text, source_lang, target_lang, translated)
 
     return TranslationResponse(
         original_text=text,

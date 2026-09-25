@@ -1,5 +1,6 @@
 import json
 import uuid
+from typing import Any, Optional
 from fastapi import APIRouter, HTTPException, status
 from fastapi.responses import StreamingResponse
 
@@ -180,3 +181,29 @@ async def chat_stream(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.post(
+    "/conversations/{conversation_id}/messages/{message_id}/mark-sent",
+    status_code=status.HTTP_200_OK,
+    summary="Mark a drafted counterparty message as sent",
+)
+async def mark_counterparty_message_sent(
+    conversation_id: uuid.UUID,
+    message_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DbSession,
+    payload: dict[str, Any] = None,
+):
+    """Mark a drafted negotiation message in an AI conversation as sent/delivered."""
+    sent_msg_id = (payload or {}).get("sent_message_id")
+    ok = await ai_chat_service.mark_counterparty_message_sent(
+        db, current_user.id, conversation_id, message_id, sent_msg_id
+    )
+    if not ok:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Message draft not found",
+        )
+    return {"status": "ok"}
+

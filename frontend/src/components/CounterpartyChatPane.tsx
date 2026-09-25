@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { connections, translation as translationApi } from "@/api/endpoints";
+import { connections, translation as translationApi, type AICounterpartyMessage } from "@/api/endpoints";
 import { tokenStore } from "@/api/client";
 import { useAuth } from "@/context/useAuth";
 import type { Connection, ConnectionMessage } from "@/types";
@@ -16,13 +16,7 @@ interface CounterpartyChatPaneProps {
   activeConnectionId: string | null;
   onSelectConnection: (connectionId: string) => void;
   onClose: () => void;
-  lastAiDispatchedMessage?: {
-    connection_id: string;
-    message_id?: string;
-    message: string;
-    counterparty_name?: string;
-    created_at?: string;
-  } | null;
+  lastAiDispatchedMessage?: AICounterpartyMessage | null;
 }
 
 export function CounterpartyChatPane({
@@ -202,7 +196,7 @@ export function CounterpartyChatPane({
     "Counterparty";
 
   const isAiDispatched = (msg: ConnectionMessage) => {
-    if (lastAiDispatchedMessage) {
+    if (lastAiDispatchedMessage && lastAiDispatchedMessage.status !== "draft") {
       if (lastAiDispatchedMessage.message_id && msg.id === lastAiDispatchedMessage.message_id) {
         return true;
       }
@@ -217,7 +211,8 @@ export function CounterpartyChatPane({
     if (!activeConnectionId || translatingPaneMsgId === msg.id) return;
     setTranslatingPaneMsgId(msg.id);
     try {
-      const res = await translationApi.translateConnectionMessage(activeConnectionId, msg.content, "en");
+      const preferredLang = localStorage.getItem("b2b_dealroom_target_lang") || "en";
+      const res = await translationApi.translateConnectionMessage(activeConnectionId, msg.content, preferredLang);
       setPaneTranslations((prev) => ({ ...prev, [msg.id]: res.translated_text }));
     } catch (err) {
       console.error("Failed to translate msg in pane", err);
@@ -344,7 +339,22 @@ export function CounterpartyChatPane({
                     })}
                   </span>
                   {paneTranslations[msg.id] ? (
-                    <span>Translated</span>
+                    <>
+                      <span>Translated</span>
+                      <button
+                        type="button"
+                        className="link-button msg-meta-action"
+                        onClick={() => {
+                          setPaneTranslations((prev) => {
+                            const next = { ...prev };
+                            delete next[msg.id];
+                            return next;
+                          });
+                        }}
+                      >
+                        Show original
+                      </button>
+                    </>
                   ) : (
                     !isMe && (
                       <button
@@ -403,6 +413,29 @@ export function CounterpartyChatPane({
             </button>
           </div>
         )}
+        {lastAiDispatchedMessage?.status === "draft" &&
+          lastAiDispatchedMessage.connection_id === activeConnectionId && (
+            <div className="counterparty-draft-banner">
+              <div className="counterparty-draft-text">
+                <span className="badge badge-warning">AI Draft</span>
+                <span className="draft-preview-snippet" title={lastAiDispatchedMessage.message}>
+                  {lastAiDispatchedMessage.message.length > 70
+                    ? `${lastAiDispatchedMessage.message.slice(0, 70)}…`
+                    : lastAiDispatchedMessage.message}
+                </span>
+              </div>
+              <button
+                type="button"
+                className="counterparty-use-draft-btn"
+                onClick={() => {
+                  setInputText(lastAiDispatchedMessage.message);
+                  inputRef.current?.focus();
+                }}
+              >
+                Use Draft
+              </button>
+            </div>
+          )}
         <form className="counterparty-composer-form" onSubmit={handleSendMessage}>
           <input
             ref={inputRef}

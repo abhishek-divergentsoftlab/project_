@@ -18,6 +18,7 @@ import { CounterpartyChatPane } from "@/components/CounterpartyChatPane";
 import {
   IconCheck,
   IconClose,
+  IconEdit,
   IconMessages,
   IconSend,
   IconShield,
@@ -253,6 +254,9 @@ export function AIChat() {
   const [activeMatchedCandidates, setActiveMatchedCandidates] = useState<MatchCandidate[]>([]);
   const [connectingRfqId, setConnectingRfqId] = useState<string | null>(null);
   const [connectedMap, setConnectedMap] = useState<Record<string, boolean>>({});
+  const [editingDrafts, setEditingDrafts] = useState<Record<string, string>>({});
+  const [activeEditDraftId, setActiveEditDraftId] = useState<string | null>(null);
+  const [sendingDraftId, setSendingDraftId] = useState<string | null>(null);
   const urlAgentParam = searchParams.get("agent");
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [selectedAgentId, setSelectedAgentId] = useState<string>(urlAgentParam || "general");
@@ -556,6 +560,73 @@ export function AIChat() {
       console.error("Failed to connect candidate:", err);
     } finally {
       setConnectingRfqId(null);
+    }
+  };
+
+  const handleSendDraft = async (msgId: string, cpMsg: AICounterpartyMessage) => {
+    if (!cpMsg.connection_id || sendingDraftId === msgId) return;
+    const draftText = (editingDrafts[msgId] ?? cpMsg.message).trim();
+    if (!draftText) {
+      toast("Message content cannot be empty.", "error");
+      return;
+    }
+
+    setSendingDraftId(msgId);
+    try {
+      // 1. Dispatch message through connection service API
+      const sentMsg = await connections.sendMessage(cpMsg.connection_id, draftText);
+
+      // 2. Mark draft as sent in AI chat conversation history if active
+      if (activeConversationId) {
+        try {
+          await aiChat.markDraftSent(activeConversationId, msgId, sentMsg.id);
+        } catch (e) {
+          console.warn("Could not mark draft sent in DB:", e);
+        }
+      }
+
+      // 3. Update message state in conversation UI
+      setMessages((prev) =>
+        prev.map((m) => {
+          if (m.id !== msgId) return m;
+          return {
+            ...m,
+            counterpartyMessage: {
+              ...cpMsg,
+              message: draftText,
+              status: "delivered",
+              message_id: sentMsg.id,
+              created_at: sentMsg.created_at,
+            },
+          };
+        })
+      );
+
+      // 4. Update lastAiDispatchedMessage and active connection
+      setLastAiDispatchedMessage({
+        ...cpMsg,
+        message: draftText,
+        status: "delivered",
+        message_id: sentMsg.id,
+        created_at: sentMsg.created_at,
+      });
+      setActiveConnectionId(cpMsg.connection_id);
+      setIsSplitView(true);
+
+      // Clean up editing state
+      setEditingDrafts((prev) => {
+        const next = { ...prev };
+        delete next[msgId];
+        return next;
+      });
+      if (activeEditDraftId === msgId) setActiveEditDraftId(null);
+
+      toast(`Message sent to ${cpMsg.counterparty_name}!`, "success");
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Failed to send message";
+      toast(msg, "error");
+    } finally {
+      setSendingDraftId(null);
     }
   };
 
@@ -870,33 +941,122 @@ export function AIChat() {
                       )}
 
                       {msg.counterpartyMessage && (
-                        <div className="ai-counterparty-msg-card">
-                          <div className="ai-cp-card-header">
-                            <span className="ai-cp-card-title">
-                              Sent to <strong>{msg.counterpartyMessage.counterparty_name}</strong>
-                              <span className="ai-cp-time">
-                                {" · "}
-                                {new Date(msg.counterpartyMessage.created_at).toLocaleTimeString([], {
-                                  hour: "2-digit",
-                                  minute: "2-digit",
-                                })}
-                              </span>
-                            </span>
-                            {!isSplitView && (
+                        msg.counterpartyMessage.status === "draft" ? (
+                          <div className="ai-counterparty-msg-card is-draft" id={`draft-card-${msg.id}`}>
+                            <div className="ai-cp-card-header">
+                              <div className="ai-cp-header-left">
+                                <span className="ai-cp-draft-badge">
+                                  📝 Negotiation Draft
+                                </span>
+                                <span className="ai-cp-recipient">
+                                  For <strong>{msg.counterpartyMessage.counterparty_name}</strong>
+                                </span>
+                              </div>
+                              <div className="ai-cp-header-actions">
+                                <button
+                                  type="button"
+                                  className="link-button btn-xs ai-cp-edit-toggle"
+                                  onClick={() => {
+                                    if (activeEditDraftId === msg.id) {
+                                      setActiveEditDraftId(null);
+                                    } else {
+                                      setActiveEditDraftId(msg.id);
+                                      if (editingDrafts[msg.id] === undefined) {
+                                        setEditingDrafts((prev) => ({
+                                          ...prev,
+                                          [msg.id]: msg.counterpartyMessage!.message,
+                                        }));
+                                      }
+                                    }
+                                  }}
+                                >
+                                  <IconEdit size={13} />
+                                  {activeEditDraftId === msg.id ? "Done Editing" : "Edit Draft"}
+                                </button>
+                                {!isSplitView && msg.counterpartyMessage.connection_id && (
+                                  <button
+                                    type="button"
+                                    className="link-button btn-xs"
+                                    onClick={() => {
+                                      setActiveConnectionId(msg.counterpartyMessage!.connection_id);
+                                      setIsSplitView(true);
+                                    }}
+                                  >
+                                    Open chat
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+
+                            {activeEditDraftId === msg.id ? (
+                              <textarea
+                                className="ai-cp-draft-editor"
+                                value={editingDrafts[msg.id] ?? msg.counterpartyMessage.message}
+                                onChange={(e) =>
+                                  setEditingDrafts((prev) => ({
+                                    ...prev,
+                                    [msg.id]: e.target.value,
+                                  }))
+                                }
+                                rows={4}
+                                placeholder="Customize message before sending..."
+                              />
+                            ) : (
+                              <p className="ai-cp-quote">
+                                {editingDrafts[msg.id] ?? msg.counterpartyMessage.message}
+                              </p>
+                            )}
+
+                            <div className="ai-cp-card-actions">
                               <button
                                 type="button"
-                                className="link-button"
-                                onClick={() => {
-                                  setActiveConnectionId(msg.counterpartyMessage!.connection_id);
-                                  setIsSplitView(true);
-                                }}
+                                className="primary small-btn ai-cp-send-btn"
+                                disabled={sendingDraftId === msg.id || !msg.counterpartyMessage.connection_id}
+                                onClick={() => handleSendDraft(msg.id, msg.counterpartyMessage!)}
+                                title={`Send message to ${msg.counterpartyMessage.counterparty_name}`}
                               >
-                                Open chat
+                                <IconSend size={14} />
+                                {sendingDraftId === msg.id
+                                  ? "Sending..."
+                                  : `Send to ${msg.counterpartyMessage.counterparty_name}`}
                               </button>
-                            )}
+                              <span className="ai-cp-hint-text">
+                                User confirmation required · Click to dispatch message
+                              </span>
+                            </div>
                           </div>
-                          <p className="ai-cp-quote">{msg.counterpartyMessage.message}</p>
-                        </div>
+                        ) : (
+                          <div className="ai-counterparty-msg-card is-sent">
+                            <div className="ai-cp-card-header">
+                              <span className="ai-cp-card-title">
+                                <span className="badge badge-success ai-sent-pill">
+                                  <IconCheck size={12} /> Sent
+                                </span>
+                                {" "}to <strong>{msg.counterpartyMessage.counterparty_name}</strong>
+                                <span className="ai-cp-time">
+                                  {" · "}
+                                  {new Date(msg.counterpartyMessage.created_at).toLocaleTimeString([], {
+                                    hour: "2-digit",
+                                    minute: "2-digit",
+                                  })}
+                                </span>
+                              </span>
+                              {!isSplitView && msg.counterpartyMessage.connection_id && (
+                                <button
+                                  type="button"
+                                  className="link-button"
+                                  onClick={() => {
+                                    setActiveConnectionId(msg.counterpartyMessage!.connection_id);
+                                    setIsSplitView(true);
+                                  }}
+                                >
+                                  Open chat
+                                </button>
+                              )}
+                            </div>
+                            <p className="ai-cp-quote">{msg.counterpartyMessage.message}</p>
+                          </div>
+                        )
                       )}
 
                       {msg.createdRfq && (

@@ -660,28 +660,39 @@ export interface Shipment {
 }
 
 export interface FreightRateOption {
-  mode: ShippingMode;
+  mode: ShippingMode | string;
+  mode_id?: string;
   mode_label: string;
+  mode_name?: string;
+  carrier_sample?: string;
   transit_days_min: number;
   transit_days_max: number;
-  base_freight_usd: number;
-  fuel_surcharge_usd: number;
-  documentation_fee_usd: number;
-  customs_clearance_usd: number;
+  base_freight_usd?: number;
+  fuel_surcharge_usd?: number;
+  documentation_fee_usd?: number;
+  customs_clearance_usd?: number;
   total_estimated_usd: number;
+  rate_amount?: number;
   chargeable_weight_kg: number;
   basis: string;
   recommended: boolean;
+  is_recommended?: boolean;
+  description?: string;
 }
 
 export interface IncotermCostBreakdown {
   incoterm: string;
-  full_name: string;
+  full_name?: string;
   seller_responsibility: string;
   buyer_responsibility: string;
+  seller_pays?: string[];
+  buyer_pays?: string[];
   risk_transfer_point: string;
   estimated_seller_logistics_usd: number;
   estimated_buyer_logistics_usd: number;
+  seller_estimated_cost?: number;
+  buyer_estimated_cost?: number;
+  currency?: string;
 }
 
 export interface FreightEstimateRequest {
@@ -689,20 +700,31 @@ export interface FreightEstimateRequest {
   origin_city?: string;
   destination_country: string;
   destination_city?: string;
-  gross_weight_kg: number;
+  gross_weight_kg?: number;
+  weight_kg?: number;
   length_cm?: number;
   width_cm?: number;
   height_cm?: number;
   cbm?: number;
+  volume_cbm?: number;
   incoterm?: string;
+  cargo_value?: number;
+  currency?: string;
 }
 
 export interface FreightEstimateResponse {
   origin: string;
   destination: string;
+  distance_km?: number;
+  is_cross_border?: boolean;
   gross_weight_kg: number;
-  cbm: number;
+  volumetric_weight_kg?: number;
+  chargeable_weight_kg?: number;
+  volume_cbm?: number;
+  cbm?: number;
+  currency?: string;
   rates: FreightRateOption[];
+  rate_options?: FreightRateOption[];
   incoterm_breakdown: IncotermCostBreakdown;
 }
 

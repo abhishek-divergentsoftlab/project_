@@ -29,9 +29,9 @@ class Settings(BaseSettings):
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "qwen3-coder-next:q4_K_M"
     OLLAMA_NUM_CTX: int = 65536
-    EMBEDDING_MODEL: str = "nomic-embed-text"
+    EMBEDDING_MODEL: str = "qwen3-embedding:8b"
     EMBEDDING_TIMEOUT_SECONDS: int = 30
-    QDRANT_COLLECTION: str = "marketplace_rfq"
+    QDRANT_COLLECTION: str = "marketplace_rfq_v2"
     # Cosine similarity below this is a different product, not a weak match.
     # Measured against the seed corpus with product-only embeddings: the right
     # product scores 0.74-0.84, a different product in the same category scores
@@ -48,6 +48,10 @@ class Settings(BaseSettings):
     AI_CHAT_MODEL: str = OLLAMA_MODEL
     AI_CHAT_TIMEOUT_SECONDS: int = 120
     AI_CHAT_NUM_CTX: int = 65536
+
+    # Real-time Deal Room Translation
+    TRANSLATION_MODEL: str = "gpt-oss:20b"
+    TRANSLATION_TIMEOUT_SECONDS: float = 10.0
 
     # Image safety moderation via vision model
     IMAGE_MODERATION_MODEL: str = "qwen3-vl:8b"

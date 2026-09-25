@@ -102,3 +102,34 @@ async def test_connection_translate_permissions(accepted_pair, make_actor):
     random_id = str(uuid.uuid4())
     not_found_res = await buyer.post(f"/translation/connections/{random_id}/translate", json=payload)
     assert not_found_res.status_code == 404
+
+
+async def test_translate_arbitrary_foreign_text(make_actor):
+    actor = await make_actor()
+    payload = {
+        "text": "Necesitamos 500 unidades para la próxima semana",
+        "target_language": "en",
+    }
+    res = await actor.post("/translation/translate", json=payload)
+    assert res.status_code == 200
+    data = res.json()
+    assert data["target_language"] == "en"
+    assert data["source_language"] == "es"
+    assert "500" in data["translated_text"]
+    assert "week" in data["translated_text"].lower() or "units" in data["translated_text"].lower()
+
+
+async def test_language_detection():
+    from services.translation_service import detect_language
+
+    assert detect_language("Gracias por su oferta") == "es"
+    assert detect_language("Danke schön für das Angebot") == "de"
+    assert detect_language("Merci beaucoup pour votre message") == "fr"
+    assert detect_language("Muito obrigado pela proposta") == "pt"
+    assert detect_language("Grazie mille per la risposta") == "it"
+    assert detect_language("We need delivery terms CIF Mumbai") == "en"
+    assert detect_language("आपकी न्यूनतम ऑर्डर मात्रा क्या है?") == "hi"
+    assert detect_language("Каковы условия доставки?") == "ru"
+    assert detect_language("ما هي شروط الدفع؟") == "ar"
+    assert detect_language("请问最低订购量是多少？") == "zh"
+    assert detect_language("こんにちは、価格を教えてください") == "ja"
