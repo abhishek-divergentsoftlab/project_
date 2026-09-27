@@ -440,6 +440,7 @@ def preprocess_message_to_rfq(
         or not config.auto_preprocess
         or check_create_rfq_intent(message)
         or check_match_query_intent(message)
+        or check_analysis_query_intent(message)
         or check_counterparty_message_intent(
             message,
             has_active_connection=has_active_connection,
@@ -478,6 +479,8 @@ def preprocess_message_to_rfq(
             "state", "note", "add", "message", "msg", "negotiate", "negotiation",
             "nagitiation", "nagotiation", "deal", "bargain", "seller", "supplier",
             "vendor", "user", "counterparty", "recipient", "away", "instead",
+            "analyze", "analyse", "analysis", "listing", "listings", "typical",
+            "market", "conditions", "condition", "benchmark", "benchmarks",
         }
         prod_norm = req.product.strip().lower()
         words = [w for w in prod_norm.split() if w not in ("i", "am", "a", "an", "the", "to", "want", "looking")]
@@ -485,6 +488,7 @@ def preprocess_message_to_rfq(
             "mention", "mantion", "aslo", "also", "say", "tell", "inform", "clarify",
             "state", "note", "add", "message", "msg", "negotiate", "deal", "seller",
             "supplier", "user", "location", "away", "not", "indore",
+            "analyze", "analyse", "listing", "market",
         }
         has_directive_word = any(w in directive_words for w in words)
         is_invalid = (
@@ -494,6 +498,7 @@ def preprocess_message_to_rfq(
             or bool(re.search(r"\brfq\b", prod_norm))
             or check_create_rfq_intent(prod_norm)
             or check_match_query_intent(prod_norm)
+            or check_analysis_query_intent(prod_norm)
             or check_counterparty_message_intent(prod_norm)
             or has_directive_word
         )
@@ -663,6 +668,33 @@ def check_match_query_intent(user_message: str) -> bool:
         return False
     text = user_message.strip()
     return any(rx.search(text) for rx in MATCH_QUERY_INTENT_REGEXES)
+
+
+ANALYSIS_QUERY_INTENT_REGEXES = [
+    re.compile(p, re.IGNORECASE)
+    for p in [
+        # Listing analysis / evaluation requests
+        r"\b(analy[sz]e|evaluat(e|ion)|assess|review)\b.*\b(listing|order|rfq|deal|offer|quote|quotation|buyer|seller|supplier|product|price|market)\b",
+        # Market comparisons, conditions, and typical pricing
+        r"\b(how\s+does\s+this\s+compare|compare\s+(this\s+)?with|typical\s+market|market\s+conditions?|market\s+rate|market\s+price|market\s+benchmark|price\s+range)\b",
+        r"\b(what\s+does\s+the\s+.*market\s+look\s+like|how\s+competitive\s+is\s+the|market\s+gap|market\s+density|competitor\s+density)\b",
+        # Trade advisory and Incoterms / KYC / negotiation guidance
+        r"\b(what\s+is\s+the\s+difference\s+between|explain)\b.*\b(fob|cif|exw|ddp|cfr|incoterms?)\b",
+        r"\b(kyc\s+checklist|supplier\s+kyc|supplier\s+verification|red\s+flags?\s+to\s+watch)\b",
+        r"\b(how\s+can\s+i\s+negotiate\s+better|counter-offer\s+strategy|payment\s+terms?\s+advice)\b",
+        r"\b(is\s+my\s+asking\s+price\s+competitive|am\s+i\s+priced\s+right|total\s+cost\s+including\s+shipping)\b",
+        r"\b(customs\s+documentation|transit\s+time\s+estimate|packaging\s+advice|landed\s+cost\s+calculator)\b",
+        r"\b(export\s+opportunities|cross-border\s+demand|trusted\s+supplier\s+criteria)\b",
+    ]
+]
+
+
+def check_analysis_query_intent(user_message: str) -> bool:
+    """Check if the user message is an analytical, market research, or informational business query."""
+    if not user_message:
+        return False
+    text = user_message.strip()
+    return any(rx.search(text) for rx in ANALYSIS_QUERY_INTENT_REGEXES)
 
 
 CLOSE_RFQ_INTENT_REGEXES = [

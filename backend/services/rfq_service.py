@@ -290,7 +290,7 @@ async def expire_due_rfqs(db: AsyncSession) -> int:
     return count
 
 
-def to_out(rfq: RFQ, pending_connections: int = 0) -> RFQOut:
+def to_out(rfq: RFQ, pending_connections: int = 0, is_saved: bool = False) -> RFQOut:
     """Reassemble the nested wire format from the flat columns."""
     quantity = (
         Quantity(value=rfq.quantity_value, unit=rfq.quantity_unit or "units")
@@ -355,6 +355,7 @@ def to_out(rfq: RFQ, pending_connections: int = 0) -> RFQOut:
         pending_connections=pending_connections,
         embedding_status=rfq.embedding_status,
         expires_at=rfq.expires_at,
+        is_saved=is_saved,
         created_at=rfq.created_at,
         updated_at=rfq.updated_at,
     )

@@ -34,6 +34,7 @@ import {
 } from "@/components/icons";
 
 import { useSidebarData } from "@/context/SidebarDataContext";
+import { ShipmentRouteMap } from "@/components/map/ShipmentRouteMap";
 import { useFeedback } from "@/context/useFeedback";
 import { useEscapeKey } from "@/hooks/useEscapeKey";
 import type {
@@ -2382,6 +2383,19 @@ function ChatAndDealMain({
                         </div>
                       </div>
                     </div>
+
+                    {/* Interactive Live Consignment Route Map */}
+                    <ShipmentRouteMap
+                      originCity={shipment.origin_city}
+                      originCountry={shipment.origin_country}
+                      destinationCity={shipment.destination_city}
+                      destinationCountry={shipment.destination_country}
+                      trackingEvents={shipment.tracking_events}
+                      shippingMode={shipment.shipping_mode}
+                      carrierName={shipment.carrier_name}
+                      trackingNumber={shipment.tracking_number}
+                      height="220px"
+                    />
 
                     {/* Cargo Specs Grid */}
                     <div className="cargo-specs-grid">

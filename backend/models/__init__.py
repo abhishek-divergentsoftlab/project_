@@ -30,6 +30,7 @@ from models.moderation import ModerationLog
 from models.notification import Notification
 from models.escrow import DealDispute, EscrowAccount, EscrowMilestone
 from models.shipment import Shipment
+from models.saved_rfq import SavedRFQ
 from models.enums import ShipmentStatus, ShippingMode
 
 __all__ = [
@@ -66,6 +67,7 @@ __all__ = [
     "Shipment",
     "ShippingMode",
     "ShipmentStatus",
+    "SavedRFQ",
 ]
 
 

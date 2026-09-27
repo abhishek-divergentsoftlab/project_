@@ -40,11 +40,39 @@ SCOPE (Business & B2B Trade Only):
 - RFQs, product specifications, procurement, and supplier selection
 - Pricing, bulk terms, payment milestones, negotiation tactics, and KYC compliance
 - Supply chain logistics, freight, Incoterms, and packaging
+- Marketplace listings analysis, price benchmarking, market condition comparisons, and commercial feasibility
 
 STRICT POLICY:
-If the query is not about business, trade, or procurement:
+- Always answer business inquiries, listing evaluations, market comparisons, and RFQ questions directly.
+- ONLY if the query is completely unrelated to business, trade, or procurement (e.g., creative writing, pop culture, video games, casual gossip):
 Respond with ONLY: "I only assist with business, procurement, and B2B trade inquiries."
 """
+
+
+def _build_ollama_options() -> dict[str, Any]:
+    """Build Ollama options dict, respecting native model context when num_ctx is not explicitly configured."""
+    opts: dict[str, Any] = {"temperature": 0.3}
+    configured_ctx = getattr(settings, "AI_CHAT_NUM_CTX", 0)
+    if configured_ctx and configured_ctx > 0:
+        opts["num_ctx"] = configured_ctx
+    return opts
+
+
+def is_false_positive_refusal(reply_text: str, user_query: str) -> bool:
+    """Check if the model refused a query that is actually a valid B2B trade inquiry."""
+    if not reply_text:
+        return False
+    refusal_needle = "i only assist with business"
+    if refusal_needle not in reply_text.lower():
+        return False
+    commercial_terms = [
+        "listing", "order", "price", "pcs", "piece", "pieces", "quantity", "cost", "quote",
+        "market", "supplier", "buyer", "seller", "t-shirt", "cotton", "textile", "textiles",
+        "agriculture", "packaging", "electronics", "inr", "try", "usd", "eur", "gbp", "fob",
+        "cif", "rfq", "kyc", "shipping", "freight", "incoterm", "incoterms", "kg", "ton",
+    ]
+    query_lower = user_query.lower()
+    return any(term in query_lower for term in commercial_terms)
 
 
 def format_rfq_summary_text(draft: dict[str, Any], readiness: dict[str, Any]) -> str:
@@ -117,6 +145,7 @@ def build_rfq_system_prompt(
     matched_candidates: Optional[list[dict[str, Any]]] = None,
     last_counterparty_message: Optional[dict[str, Any]] = None,
     active_connection_id: Optional[Union[str, uuid.UUID]] = None,
+    is_analysis_query: bool = False,
 ) -> str:
     """Construct dynamic prompt instructing assistant on the exact question sequence and matches."""
     status_lines = []
@@ -149,7 +178,10 @@ def build_rfq_system_prompt(
     if opts:
         status_lines.append("- Optional details captured: " + "; ".join(opts))
 
-    status_str = "\n".join(status_lines)
+    if is_analysis_query and not draft.get("role") and not draft.get("product_details", {}).get("name") and not draft.get("category"):
+        status_str = "- No active RFQ being drafted (Market Analysis / Advisory Inquiry)"
+    else:
+        status_str = "\n".join(status_lines)
 
     missing_opts = []
     if not draft.get("quantity"):
@@ -162,7 +194,14 @@ def build_rfq_system_prompt(
         missing_opts.append("delivery deadline")
 
     # Sequence directive
-    if not readiness["has_role"]:
+    if is_analysis_query:
+        flow_directive = (
+            "MARKET ANALYSIS & BENCHMARKING DIRECTIVE:\n"
+            "- The user is asking for market intelligence, price benchmarking, listing evaluation, or commercial analysis.\n"
+            "- Directly answer the user's business inquiry with concrete facts, pricing benchmarks, and concise data tables.\n"
+            "- Do NOT prompt the user to specify Buy/Sell or create an RFQ unless they explicitly ask to create one."
+        )
+    elif not readiness["has_role"]:
         flow_directive = (
             "1. STEP 1 (REQUIRED): Role is missing. Ask the user in ONE brief sentence whether they want to BUY or SELL goods."
         )
@@ -1038,6 +1077,11 @@ async def generate_business_chat_reply(
         )
     )
 
+    is_analysis_query = (not is_counterparty_msg) and (not is_match_query) and (
+        rfq_tool_service.check_analysis_query_intent(last_user_content)
+        or (agent is not None and agent.id in ("market_research", "price_analyst", "logistics", "verification"))
+    )
+
     async def _finalize_response(
         reply_text: str,
         thinking_text: Optional[str] = None,
@@ -1094,6 +1138,7 @@ async def generate_business_chat_reply(
         matched_candidates=matched_candidates,
         last_counterparty_message=last_counterparty_msg,
         active_connection_id=active_connection_id,
+        is_analysis_query=is_analysis_query,
     )
     if agent and agent.id != "general" and agent.system_prompt:
         dynamic_system_prompt = agent.system_prompt + "\n\n" + dynamic_system_prompt
@@ -1120,7 +1165,7 @@ async def generate_business_chat_reply(
         )
 
     # Immediate handling when user explicitly asks to create/proceed with RFQ
-    if not is_match_query and not is_counterparty_msg and rfq_tool_service.check_create_rfq_intent(last_user_content):
+    if not is_match_query and not is_analysis_query and not is_counterparty_msg and rfq_tool_service.check_create_rfq_intent(last_user_content):
         if readiness["has_role"] and readiness["has_product"]:
             created_rfq_obj, err = await execute_create_rfq_call(draft, {}, db=db, user=user)
             if created_rfq_obj:
@@ -1151,7 +1196,7 @@ async def generate_business_chat_reply(
             )
 
     # Immediate handling when user explicitly asks to close an RFQ
-    if not is_match_query and not is_counterparty_msg and rfq_tool_service.check_close_rfq_intent(last_user_content):
+    if not is_match_query and not is_analysis_query and not is_counterparty_msg and rfq_tool_service.check_close_rfq_intent(last_user_content):
         closed_rfq_obj, err = await execute_close_rfq_call(
             rfq_id_str=None, conversation=conversation, db=db, user=user
         )
@@ -1168,21 +1213,30 @@ async def generate_business_chat_reply(
             counterparty_message_data=None,
         )
 
-    tools = [] if is_match_query else [
-        rfq_tool_service.UPDATE_RFQ_DRAFT_TOOL,
-        rfq_tool_service.CREATE_RFQ_TOOL,
-        rfq_tool_service.DRAFT_COUNTERPARTY_MESSAGE_TOOL,
-        rfq_tool_service.CLOSE_RFQ_TOOL,
-    ]
+    if is_match_query or is_analysis_query:
+        tools = []
+    elif agent and agent.id != "general":
+        available_tools_map = {
+            "update_rfq_draft": rfq_tool_service.UPDATE_RFQ_DRAFT_TOOL,
+            "create_rfq": rfq_tool_service.CREATE_RFQ_TOOL,
+            "draft_counterparty_message": rfq_tool_service.DRAFT_COUNTERPARTY_MESSAGE_TOOL,
+            "send_counterparty_message": rfq_tool_service.DRAFT_COUNTERPARTY_MESSAGE_TOOL,
+            "close_rfq": rfq_tool_service.CLOSE_RFQ_TOOL,
+        }
+        tools = [available_tools_map[name] for name in (agent.tools or []) if name in available_tools_map]
+    else:
+        tools = [
+            rfq_tool_service.UPDATE_RFQ_DRAFT_TOOL,
+            rfq_tool_service.CREATE_RFQ_TOOL,
+            rfq_tool_service.DRAFT_COUNTERPARTY_MESSAGE_TOOL,
+            rfq_tool_service.CLOSE_RFQ_TOOL,
+        ]
 
     payload: dict[str, Any] = {
         "model": settings.AI_CHAT_MODEL,
         "messages": prepared_messages,
         "stream": False,
-        "options": {
-            "temperature": 0.3,
-            "num_ctx": settings.AI_CHAT_NUM_CTX,
-        },
+        "options": _build_ollama_options(),
     }
     if tools:
         payload["tools"] = tools
@@ -1209,6 +1263,41 @@ async def generate_business_chat_reply(
         message_data = data.get("message") or {}
         reply = (message_data.get("content") or "").strip()
         thinking = message_data.get("thinking") or None
+
+        # Guardrail recovery: If model mistakenly emitted the refusal string for a valid business query
+        if is_false_positive_refusal(reply, last_user_content):
+            logger.warning(
+                "Detected false-positive guardrail refusal for business inquiry: '%s'. Re-prompting...",
+                last_user_content[:80],
+            )
+            recovery_prompt = [
+                {
+                    "role": "system",
+                    "content": (
+                        f"{SYSTEM_BUSINESS_PROMPT}\n\n"
+                        "DIRECTIVE: The user's query is legitimate B2B business and trade analysis. "
+                        "Directly evaluate the listing or inquiry against typical market conditions with numbers, ranges, and facts. "
+                        "Do NOT output refusal text."
+                    ),
+                },
+                {"role": "user", "content": last_user_content},
+            ]
+            recovery_payload = {
+                "model": settings.AI_CHAT_MODEL,
+                "messages": recovery_prompt,
+                "stream": False,
+                "options": _build_ollama_options(),
+            }
+            try:
+                rec_resp = await client.post(url, json=recovery_payload)
+                if rec_resp.status_code == 200:
+                    rec_data = rec_resp.json()
+                    rec_content = (rec_data.get("message", {}).get("content") or "").strip()
+                    if rec_content and not is_false_positive_refusal(rec_content, last_user_content):
+                        reply = rec_content
+                        thinking = rec_data.get("message", {}).get("thinking") or thinking
+            except Exception as rec_err:
+                logger.warning("Recovery call failed: %s", rec_err)
 
         # Execute any tool calls
         created_rfq_obj = None
@@ -1253,7 +1342,7 @@ async def generate_business_chat_reply(
         readiness = rfq_tool_service.evaluate_rfq_readiness(draft)
 
         # Check deterministic user intent to create if tool was not called explicitly
-        if not is_match_query and not is_counterparty_msg and not created_rfq_obj and rfq_tool_service.check_create_rfq_intent(last_user_content):
+        if not is_match_query and not is_analysis_query and not is_counterparty_msg and not created_rfq_obj and rfq_tool_service.check_create_rfq_intent(last_user_content):
             if readiness["has_role"] and readiness["has_product"]:
                 created_rfq_obj, err = await execute_create_rfq_call(draft, {}, db=db, user=user)
                 if err and not reply:
@@ -1414,6 +1503,11 @@ async def stream_business_chat_reply(
         )
     )
 
+    is_analysis_query = (not is_counterparty_msg) and (not is_match_query) and (
+        rfq_tool_service.check_analysis_query_intent(last_user_content)
+        or (agent is not None and agent.id in ("market_research", "price_analyst", "logistics", "verification"))
+    )
+
     def emit(chunk: dict[str, Any]) -> dict[str, Any]:
         if active_conv_id:
             chunk["conversation_id"] = active_conv_id
@@ -1469,6 +1563,7 @@ async def stream_business_chat_reply(
         matched_candidates=matched_candidates,
         last_counterparty_message=last_counterparty_msg,
         active_connection_id=active_connection_id,
+        is_analysis_query=is_analysis_query,
     )
     if agent and agent.id != "general" and agent.system_prompt:
         dynamic_system_prompt = agent.system_prompt + "\n\n" + dynamic_system_prompt
@@ -1501,7 +1596,7 @@ async def stream_business_chat_reply(
         return
 
     # Immediate handling when user explicitly asks to create/proceed with RFQ
-    if not is_match_query and not is_counterparty_msg and rfq_tool_service.check_create_rfq_intent(last_user_content):
+    if not is_match_query and not is_analysis_query and not is_counterparty_msg and rfq_tool_service.check_create_rfq_intent(last_user_content):
         if readiness["has_role"] and readiness["has_product"]:
             # Initial thinking step
             yield emit({
@@ -1583,7 +1678,7 @@ async def stream_business_chat_reply(
             return
 
     # Immediate handling when user explicitly asks to close an RFQ
-    if not is_match_query and not is_counterparty_msg and rfq_tool_service.check_close_rfq_intent(last_user_content):
+    if not is_match_query and not is_analysis_query and not is_counterparty_msg and rfq_tool_service.check_close_rfq_intent(last_user_content):
         closed_rfq_obj, err = await execute_close_rfq_call(
             rfq_id_str=None, conversation=conversation, db=db, user=user
         )
@@ -1621,21 +1716,30 @@ async def stream_business_chat_reply(
         })
         return
 
-    tools = [] if is_match_query else [
-        rfq_tool_service.UPDATE_RFQ_DRAFT_TOOL,
-        rfq_tool_service.CREATE_RFQ_TOOL,
-        rfq_tool_service.DRAFT_COUNTERPARTY_MESSAGE_TOOL,
-        rfq_tool_service.CLOSE_RFQ_TOOL,
-    ]
+    if is_match_query or is_analysis_query:
+        tools = []
+    elif agent and agent.id != "general":
+        available_tools_map = {
+            "update_rfq_draft": rfq_tool_service.UPDATE_RFQ_DRAFT_TOOL,
+            "create_rfq": rfq_tool_service.CREATE_RFQ_TOOL,
+            "draft_counterparty_message": rfq_tool_service.DRAFT_COUNTERPARTY_MESSAGE_TOOL,
+            "send_counterparty_message": rfq_tool_service.DRAFT_COUNTERPARTY_MESSAGE_TOOL,
+            "close_rfq": rfq_tool_service.CLOSE_RFQ_TOOL,
+        }
+        tools = [available_tools_map[name] for name in (agent.tools or []) if name in available_tools_map]
+    else:
+        tools = [
+            rfq_tool_service.UPDATE_RFQ_DRAFT_TOOL,
+            rfq_tool_service.CREATE_RFQ_TOOL,
+            rfq_tool_service.DRAFT_COUNTERPARTY_MESSAGE_TOOL,
+            rfq_tool_service.CLOSE_RFQ_TOOL,
+        ]
 
     payload: dict[str, Any] = {
         "model": settings.AI_CHAT_MODEL,
         "messages": prepared_messages,
         "stream": True,
-        "options": {
-            "temperature": 0.3,
-            "num_ctx": settings.AI_CHAT_NUM_CTX,
-        },
+        "options": _build_ollama_options(),
     }
     if tools:
         payload["tools"] = tools
@@ -1644,10 +1748,10 @@ async def stream_business_chat_reply(
 
     try:
         timeout = httpx.Timeout(
-            connect=15.0,
+            connect=30.0,
             read=float(settings.AI_CHAT_TIMEOUT_SECONDS),
-            write=15.0,
-            pool=15.0,
+            write=30.0,
+            pool=30.0,
         )
         total_content = ""
         total_thinking = ""
@@ -1829,7 +1933,7 @@ async def stream_business_chat_reply(
                         break
 
         # Check user intent to create if tool was not called explicitly by model
-        if not is_match_query and not is_counterparty_msg and not created_rfq_obj and rfq_tool_service.check_create_rfq_intent(last_user_content):
+        if not is_match_query and not is_analysis_query and not is_counterparty_msg and not created_rfq_obj and rfq_tool_service.check_create_rfq_intent(last_user_content):
             if readiness["has_role"] and readiness["has_product"]:
                 created_rfq_obj, err = await execute_create_rfq_call(draft, {}, db=db, user=user)
                 captured_tool_step = {
@@ -1896,7 +2000,7 @@ async def stream_business_chat_reply(
                 })
 
         # If model did not emit tool_calls in stream, but preprocessing updated fields
-        if not is_match_query and not is_counterparty_msg and not counterparty_msg_obj and not captured_tool_step and draft != (current_rfq or {}):
+        if not is_match_query and not is_analysis_query and not is_counterparty_msg and not counterparty_msg_obj and not captured_tool_step and draft != (current_rfq or {}):
             extracted_args = {}
             for k in ("role", "category", "product_details", "quantity", "price_target", "location", "deadline"):
                 if draft.get(k) and draft.get(k) != (current_rfq or {}).get(k):

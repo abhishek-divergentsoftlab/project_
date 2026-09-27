@@ -3,7 +3,8 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 
 import { errorMessage } from "@/api/client";
 import { moderation as moderationApi, rfqs as rfqApi } from "@/api/endpoints";
-import { IconAlert, IconChevronLeft, IconClose, IconPlus } from "@/components/icons";
+import { IconAlert, IconChevronLeft, IconClose, IconMapPin, IconPlus } from "@/components/icons";
+import { LocationMapPicker } from "@/components/map/LocationMapPicker";
 import { useAuth } from "@/context/useAuth";
 import { useFeedback } from "@/context/useFeedback";
 import type { ProductDetails, RFQ, RFQCreatePayload, RFQRole } from "@/types";
@@ -105,12 +106,13 @@ export function RFQNew() {
     pricePerUnit: "",
     city: "",
     state: "",
-    // Left blank: a recognised city fills in the state and country server side,
-    // and defaulting to India put every Hamburg listing in the wrong country.
     country: "",
+    latitude: null as number | null,
+    longitude: null as number | null,
     deadlineDays: "",
     publishNow: true,
   });
+  const [showMapPicker, setShowMapPicker] = useState(false);
   const [attributes, setAttributes] = useState<Attribute[]>([{ key: "", value: "", mustMatch: false }]);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -134,10 +136,15 @@ export function RFQNew() {
       city: rfq.location?.city ?? "",
       state: rfq.location?.state ?? "",
       country: rfq.location?.country ?? "",
+      latitude: rfq.location?.latitude ?? null,
+      longitude: rfq.location?.longitude ?? null,
       // An edit must not silently republish a draft, nor unpublish a live one.
       deadlineDays: "",
       publishNow: rfq.status === "active",
     });
+    if (rfq.location?.latitude != null && rfq.location?.longitude != null) {
+      setShowMapPicker(true);
+    }
     setAttributes(toAttributeRows(rfq.product_details));
     setExisting(rfq);
   }, []);
@@ -241,11 +248,13 @@ export function RFQNew() {
         per_unit: form.pricePerUnit || form.quantityUnit || null,
       };
     }
-    if (form.city || form.state || form.country) {
+    if (form.city || form.state || form.country || form.latitude != null) {
       payload.location = {
         city: form.city || null,
         state: form.state || null,
         country: form.country || null,
+        latitude: form.latitude != null ? form.latitude : null,
+        longitude: form.longitude != null ? form.longitude : null,
       };
     }
     if (form.deadlineDays) {
@@ -476,9 +485,46 @@ export function RFQNew() {
 
         <div className="form-section">
           <div className="form-section-head">
-            <h2>Delivery</h2>
-            <p>A recognised city fills in the state and country, so matches can be ranked by real distance.</p>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", width: "100%", flexWrap: "wrap", gap: "8px" }}>
+              <div>
+                <h2>Delivery & Sourcing Location</h2>
+                <p>Pinpoint your dispatch hub or delivery point on the interactive map for real distance ranking.</p>
+              </div>
+              <button
+                type="button"
+                className="secondary small-btn"
+                style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}
+                onClick={() => setShowMapPicker(!showMapPicker)}
+              >
+                <IconMapPin size={14} />
+                {showMapPicker ? "Hide Map" : "🗺️ Select on Map"}
+              </button>
+            </div>
           </div>
+
+          {showMapPicker && (
+            <div style={{ marginBottom: "16px" }}>
+              <LocationMapPicker
+                initialLat={form.latitude}
+                initialLng={form.longitude}
+                initialCity={form.city}
+                initialState={form.state}
+                initialCountry={form.country}
+                onLocationSelect={(loc) => {
+                  setForm((current) => ({
+                    ...current,
+                    city: loc.city,
+                    state: loc.state,
+                    country: loc.country,
+                    latitude: loc.latitude,
+                    longitude: loc.longitude,
+                  }));
+                }}
+                height="280px"
+                showPresets={true}
+              />
+            </div>
+          )}
 
           <div className="field-grid">
             <div className="field">

@@ -57,11 +57,11 @@ WHEN ANSWERING:
 3. When comparing suppliers, use a table with columns: Company | Price | Location | Rating | Verified
 4. Flag opportunities: "Only 3 sellers offer X in Y region — low competition"
 
-SCOPE: Market intelligence, product research, competitive analysis, pricing benchmarks.
-If the query is not about market research or business intelligence:
+SCOPE: Market intelligence, product research, competitive analysis, pricing benchmarks, and buyer/seller listing evaluation.
+If the query is not about market research, business intelligence, or listing analysis:
 Respond with ONLY: "I specialise in market research. Try the general Business AI for other queries."
 """,
-    tools=["update_rfq_draft"],
+    tools=[],
     suggested_prompts=[
         {"label": "📊 Rice market in India", "prompt": "What does the rice market look like? How many sellers are active and what's the price range?"},
         {"label": "🏭 Steel suppliers analysis", "prompt": "Analyse the steel pipe market — who are the top suppliers, price range, and locations?"},
@@ -199,11 +199,11 @@ PRICE EVALUATION CRITERIA:
 - Logistics cost impact (nearby = cheaper shipping)
 - Trust premium (verified suppliers may command higher prices legitimately)
 
-SCOPE: Price analysis, cost comparison, value assessment.
-If the query is not about pricing or cost analysis:
+SCOPE: Price analysis, cost comparison, value assessment, and market condition benchmarking.
+If the query is not about pricing, cost analysis, or market benchmarking:
 Respond with ONLY: "I specialise in price analysis. Try the general Business AI for other queries."
 """,
-    tools=["update_rfq_draft"],
+    tools=[],
     suggested_prompts=[
         {"label": "💰 Compare top 5 prices", "prompt": "Compare the prices of my top 5 matches and tell me which is the best deal"},
         {"label": "💱 Currency comparison", "prompt": "How do the USD-quoted suppliers compare to INR ones after conversion?"},

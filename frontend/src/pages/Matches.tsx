@@ -5,6 +5,7 @@ import { errorMessage } from "@/api/client";
 import { connections, matching, rfqs as rfqApi } from "@/api/endpoints";
 import { IconChevronLeft, IconSparkles } from "@/components/icons";
 import { MatchCard } from "@/components/MatchCard";
+import { MatchRouteModal } from "@/components/map/MatchRouteModal";
 import { useFeedback } from "@/context/useFeedback";
 import type { Connection, MatchCandidate, RFQ } from "@/types";
 
@@ -41,6 +42,7 @@ export function Matches() {
   const [loadingMore, setLoadingMore] = useState(false);
   const [closing, setClosing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [routeCandidate, setRouteCandidate] = useState<MatchCandidate | null>(null);
 
   const load = useCallback(async () => {
     if (!rfqId) return;
@@ -188,7 +190,12 @@ export function Matches() {
       ) : (
         <div className="match-grid">
           {results.map((candidate) => (
-            <MatchCard key={candidate.rfq_id} candidate={candidate} onContact={handleContact} />
+            <MatchCard
+              key={candidate.rfq_id}
+              candidate={candidate}
+              onContact={handleContact}
+              onViewRoute={(c) => setRouteCandidate(c)}
+            />
           ))}
         </div>
       )}
@@ -200,6 +207,13 @@ export function Matches() {
           </button>
         </div>
       )}
+
+      <MatchRouteModal
+        isOpen={Boolean(routeCandidate)}
+        onClose={() => setRouteCandidate(null)}
+        ownRfq={rfq}
+        candidate={routeCandidate}
+      />
     </section>
   );
 }

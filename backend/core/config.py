@@ -27,7 +27,8 @@ class Settings(BaseSettings):
     QDRANT_URL: str = "http://localhost:6333"
     REDIS_URL: str = "redis://localhost:6379/0"
     OLLAMA_BASE_URL: str = "http://localhost:11434"
-    OLLAMA_MODEL: str = "qwen3-coder-next:q4_K_M"
+    OLLAMA_MODEL: str = "gpt-oss:120b"
+    # OLLAMA_MODEL: str = "qwen3-coder-next:q4_K_M"
     OLLAMA_NUM_CTX: int = 65536
     EMBEDDING_MODEL: str = "qwen3-embedding:8b"
     EMBEDDING_TIMEOUT_SECONDS: int = 30
@@ -46,8 +47,8 @@ class Settings(BaseSettings):
     DIRECT_SEARCH_LLM: bool = True
     # AI Conversational Business Assistant (Ollama)
     AI_CHAT_MODEL: str = OLLAMA_MODEL
-    AI_CHAT_TIMEOUT_SECONDS: int = 120
-    AI_CHAT_NUM_CTX: int = 65536
+    AI_CHAT_TIMEOUT_SECONDS: int = 180
+    AI_CHAT_NUM_CTX: int = 0  # 0 = use native model context to prevent Ollama reload/deadlocks
 
     # Real-time Deal Room Translation
     TRANSLATION_MODEL: str = "gpt-oss:20b"
@@ -61,6 +62,10 @@ class Settings(BaseSettings):
 
     HOST: str = "127.0.0.1"
     PORT: int = 8011
+
+    # Optional map and geocoding keys
+    MAPBOX_ACCESS_TOKEN: str = ""
+    GEOCODING_API_KEY: str = ""
 
     # NoDecode stops pydantic-settings from trying to JSON-parse this out of
     # the .env file, so it can be written as a plain comma-separated list.

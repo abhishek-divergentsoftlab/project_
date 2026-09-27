@@ -13,6 +13,7 @@ from models.certificate import Certificate
 from models.connection import Connection
 from models.enums import CertificationStatus, ConnectionStatus, KYCStatus, RFQRole, RFQStatus
 from models.rfq import RFQ
+from models.saved_rfq import SavedRFQ
 from models.user import User, UserProfile
 from schemas.common import DeadlineOut, Location, Money, Quantity
 from schemas.marketplace import (
@@ -21,6 +22,7 @@ from schemas.marketplace import (
     CatalogListOut,
     CategoryCountOut,
 )
+from services import locations
 from services.match_scoring import haversine_km
 
 
@@ -37,9 +39,13 @@ async def get_catalog(
     max_price: Optional[float] = None,
     currency: Optional[str] = None,
     verified_only: bool = False,
+    saved_only: bool = False,
     sort_by: str = "newest",
     limit: int = 24,
     offset: int = 0,
+    lat: Optional[float] = None,
+    lon: Optional[float] = None,
+    radius_km: Optional[float] = None,
 ) -> CatalogListOut:
     """Retrieve filtered, paginated catalog items with counterparty trust metadata."""
     now = datetime.now(UTC)
@@ -54,8 +60,18 @@ async def get_catalog(
     if role:
         conditions.append(RFQ.role == role)
 
+    if saved_only:
+        saved_subquery = select(SavedRFQ.rfq_id).where(SavedRFQ.user_id == viewer.id)
+        conditions.append(RFQ.id.in_(saved_subquery))
+
     if category and category.strip():
-        conditions.append(RFQ.category.ilike(f"%{category.strip()}%"))
+        cat_clean = category.strip()
+        conditions.append(
+            or_(
+                func.lower(func.trim(RFQ.category)) == cat_clean.lower(),
+                RFQ.category.ilike(f"%{cat_clean}%"),
+            )
+        )
 
     if city and city.strip():
         conditions.append(RFQ.location_city.ilike(f"%{city.strip()}%"))
@@ -154,6 +170,13 @@ async def get_catalog(
     for cert in certs_rows:
         certs_map.setdefault(cert.user_id, []).append(cert.name)
 
+    # Batch load saved status for viewer
+    saved_query = select(SavedRFQ.rfq_id).where(
+        SavedRFQ.user_id == viewer.id,
+        SavedRFQ.rfq_id.in_(rfq_ids),
+    )
+    saved_rfq_ids = set((await db.scalars(saved_query)).all())
+
     # Viewer coordinates for distance computation
     viewer_lat = getattr(viewer.profile, "latitude", None) if viewer.profile else None
     viewer_lon = getattr(viewer.profile, "longitude", None) if viewer.profile else None
@@ -171,24 +194,45 @@ async def get_catalog(
             ("sent" if conn.sender_id == viewer.id else "received") if conn else None
         )
 
+        # Coordinate resolution with smart fallback so listings appear on map
+        loc_lat = rfq.latitude
+        loc_lon = rfq.longitude
+        if (loc_lat is None or loc_lon is None) and (rfq.location_city or rfq.location_state):
+            loc_candidate = locations.find_location(rfq.location_city or "") or locations.find_location(rfq.location_state or "")
+            if loc_candidate:
+                loc_lat = locations.as_decimal(loc_candidate.latitude)
+                loc_lon = locations.as_decimal(loc_candidate.longitude)
+        if (loc_lat is None or loc_lon is None) and owner_profile and owner_profile.latitude and owner_profile.longitude:
+            loc_lat = owner_profile.latitude
+            loc_lon = owner_profile.longitude
+
+        # Reference coordinate for distance calculation (passed lat/lon or viewer's profile)
+        ref_lat = lat if lat is not None else viewer_lat
+        ref_lon = lon if lon is not None else viewer_lon
+
         # Distance calculation
         dist_km: Optional[float] = None
         if (
-            viewer_lat is not None
-            and viewer_lon is not None
-            and rfq.latitude is not None
-            and rfq.longitude is not None
+            ref_lat is not None
+            and ref_lon is not None
+            and loc_lat is not None
+            and loc_lon is not None
         ):
             try:
                 raw_dist = haversine_km(
-                    float(viewer_lat),
-                    float(viewer_lon),
-                    float(rfq.latitude),
-                    float(rfq.longitude),
+                    float(ref_lat),
+                    float(ref_lon),
+                    float(loc_lat),
+                    float(loc_lon),
                 )
                 dist_km = round(raw_dist, 1)
             except Exception:
                 dist_km = None
+
+        # Filter by radius if requested
+        if radius_km is not None:
+            if dist_km is None or dist_km > radius_km:
+                continue
 
         company_name = (
             (owner_profile.company_name or owner_profile.name)
@@ -232,8 +276,8 @@ async def get_catalog(
             city=rfq.location_city,
             state=rfq.location_state,
             country=rfq.location_country,
-            latitude=rfq.latitude,
-            longitude=rfq.longitude,
+            latitude=loc_lat,
+            longitude=loc_lon,
             raw=rfq.location_raw,
         )
         deadline = (
@@ -263,6 +307,7 @@ async def get_catalog(
                 created_at=rfq.created_at,
                 counterparty=counterparty_out,
                 distance_km=dist_km,
+                is_saved=rfq.id in saved_rfq_ids,
             )
         )
 
@@ -273,9 +318,12 @@ async def get_categories_summary(db: AsyncSession) -> list[CategoryCountOut]:
     """Return top categories with active listing counts across market sides."""
     now = datetime.now(UTC)
 
+    # Normalize category casing and whitespace to eliminate duplicate entries
+    norm_category = func.initcap(func.trim(RFQ.category))
+
     query = (
         select(
-            RFQ.category,
+            norm_category.label("category"),
             func.count(RFQ.id).label("total_count"),
             func.count(case((RFQ.role == RFQRole.SELLER, 1))).label("seller_count"),
             func.count(case((RFQ.role == RFQRole.BUYER, 1))).label("buyer_count"),
@@ -283,8 +331,10 @@ async def get_categories_summary(db: AsyncSession) -> list[CategoryCountOut]:
         .where(
             RFQ.status == RFQStatus.ACTIVE,
             or_(RFQ.expires_at.is_(None), RFQ.expires_at > now),
+            RFQ.category.is_not(None),
+            func.length(func.trim(RFQ.category)) > 0,
         )
-        .group_by(RFQ.category)
+        .group_by(norm_category)
         .order_by(func.count(RFQ.id).desc())
         .limit(20)
     )

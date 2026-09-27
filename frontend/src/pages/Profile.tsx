@@ -6,12 +6,14 @@ import {
   IconClock,
   IconExternalLink,
   IconFileText,
+  IconMapPin,
   IconPlus,
   IconShield,
   IconStar,
   IconUpload,
   IconX,
 } from "@/components/icons";
+import { LocationMapPicker } from "@/components/map/LocationMapPicker";
 import { Menu } from "@/components/ui/Menu";
 import { Modal } from "@/components/ui/Modal";
 import { useAuth } from "@/context/useAuth";
@@ -87,7 +89,10 @@ export function Profile() {
     city: "",
     state: "",
     country: "",
+    latitude: null as number | null,
+    longitude: null as number | null,
   });
+  const [showMapPicker, setShowMapPicker] = useState(false);
   const [role, setRole] = useState<UserRole>("buyer");
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -150,7 +155,12 @@ export function Profile() {
       city: profile.city ?? "",
       state: profile.state ?? "",
       country: profile.country ?? "",
+      latitude: profile.latitude ?? null,
+      longitude: profile.longitude ?? null,
     });
+    if (profile.latitude != null && profile.longitude != null) {
+      setShowMapPicker(true);
+    }
 
     setKycForm({
       gst_number: profile.gst_number ?? "",
@@ -207,7 +217,10 @@ export function Profile() {
     setSaving(true);
     try {
       const payload = Object.fromEntries(
-        Object.entries(form).map(([key, value]) => [key, value.trim() || null]),
+        Object.entries(form).map(([key, value]) => [
+          key,
+          typeof value === "string" ? value.trim() || null : value ?? null,
+        ]),
       );
       await users.updateProfile(payload);
       if (user && role !== user.role) await users.updateRole(role);
@@ -498,9 +511,47 @@ export function Profile() {
 
           <div className="form-section">
             <div className="form-section-head">
-              <h2>Location</h2>
-              <p>A recognised city enables distance and freight estimates on matches.</p>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", width: "100%", flexWrap: "wrap", gap: "8px" }}>
+                <div>
+                  <h2>Facility & Dispatch Location</h2>
+                  <p>Pinpoint your primary facility, warehouse, or factory on the map for distance and freight calculations.</p>
+                </div>
+                <button
+                  type="button"
+                  className="secondary small-btn"
+                  style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}
+                  onClick={() => setShowMapPicker(!showMapPicker)}
+                >
+                  <IconMapPin size={14} />
+                  {showMapPicker ? "Hide Map" : "🗺️ Pinpoint on Map"}
+                </button>
+              </div>
             </div>
+
+            {showMapPicker && (
+              <div style={{ marginBottom: "16px" }}>
+                <LocationMapPicker
+                  initialLat={form.latitude}
+                  initialLng={form.longitude}
+                  initialCity={form.city}
+                  initialState={form.state}
+                  initialCountry={form.country}
+                  onLocationSelect={(loc) => {
+                    setForm((current) => ({
+                      ...current,
+                      city: loc.city,
+                      state: loc.state,
+                      country: loc.country,
+                      latitude: loc.latitude,
+                      longitude: loc.longitude,
+                    }));
+                  }}
+                  height="280px"
+                  showPresets={true}
+                />
+              </div>
+            )}
+
             <div className="field-grid">
               <div className="field">
                 <label htmlFor="p-city">City</label>

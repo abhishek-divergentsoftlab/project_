@@ -3,7 +3,7 @@ import { Link, useNavigate } from "react-router-dom";
 
 import { errorMessage } from "@/api/client";
 import { rfqs as rfqApi } from "@/api/endpoints";
-import { IconPlus, IconRFQ } from "@/components/icons";
+import { IconBookmark, IconPlus, IconRFQ } from "@/components/icons";
 import { Menu } from "@/components/ui/Menu";
 import { useFeedback } from "@/context/useFeedback";
 import type { RFQ, RFQStatus } from "@/types";
@@ -53,6 +53,23 @@ export function RFQList() {
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [savedCount, setSavedCount] = useState<number>(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadSavedCount() {
+      try {
+        const ids = await rfqApi.getSavedIds();
+        if (!cancelled) setSavedCount(ids.length);
+      } catch {
+        // silent fallback
+      }
+    }
+    void loadSavedCount();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -134,10 +151,21 @@ export function RFQList() {
           <h1>My RFQs</h1>
           <p>Requests you've posted to buy or sell. Open one to see who matches.</p>
         </div>
-        <Link className="button" to="/rfqs/new">
-          <IconPlus size={16} />
-          New RFQ
-        </Link>
+        <div style={{ display: "flex", gap: "var(--space-2)", alignItems: "center" }}>
+          <Link
+            className="button secondary"
+            to="/marketplace?saved=true"
+            title="View RFQs you saved / bookmarked for later"
+            style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}
+          >
+            <IconBookmark size={15} />
+            <span>Saved RFQs {savedCount > 0 ? `(${savedCount})` : ""}</span>
+          </Link>
+          <Link className="button" to="/rfqs/new">
+            <IconPlus size={16} />
+            New RFQ
+          </Link>
+        </div>
       </header>
 
       <div className="list-toolbar">
@@ -154,6 +182,15 @@ export function RFQList() {
               {item.label}
             </button>
           ))}
+          <Link
+            to="/marketplace?saved=true"
+            className="tab"
+            style={{ display: "inline-flex", alignItems: "center", gap: "5px", color: "var(--muted)", textDecoration: "none" }}
+            title="View your bookmarked RFQs"
+          >
+            <IconBookmark size={13} />
+            <span>Saved RFQs {savedCount > 0 ? `(${savedCount})` : ""}</span>
+          </Link>
         </div>
         {!loading && items.length > 0 && (
           <span className="result-meta">

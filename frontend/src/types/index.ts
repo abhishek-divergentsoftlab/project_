@@ -92,6 +92,7 @@ export interface RFQ {
   pending_connections: number;
   embedding_status: EmbeddingStatus;
   expires_at: string | null;
+  is_saved?: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -481,6 +482,7 @@ export interface CatalogItem {
   created_at: string;
   counterparty: CatalogCounterparty;
   distance_km: number | null;
+  is_saved?: boolean;
 }
 
 export interface CatalogListResponse {
@@ -507,9 +509,13 @@ export interface CatalogFilterParams {
   max_price?: number;
   currency?: string;
   verified_only?: boolean;
+  saved_only?: boolean;
   sort_by?: "newest" | "price_asc" | "price_desc" | "trust_desc";
   limit?: number;
   offset?: number;
+  lat?: number;
+  lon?: number;
+  radius_km?: number;
 }
 
 export interface LanguageInfo {

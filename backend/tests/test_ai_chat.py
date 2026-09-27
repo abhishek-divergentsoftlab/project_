@@ -742,9 +742,10 @@ async def test_ai_chat_message_with_matched_candidates_persisted(client: AsyncCl
         assert saved_candidates[0]["counterparty"]["company_name"] == "Himalaya Orchards"
 
 
-async def test_ai_chat_payload_includes_num_ctx(client: AsyncClient, make_actor):
-    """Ensure num_ctx is configured and sent in Ollama options for both chat and stream."""
+async def test_ai_chat_payload_includes_num_ctx(client: AsyncClient, make_actor, monkeypatch):
+    """Ensure num_ctx is configured and sent when set, and omitted when 0 to preserve native context."""
     from core.config import settings
+    monkeypatch.setattr(settings, "AI_CHAT_NUM_CTX", 65536)
     actor = await make_actor("buyer")
     captured_payloads = []
 
@@ -775,6 +776,17 @@ async def test_ai_chat_payload_includes_num_ctx(client: AsyncClient, make_actor)
         assert options.get("num_ctx") == 65536
         assert options.get("num_ctx") == settings.AI_CHAT_NUM_CTX
 
+        # Also verify that when AI_CHAT_NUM_CTX is 0, num_ctx is omitted to allow native model context
+        monkeypatch.setattr(settings, "AI_CHAT_NUM_CTX", 0)
+        res_zero = await actor.post(
+            "/ai-chat/message",
+            json={"messages": [{"role": "user", "content": "Testing native context"}]},
+        )
+        assert res_zero.status_code == 200
+        assert len(captured_payloads) == 2
+        options_zero = captured_payloads[1].get("options", {})
+        assert "num_ctx" not in options_zero
+
     # Test stream payload options
     captured_stream_payloads = []
 
@@ -796,6 +808,7 @@ async def test_ai_chat_payload_includes_num_ctx(client: AsyncClient, make_actor)
             captured_stream_payloads.append(kwargs.get("json") or {})
         return MockStreamContext()
 
+    monkeypatch.setattr(settings, "AI_CHAT_NUM_CTX", 65536)
     with patch.object(httpx.AsyncClient, "stream", mock_stream):
         s_res = await actor.post(
             "/ai-chat/stream",
@@ -1117,6 +1130,126 @@ def test_is_truncated_message_detection():
     assert is_truncated_message(truncated_2) is True
     assert is_truncated_message(complete_1) is False
     assert is_truncated_message(complete_2) is False
+
+
+def test_analysis_query_intent_detection():
+    """Verify check_analysis_query_intent catches listing analysis, price benchmark, and advisory queries."""
+    from services.rfq_tool_service import check_analysis_query_intent, preprocess_message_to_rfq
+
+    analysis_prompts = [
+        'Analyze this buyer listing for "Need 115,300 pcs of white cotton t-shirt — 140, cotton-poly 60/40" in category "Textiles". Price is TRY 159 / pcs, quantity 115,300 pcs. How does this compare with typical market conditions?',
+        'Analyze this supplier listing for "Basmati Rice" in category "Agriculture". Price is INR 80 / kg, quantity 10,000 kg. How does this compare with typical market conditions?',
+        "What does the rice market look like? How many sellers are active and what's the price range?",
+        "Analyse the steel pipe market — who are the top suppliers, price range, and locations?",
+        "How competitive is the corrugated box market? Show me supplier density by region.",
+        "What is the difference between FOB, CIF, and EXW shipping terms?",
+        "What are the key supplier KYC and verification checks?",
+        "How can I negotiate better payment terms with a supplier?",
+        "Is my asking price competitive compared to similar listings?",
+    ]
+
+    for p in analysis_prompts:
+        assert check_analysis_query_intent(p) is True, f"Failed for prompt: {p}"
+        # Preprocessing must NOT treat analysis as an RFQ draft
+        draft = preprocess_message_to_rfq(p)
+        assert draft == {}, f"Draft was polluted for prompt: {p}, got: {draft}"
+
+    # Verify standard RFQ prompts are NOT flagged as analysis queries
+    rfq_prompts = [
+        "I want to buy 500 kg apples in Indore",
+        "I want to buy 500 corrugated boxes",
+        "I am a seller of industrial stainless steel pipes",
+        "create rfq",
+        "send negotiation message to the seller",
+    ]
+    for p in rfq_prompts:
+        assert check_analysis_query_intent(p) is False, f"Incorrectly flagged RFQ prompt: {p}"
+
+
+def test_analysis_query_system_prompt_directive():
+    """Verify build_rfq_system_prompt provides market analysis directive when is_analysis_query=True."""
+    from services.ai_chat_service import build_rfq_system_prompt
+    from services.rfq_tool_service import evaluate_rfq_readiness
+
+    empty_draft = {}
+    readiness = evaluate_rfq_readiness(empty_draft)
+
+    # Standard non-analysis prompt demands Buy or Sell role
+    standard_prompt = build_rfq_system_prompt(empty_draft, readiness, is_analysis_query=False)
+    assert "Ask the user in ONE brief sentence whether they want to BUY or SELL goods" in standard_prompt
+
+    # Analysis prompt gives market analysis directive without forcing Buy/Sell
+    analysis_prompt = build_rfq_system_prompt(empty_draft, readiness, is_analysis_query=True)
+    assert "MARKET ANALYSIS & BENCHMARKING DIRECTIVE" in analysis_prompt
+    assert "Do NOT prompt the user to specify Buy/Sell or create an RFQ" in analysis_prompt
+    assert "Market Analysis / Advisory Inquiry" in analysis_prompt
+
+
+def test_is_false_positive_refusal_detection():
+    """Verify is_false_positive_refusal detects refusal on commercial queries."""
+    from services.ai_chat_service import is_false_positive_refusal
+
+    refusal = "I only assist with business, procurement, and B2B trade inquiries."
+    normal_reply = "Here is the market analysis for white cotton t-shirts: typical price is USD 1.80-3.20."
+
+    # False positive: user asked about a B2B listing/price/market, but model refused
+    commercial_query = (
+        'Analyze this buyer listing for "Need 115,300 pcs of white cotton t-shirt — 140, cotton-poly 60/40" '
+        'in category "Textiles". Price is TRY 159 / pcs, quantity 115,300 pcs. How does this compare with typical market conditions?'
+    )
+    assert is_false_positive_refusal(refusal, commercial_query) is True
+    assert is_false_positive_refusal(normal_reply, commercial_query) is False
+
+    # True positive refusal: user asked about movies/weather/games
+    non_business_query = "Write me a poem about the sunset in the mountains."
+    assert is_false_positive_refusal(refusal, non_business_query) is False
+
+
+@pytest.mark.asyncio
+async def test_ai_chat_message_analysis_query_bypasses_tools(client: AsyncClient, make_actor):
+    """Verify POST /ai-chat/message for an analysis query passes empty tools and returns analysis reply."""
+    actor = await make_actor("buyer")
+    analysis_prompt = (
+        'Analyze this buyer listing for "Need 115,300 pcs of white cotton t-shirt — 140, cotton-poly 60/40" '
+        'in category "Textiles". Price is TRY 159 / pcs, quantity 115,300 pcs. How does this compare with typical market conditions?'
+    )
+
+    captured_payloads = []
+    orig_post = httpx.AsyncClient.post
+
+    async def mock_post(self, url, *args, **kwargs):
+        if "api/chat" in str(url):
+            payload = kwargs.get("json") or {}
+            captured_payloads.append(payload)
+            mock_resp = AsyncMock()
+            mock_resp.status_code = 200
+            mock_resp.json = lambda: {
+                "message": {
+                    "role": "assistant",
+                    "content": "The quoted price of TRY 159/pc is approx USD 4.80, which is higher than typical FOB benchmarks (USD 1.80–3.20).",
+                    "thinking": "Evaluated listing against textile benchmarks.",
+                }
+            }
+            return mock_resp
+        return await orig_post(self, url, *args, **kwargs)
+
+    with patch.object(httpx.AsyncClient, "post", mock_post):
+        res = await actor.post(
+            "/ai-chat/message",
+            json={"messages": [{"role": "user", "content": analysis_prompt}]},
+        )
+        assert res.status_code == 200
+        data = res.json()
+        assert "TRY 159" in data["reply"]
+        assert len(captured_payloads) == 1
+        # Tools should be empty for analysis queries
+        assert "tools" not in captured_payloads[0] or captured_payloads[0]["tools"] == []
+        # Dynamic system prompt must contain analysis directive
+        sys_msg = captured_payloads[0]["messages"][0]["content"]
+        assert "MARKET ANALYSIS & BENCHMARKING DIRECTIVE" in sys_msg
+        # RFQ draft is not populated with corrupted listing text
+        assert data["rfq_draft"] == {}
+
 
 
 

@@ -14,8 +14,10 @@ from api.deps import CurrentUser, DbSession
 from models.enums import RFQStatus
 from models.rfq import RFQ
 from schemas.rfq import RFQCreate, RFQListOut, RFQOut, RFQUpdate
+from schemas.marketplace import CatalogListOut
 from schemas.connection import ConnectionOut
-from services import connection_service, rfq_service
+from services import connection_service, rfq_service, saved_rfq_service
+from services.saved_rfq_service import SavedRFQNotFoundError
 from services.rfq_service import RFQError
 
 router = APIRouter()
@@ -60,6 +62,29 @@ async def list_rfqs(
         total=total,
         limit=limit,
         offset=offset,
+    )
+
+
+@router.get("/saved/ids", response_model=list[str])
+async def get_saved_rfq_ids(
+    current_user: CurrentUser,
+    db: DbSession,
+) -> list[str]:
+    """Return all RFQ IDs bookmarked by the current user."""
+    ids = await saved_rfq_service.get_saved_rfq_ids(db, current_user.id)
+    return [str(i) for i in ids]
+
+
+@router.get("/saved", response_model=CatalogListOut)
+async def list_saved_rfqs(
+    current_user: CurrentUser,
+    db: DbSession,
+    limit: Annotated[int, Query(ge=1, le=100)] = 24,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> CatalogListOut:
+    """List all RFQs bookmarked by the current user for later review."""
+    return await saved_rfq_service.list_saved_rfqs(
+        db, current_user, limit=limit, offset=offset
     )
 
 
@@ -122,4 +147,29 @@ async def list_rfq_connections(
         db, rfq_id, current_user.id
     )
     return [connection_service.to_out(row, current_user.id) for row in rows]
+
+
+@router.post("/{rfq_id}/save", status_code=status.HTTP_200_OK)
+async def save_rfq(
+    rfq_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DbSession,
+) -> dict[str, str]:
+    """Bookmark / save an RFQ to revisit later."""
+    try:
+        await saved_rfq_service.save_rfq(db, current_user.id, rfq_id)
+    except SavedRFQNotFoundError:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "RFQ not found")
+    return {"status": "saved", "rfq_id": str(rfq_id)}
+
+
+@router.delete("/{rfq_id}/save", status_code=status.HTTP_200_OK)
+async def unsave_rfq(
+    rfq_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DbSession,
+) -> dict[str, str]:
+    """Remove an RFQ from the user's saved list."""
+    await saved_rfq_service.unsave_rfq(db, current_user.id, rfq_id)
+    return {"status": "unsaved", "rfq_id": str(rfq_id)}
 

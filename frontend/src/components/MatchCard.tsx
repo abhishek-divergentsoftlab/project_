@@ -130,9 +130,11 @@ interface MatchCardProps {
   candidate: MatchCandidate;
   /** Omit to render the Contact button disabled. */
   onContact?: (rfqId: string) => void | Promise<void>;
+  /** Optional handler to inspect geodesic route & logistics on interactive map */
+  onViewRoute?: (candidate: MatchCandidate) => void;
 }
 
-export function MatchCard({ candidate, onContact }: MatchCardProps) {
+export function MatchCard({ candidate, onContact, onViewRoute }: MatchCardProps) {
   const { score, counterparty, quantity, price, location, distance_km: distanceKm } = candidate;
   const [contacting, setContacting] = useState(false);
 
@@ -221,12 +223,30 @@ export function MatchCard({ candidate, onContact }: MatchCardProps) {
         </div>
         <div>
           <dt>Distance</dt>
-          <dd>{distance ?? "—"}</dd>
+          <dd style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+            <span>{distance ?? "—"}</span>
+            {onViewRoute && (
+              <button
+                type="button"
+                className="link-button"
+                style={{ fontSize: "11px", fontWeight: 600, color: "var(--accent)" }}
+                onClick={() => onViewRoute(candidate)}
+                title="View physical route and logistics feasibility on map"
+              >
+                🗺️ View Map
+              </button>
+            )}
+          </dd>
         </div>
       </dl>
 
       {candidate.logistics && (
-        <p className="match-logistics" title={candidate.logistics.mode}>
+        <div
+          className="match-logistics"
+          title={candidate.logistics.mode}
+          style={{ cursor: onViewRoute ? "pointer" : "default" }}
+          onClick={() => onViewRoute?.(candidate)}
+        >
           <IconTruck size={15} />
           <span>
             {candidate.logistics.label}
@@ -236,7 +256,12 @@ export function MatchCard({ candidate, onContact }: MatchCardProps) {
           {candidate.logistics.customs_required && (
             <span className="badge badge-customs">Customs</span>
           )}
-        </p>
+          {onViewRoute && (
+            <span style={{ marginLeft: "auto", fontSize: "10px", color: "var(--accent)", fontWeight: 700 }}>
+              MAP
+            </span>
+          )}
+        </div>
       )}
 
       <details className="match-breakdown">

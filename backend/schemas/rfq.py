@@ -87,6 +87,7 @@ class RFQOut(BaseModel):
     embedding_status: EmbeddingStatus
 
     expires_at: Optional[datetime] = None
+    is_saved: bool = False
     created_at: datetime
     updated_at: datetime
 

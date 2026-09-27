@@ -38,6 +38,7 @@ from models.enums import EmbeddingStatus, RFQRole, RFQStatus
 
 if TYPE_CHECKING:
     from models.user import User
+    from models.saved_rfq import SavedRFQ
 
 
 def _pg_enum(enum_cls: type, name: str) -> Enum:
@@ -140,6 +141,9 @@ class RFQ(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     embedding_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     user: Mapped["User"] = relationship(back_populates="rfqs", lazy="selectin")
+    saved_by: Mapped[list["SavedRFQ"]] = relationship(
+        back_populates="rfq", cascade="all, delete-orphan", lazy="noload"
+    )
 
     @property
     def is_matchable(self) -> bool:

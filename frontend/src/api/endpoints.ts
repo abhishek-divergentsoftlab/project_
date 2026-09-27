@@ -173,6 +173,22 @@ export const rfqs = {
     const { data } = await api.get<Connection[]>(`/rfqs/${id}/connections`);
     return data;
   },
+  async save(id: string): Promise<{ status: string; rfq_id: string }> {
+    const { data } = await api.post<{ status: string; rfq_id: string }>(`/rfqs/${id}/save`);
+    return data;
+  },
+  async unsave(id: string): Promise<{ status: string; rfq_id: string }> {
+    const { data } = await api.delete<{ status: string; rfq_id: string }>(`/rfqs/${id}/save`);
+    return data;
+  },
+  async getSavedIds(): Promise<string[]> {
+    const { data } = await api.get<string[]>("/rfqs/saved/ids");
+    return data;
+  },
+  async listSaved(params: { limit?: number; offset?: number } = {}): Promise<CatalogListResponse> {
+    const { data } = await api.get<CatalogListResponse>("/rfqs/saved", { params });
+    return data;
+  },
 };
 
 export const connections = {

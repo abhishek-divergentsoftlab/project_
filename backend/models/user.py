@@ -19,6 +19,7 @@ from models.enums import KYCStatus, UserRole, UserStatus
 
 if TYPE_CHECKING:
     from models.rfq import RFQ
+    from models.saved_rfq import SavedRFQ
 
 
 class User(Base, UUIDPrimaryKeyMixin, TimestampMixin):
@@ -57,6 +58,9 @@ class User(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         back_populates="user", uselist=False, cascade="all, delete-orphan", lazy="selectin"
     )
     rfqs: Mapped[list["RFQ"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan", lazy="noload"
+    )
+    saved_rfqs: Mapped[list["SavedRFQ"]] = relationship(
         back_populates="user", cascade="all, delete-orphan", lazy="noload"
     )
 

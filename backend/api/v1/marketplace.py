@@ -25,6 +25,7 @@ async def get_marketplace_catalog(
     max_price: Annotated[Optional[float], Query(ge=0, description="Max target price")] = None,
     currency: Annotated[Optional[str], Query(description="Currency filter (e.g. USD, INR)")] = None,
     verified_only: Annotated[bool, Query(description="Filter KYC-verified or high-trust suppliers")] = False,
+    saved_only: Annotated[bool, Query(description="Filter saved listings only")] = False,
     sort_by: Annotated[
         str,
         Query(
@@ -34,6 +35,9 @@ async def get_marketplace_catalog(
     ] = "newest",
     limit: Annotated[int, Query(ge=1, le=100)] = 24,
     offset: Annotated[int, Query(ge=0)] = 0,
+    lat: Annotated[Optional[float], Query(ge=-90, le=90, description="Reference latitude for radius and distance")] = None,
+    lon: Annotated[Optional[float], Query(ge=-180, le=180, description="Reference longitude for radius and distance")] = None,
+    radius_km: Annotated[Optional[float], Query(gt=0, description="Max distance in kilometers")] = None,
 ) -> CatalogListOut:
     """Browse and filter active listings across the wholesale marketplace."""
     return await catalog_service.get_catalog(
@@ -48,9 +52,13 @@ async def get_marketplace_catalog(
         max_price=max_price,
         currency=currency,
         verified_only=verified_only,
+        saved_only=saved_only,
         sort_by=sort_by,
         limit=limit,
         offset=offset,
+        lat=lat,
+        lon=lon,
+        radius_km=radius_km,
     )
 
 

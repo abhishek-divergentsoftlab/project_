@@ -52,6 +52,7 @@ class CatalogItemOut(BaseModel):
     created_at: datetime
     counterparty: CatalogCounterpartyOut
     distance_km: Optional[float] = None
+    is_saved: bool = False
 
 
 class CatalogListOut(BaseModel):

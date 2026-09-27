@@ -1,0 +1,1064 @@
+/* ==========================================================================
+   Map Styling & Spatial UI Components
+   ========================================================================== */
+
+/* Leaflet Container Defaults & Theme Adaptation */
+.map-canvas-container {
+  width: 100%;
+  height: 100%;
+  min-height: 280px;
+  position: relative;
+  border-radius: 12px;
+  overflow: hidden;
+  background-color: var(--bg-subtle);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-sm);
+  z-index: 1;
+}
+
+.map-canvas-container:focus-visible {
+  outline: 2px solid var(--accent);
+}
+
+/* Custom DivIcon Base */
+.leaflet-custom-div-icon {
+  background: transparent !important;
+  border: none !important;
+}
+
+/* Pin Keyframes */
+@keyframes pinPulseGlow {
+  0% {
+    transform: scale(0.8);
+    opacity: 0.8;
+  }
+  50% {
+    transform: scale(1.6);
+    opacity: 0.25;
+  }
+  100% {
+    transform: scale(2.2);
+    opacity: 0;
+  }
+}
+
+@keyframes vehicleBob {
+  0%, 100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-4px);
+  }
+}
+
+/* 1. Location Picker Draggable Pin */
+.location-picker-pin {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  cursor: grab;
+  user-select: none;
+}
+
+.location-picker-pin:active {
+  cursor: grabbing;
+}
+
+.location-picker-pin .pin-pulse {
+  position: absolute;
+  top: 6px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: pinPulseGlow 2s infinite ease-out;
+  pointer-events: none;
+}
+
+.location-picker-pin .pin-marker-head {
+  width: 34px;
+  height: 34px;
+  background: linear-gradient(135deg, #2563eb, #1d4ed8);
+  color: #ffffff;
+  border-radius: 50% 50% 50% 0;
+  transform: rotate(-45deg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 4px 12px rgba(37, 99, 235, 0.45);
+  border: 2px solid #ffffff;
+  transition: transform 0.2s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.location-picker-pin:hover .pin-marker-head {
+  transform: rotate(-45deg) scale(1.12);
+}
+
+.location-picker-pin .pin-marker-head svg {
+  transform: rotate(45deg);
+}
+
+.location-picker-pin .pin-drag-hint {
+  margin-top: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  background: rgba(15, 23, 42, 0.85);
+  color: #ffffff;
+  padding: 1px 5px;
+  border-radius: 4px;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.25);
+  backdrop-filter: blur(4px);
+  white-space: nowrap;
+}
+
+/* 2. Marketplace Pins (Seller Emerald vs Buyer Blue) */
+.marketplace-pin {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  cursor: pointer;
+  filter: drop-shadow(0 4px 10px rgba(0, 0, 0, 0.25));
+  transition: transform 0.2s ease, filter 0.2s ease;
+}
+
+.marketplace-pin:hover {
+  transform: translateY(-4px) scale(1.08);
+  z-index: 999;
+}
+
+.marketplace-pin.pin-is-selected {
+  transform: translateY(-6px) scale(1.15);
+  z-index: 1000;
+}
+
+.marketplace-pin .pin-content-box {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border-radius: 16px;
+  font-size: 11px;
+  font-weight: 600;
+  border: 1.5px solid #ffffff;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+  white-space: nowrap;
+}
+
+.pin-role-seller .pin-content-box {
+  background: linear-gradient(135deg, #059669, #047857);
+  color: #ffffff;
+}
+
+.pin-role-seller .pin-role-pill {
+  background: rgba(255, 255, 255, 0.25);
+  padding: 1px 4px;
+  border-radius: 8px;
+  font-size: 9px;
+  letter-spacing: 0.05em;
+}
+
+.pin-role-buyer .pin-content-box {
+  background: linear-gradient(135deg, #2563eb, #1e40af);
+  color: #ffffff;
+}
+
+.pin-role-buyer .pin-role-pill {
+  background: rgba(255, 255, 255, 0.25);
+  padding: 1px 4px;
+  border-radius: 8px;
+  font-size: 9px;
+  letter-spacing: 0.05em;
+}
+
+.marketplace-pin .pin-tip {
+  width: 0;
+  height: 0;
+  border-left: 5px solid transparent;
+  border-right: 5px solid transparent;
+  margin-top: -1px;
+}
+
+.pin-role-seller .pin-tip {
+  border-top: 6px solid #047857;
+}
+
+.pin-role-buyer .pin-tip {
+  border-top: 6px solid #1e40af;
+}
+
+.marketplace-pin.pin-is-selected .pin-pulse {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 50px;
+  height: 50px;
+  border-radius: 50%;
+  border: 2px solid var(--accent);
+  animation: pinPulseGlow 1.8s infinite ease-out;
+  pointer-events: none;
+}
+
+/* 3. Shipment Waypoints and Moving Vehicle */
+.shipment-waypoint-pin {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+}
+
+.shipment-waypoint-pin .waypoint-badge {
+  background: var(--surface);
+  border: 2px solid var(--border-strong);
+  border-radius: 20px;
+  padding: 2px 7px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.shipment-waypoint-pin.waypoint-origin .waypoint-badge {
+  border-color: #059669;
+}
+
+.shipment-waypoint-pin.waypoint-destination .waypoint-badge {
+  border-color: #2563eb;
+}
+
+.moving-vehicle-pin {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  animation: vehicleBob 2.5s infinite ease-in-out;
+}
+
+.moving-vehicle-pin .vehicle-halo {
+  position: absolute;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  background: rgba(37, 99, 235, 0.2);
+  border: 2px solid #2563eb;
+  animation: pinPulseGlow 2.2s infinite ease-out;
+}
+
+.moving-vehicle-pin .vehicle-symbol {
+  width: 32px;
+  height: 32px;
+  background: var(--surface);
+  border: 2px solid #2563eb;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.25);
+}
+
+/* Custom Modern Leaflet Popup */
+.leaflet-popup-content-wrapper {
+  background: var(--surface) !important;
+  color: var(--text) !important;
+  border-radius: 12px !important;
+  box-shadow: 0 16px 36px rgba(0, 0, 0, 0.2) !important;
+  border: 1px solid var(--border) !important;
+  padding: 0 !important;
+  overflow: hidden !important;
+  font-family: inherit !important;
+}
+
+.leaflet-popup-content {
+  margin: 0 !important;
+  line-height: 1.4 !important;
+}
+
+.leaflet-popup-tip {
+  background: var(--surface) !important;
+  border: 1px solid var(--border) !important;
+}
+
+.leaflet-container a.leaflet-popup-close-button {
+  color: var(--muted) !important;
+  top: 8px !important;
+  right: 8px !important;
+  padding: 4px !important;
+  border-radius: 6px !important;
+  transition: all 0.15s ease;
+}
+
+.leaflet-container a.leaflet-popup-close-button:hover {
+  color: var(--text) !important;
+  background: var(--bg-subtle) !important;
+}
+
+/* Location Picker UI Container */
+.location-picker-widget {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 16px;
+  box-shadow: var(--shadow-sm);
+}
+
+.picker-search-bar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  position: relative;
+}
+
+.picker-search-input {
+  flex: 1;
+  height: 40px;
+  padding: 0 12px 0 38px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 14px;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.picker-search-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--focus-ring);
+  outline: none;
+}
+
+.picker-search-icon {
+  position: absolute;
+  left: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--muted);
+  pointer-events: none;
+}
+
+.picker-locate-btn {
+  height: 40px;
+  padding: 0 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.15s ease;
+}
+
+.picker-locate-btn:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* Quick Hub Presets */
+.picker-presets-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+  scrollbar-width: thin;
+}
+
+.preset-chip-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-right: 4px;
+  white-space: nowrap;
+}
+
+.preset-chip-btn {
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 500;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  color: var(--text);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.15s ease;
+}
+
+.preset-chip-btn:hover {
+  background: var(--accent);
+  color: #ffffff;
+  border-color: var(--accent);
+}
+
+/* Coordinate Bar Below Map */
+.picker-status-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 14px;
+  background: var(--bg-subtle);
+  border-radius: 8px;
+  font-size: 12px;
+}
+
+.picker-status-location {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.picker-status-coords {
+  color: var(--muted);
+  font-family: monospace;
+  font-size: 11px;
+}
+
+/* ==========================================================================
+   Marketplace Map Explorer View
+   ========================================================================== */
+
+.marketplace-map-layout {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  margin-top: 16px;
+}
+
+.map-controls-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: var(--shadow-xs);
+}
+
+.map-toolbar-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.map-radius-selector {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.map-radius-select {
+  height: 36px;
+  padding: 0 10px;
+  border-radius: 8px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.map-legend-pills {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.legend-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border-radius: 12px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.legend-pill.seller {
+  background: rgba(16, 185, 129, 0.15);
+  color: #059669;
+}
+
+.legend-pill.buyer {
+  background: rgba(59, 130, 246, 0.15);
+  color: #2563eb;
+}
+
+.legend-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.legend-pill.seller .legend-dot {
+  background: #059669;
+}
+
+.legend-pill.buyer .legend-dot {
+  background: #2563eb;
+}
+
+.map-explorer-split-container {
+  display: grid;
+  grid-template-columns: 1fr 380px;
+  gap: 16px;
+  min-height: 600px;
+  height: 65vh;
+}
+
+@media (max-width: 960px) {
+  .map-explorer-split-container {
+    grid-template-columns: 1fr;
+    height: auto;
+  }
+}
+
+.map-explorer-map-pane {
+  position: relative;
+  border-radius: 14px;
+  overflow: hidden;
+  height: 100%;
+  min-height: 480px;
+}
+
+.map-explorer-cards-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow-y: auto;
+  max-height: 100%;
+  padding-right: 4px;
+  scrollbar-width: thin;
+}
+
+/* Floating Selected Item Drawer inside Map */
+.map-selected-drawer {
+  position: absolute;
+  bottom: 16px;
+  left: 16px;
+  right: 16px;
+  max-width: 500px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: 0 20px 45px rgba(0, 0, 0, 0.28);
+  padding: 16px;
+  z-index: 1000;
+  backdrop-filter: blur(12px);
+  animation: slideUpDrawer 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes slideUpDrawer {
+  from {
+    transform: translateY(20px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.drawer-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.drawer-title-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.drawer-badges-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.drawer-item-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text);
+  margin: 0;
+}
+
+.drawer-close-btn {
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 6px;
+  transition: all 0.15s ease;
+}
+
+.drawer-close-btn:hover {
+  background: var(--bg-subtle);
+  color: var(--text);
+}
+
+.drawer-specs-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  padding: 10px 0;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  margin: 10px 0;
+}
+
+.drawer-spec-item {
+  display: flex;
+  flex-direction: column;
+}
+
+.drawer-spec-label {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.drawer-spec-val {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.drawer-actions-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.drawer-distance-indicator {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.drawer-btn-connect {
+  height: 36px;
+  padding: 0 16px;
+  background: var(--accent);
+  color: #ffffff;
+  border: none;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.drawer-btn-connect:hover {
+  background: var(--accent-hover);
+}
+
+/* ==========================================================================
+   Shipment Live Route Map Component
+   ========================================================================== */
+
+.shipment-route-map-box {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  overflow: hidden;
+  box-shadow: var(--shadow-sm);
+  display: flex;
+  flex-direction: column;
+  margin: 16px 0;
+}
+
+.shipment-map-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  background: var(--bg-subtle);
+  border-bottom: 1px solid var(--border);
+}
+
+.shipment-map-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.shipment-map-meta-strip {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.shipment-meta-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.shipment-meta-item strong {
+  color: var(--text);
+}
+
+/* Geodesic Flight/Route Line glow */
+.leaflet-interactive.route-glow-path {
+  filter: drop-shadow(0 0 6px rgba(37, 99, 235, 0.6));
+}
+
+/* Google Maps / Turn-by-Turn Driving Road Route */
+.leaflet-interactive.route-road-casing {
+  filter: drop-shadow(0 2px 7px rgba(0, 0, 0, 0.45));
+}
+
+.leaflet-interactive.route-road-core {
+  filter: drop-shadow(0 0 10px rgba(56, 189, 248, 0.6));
+  transition: stroke 0.3s ease;
+}
+
+/* Floating Google Maps-style Directions Strip */
+.route-map-floating-overlay {
+  position: absolute;
+  top: 14px;
+  left: 14px;
+  right: 14px;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+  background: rgba(18, 24, 38, 0.88);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  padding: 8px 14px;
+  border-radius: 12px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  pointer-events: auto;
+}
+
+[data-theme="light"] .route-map-floating-overlay {
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.15);
+}
+
+.route-meta-chips {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.route-pill-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+}
+
+.route-pill-badge.pill-road {
+  background: rgba(59, 130, 246, 0.18);
+  color: #60a5fa;
+  border: 1px solid rgba(96, 165, 250, 0.35);
+}
+
+[data-theme="light"] .route-pill-badge.pill-road {
+  background: #eff6ff;
+  color: #1d4ed8;
+  border: 1px solid #bfdbfe;
+}
+
+.route-pill-badge.pill-time {
+  background: rgba(16, 185, 129, 0.18);
+  color: #34d399;
+  border: 1px solid rgba(52, 211, 153, 0.35);
+}
+
+[data-theme="light"] .route-pill-badge.pill-time {
+  background: #ecfdf5;
+  color: #047857;
+  border: 1px solid #a7f3d0;
+}
+
+.route-pill-badge.pill-distance {
+  background: rgba(245, 158, 11, 0.18);
+  color: #fbbf24;
+  border: 1px solid rgba(251, 191, 36, 0.35);
+}
+
+[data-theme="light"] .route-pill-badge.pill-distance {
+  background: #fffbeb;
+  color: #b45309;
+  border: 1px solid #fde68a;
+}
+
+.route-pill-badge.pill-sea {
+  background: rgba(16, 185, 129, 0.18);
+  color: #10b981;
+  border: 1px solid rgba(16, 185, 129, 0.4);
+}
+
+[data-theme="light"] .route-pill-badge.pill-sea {
+  background: #ecfdf5;
+  color: #047857;
+  border: 1px solid #a7f3d0;
+}
+
+.route-pill-badge.pill-air {
+  background: rgba(168, 85, 247, 0.2);
+  color: #c084fc;
+  border: 1px solid rgba(168, 85, 247, 0.4);
+}
+
+[data-theme="light"] .route-pill-badge.pill-air {
+  background: #faf5ff;
+  color: #7e22ce;
+  border: 1px solid #e9d5ff;
+}
+
+/* Ocean Cargo Maritime Polylines */
+.leaflet-interactive.route-sea-casing {
+  filter: drop-shadow(0 2px 7px rgba(4, 120, 87, 0.4));
+}
+
+.leaflet-interactive.route-sea-core {
+  filter: drop-shadow(0 0 10px rgba(16, 185, 129, 0.7));
+  animation: seaWavePulse 4s infinite linear;
+}
+
+@keyframes seaWavePulse {
+  0% {
+    stroke-dashoffset: 0;
+  }
+  100% {
+    stroke-dashoffset: -36;
+  }
+}
+
+/* Air Cargo Supersonic Flight Polylines */
+.leaflet-interactive.route-air-casing {
+  filter: drop-shadow(0 2px 8px rgba(126, 34, 206, 0.45));
+}
+
+.leaflet-interactive.route-air-core {
+  filter: drop-shadow(0 0 12px rgba(192, 132, 252, 0.8));
+  animation: airContrailFlow 3s infinite linear;
+}
+
+@keyframes airContrailFlow {
+  0% {
+    stroke-dashoffset: 0;
+  }
+  100% {
+    stroke-dashoffset: -32;
+  }
+}
+
+/* Segmented Freight Mode Selector Tabs */
+.freight-mode-tab-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg-subtle);
+  padding: 4px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+}
+
+.freight-mode-tab-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 14px;
+  border-radius: 8px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  white-space: nowrap;
+}
+
+.freight-mode-tab-btn:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+[data-theme="light"] .freight-mode-tab-btn:hover {
+  background: rgba(0, 0, 0, 0.04);
+}
+
+.freight-mode-tab-btn.active-road {
+  background: #2563eb;
+  color: #ffffff;
+  box-shadow: 0 4px 12px rgba(37, 99, 235, 0.35);
+  font-weight: 600;
+}
+
+.freight-mode-tab-btn.active-ocean {
+  background: #059669;
+  color: #ffffff;
+  box-shadow: 0 4px 12px rgba(5, 150, 105, 0.35);
+  font-weight: 600;
+}
+
+.freight-mode-tab-btn.active-air {
+  background: #7c3aed;
+  color: #ffffff;
+  box-shadow: 0 4px 12px rgba(124, 58, 237, 0.35);
+  font-weight: 600;
+}
+
+/* Route Feasibility Advisory Styles */
+.unfeasible-tab-pill {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: rgba(239, 68, 68, 0.2);
+  color: #f87171;
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  margin-left: 5px;
+  line-height: 1.2;
+}
+
+[data-theme="light"] .unfeasible-tab-pill {
+  background: #fef2f2;
+  color: #dc2626;
+  border: 1px solid #fecaca;
+}
+
+.route-unfeasible-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px 16px;
+  background: linear-gradient(135deg, rgba(239, 68, 68, 0.12), rgba(245, 158, 11, 0.08));
+  border: 1px solid rgba(239, 68, 68, 0.35);
+  border-radius: 10px;
+  color: var(--text);
+  animation: bannerFadeIn 0.25s ease-out;
+}
+
+[data-theme="light"] .route-unfeasible-banner {
+  background: linear-gradient(135deg, #fff1f2, #fffbeb);
+  border-color: #fca5a5;
+}
+
+.route-unfeasible-icon {
+  font-size: 22px;
+  line-height: 1;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.route-unfeasible-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.route-unfeasible-title {
+  font-size: 13.5px;
+  font-weight: 700;
+  color: #ef4444;
+  margin-bottom: 4px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+[data-theme="light"] .route-unfeasible-title {
+  color: #b91c1c;
+}
+
+.route-unfeasible-desc {
+  font-size: 12.5px;
+  color: var(--text);
+  line-height: 1.5;
+  margin-bottom: 8px;
+}
+
+.route-unfeasible-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  background: #2563eb;
+  color: #ffffff;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  box-shadow: 0 2px 6px rgba(37, 99, 235, 0.3);
+}
+
+.route-unfeasible-action:hover {
+  background: #1d4ed8;
+  transform: translateY(-1px);
+  box-shadow: 0 4px 10px rgba(37, 99, 235, 0.4);
+}
+
+@keyframes bannerFadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+

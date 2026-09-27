@@ -2,8 +2,9 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 
 import { errorMessage } from "@/api/client";
-import { connections as connApi, marketplace as marketApi } from "@/api/endpoints";
+import { connections as connApi, marketplace as marketApi, rfqs as rfqApi } from "@/api/endpoints";
 import {
+  IconBookmark,
   IconClose,
   IconFilter,
   IconMapPin,
@@ -12,6 +13,8 @@ import {
   IconSparkles,
 } from "@/components/icons";
 import { Modal } from "@/components/ui/Modal";
+import { MarketplaceMap } from "@/components/map/MarketplaceMap";
+import { useAuth } from "@/context/useAuth";
 import { useFeedback } from "@/context/useFeedback";
 import { formatShortDate, formatDate } from "@/utils/format";
 import type {
@@ -67,8 +70,8 @@ function formatMoq(item: CatalogItem): string | null {
 export function Marketplace() {
   const navigate = useNavigate();
   const { toast } = useFeedback();
+  const { user } = useAuth();
   const [searchParams, setSearchParams] = useSearchParams();
-
 
   // Search & Filters state
   const queryParam = searchParams.get("q") || "";
@@ -76,18 +79,26 @@ export function Marketplace() {
   const categoryParam = searchParams.get("category") || "";
   const sortParam = (searchParams.get("sort") as "newest" | "price_asc" | "price_desc" | "trust_desc") || "newest";
   const verifiedOnlyParam = searchParams.get("verified") === "true";
+  const savedParam = searchParams.get("saved") === "true";
 
   const [searchQuery, setSearchQuery] = useState(queryParam);
   const [activeRole, setActiveRole] = useState<RFQRole | "all">(roleParam || "all");
   const [selectedCategory, setSelectedCategory] = useState<string>(categoryParam);
   const [sortBy, setSortBy] = useState<"newest" | "price_asc" | "price_desc" | "trust_desc">(sortParam);
   const [verifiedOnly, setVerifiedOnly] = useState(verifiedOnlyParam);
+  const [savedOnly, setSavedOnly] = useState(savedParam);
+  const [savedCount, setSavedCount] = useState<number>(0);
 
   // Price & location filters
   const [minPrice, setMinPrice] = useState<string>("");
   const [maxPrice, setMaxPrice] = useState<string>("");
   const [currency, setCurrency] = useState<string>("");
   const [locationQuery, setLocationQuery] = useState<string>("");
+  const [selectedRadius, setSelectedRadius] = useState<number | null>(null);
+
+  // View mode & map state
+  const [viewMode, setViewMode] = useState<"grid" | "map">("grid");
+  const [activeMapItem, setActiveMapItem] = useState<CatalogItem | null>(null);
 
   // Data state
   const [items, setItems] = useState<CatalogItem[]>([]);
@@ -106,7 +117,7 @@ export function Marketplace() {
   // Sidebar filter toggle for mobile
   const [showFiltersMobile, setShowFiltersMobile] = useState(false);
 
-  // Load categories summary on mount
+  // Load categories and saved count summary on mount
   useEffect(() => {
     let cancelled = false;
     async function loadCats() {
@@ -117,7 +128,16 @@ export function Marketplace() {
         console.error("Failed to load categories", err);
       }
     }
+    async function loadSavedCount() {
+      try {
+        const ids = await rfqApi.getSavedIds();
+        if (!cancelled) setSavedCount(ids.length);
+      } catch {
+        // silent fallback
+      }
+    }
     void loadCats();
+    void loadSavedCount();
     return () => {
       cancelled = true;
     };
@@ -139,9 +159,13 @@ export function Marketplace() {
         max_price: maxPrice ? Number(maxPrice) : undefined,
         currency: currency || undefined,
         verified_only: verifiedOnly ? true : undefined,
+        saved_only: savedOnly ? true : undefined,
         sort_by: sortBy,
-        limit: PAGE_SIZE,
+        limit: viewMode === "map" ? 60 : PAGE_SIZE,
         offset,
+        radius_km: selectedRadius || undefined,
+        lat: user?.profile?.latitude ? Number(user.profile.latitude) : undefined,
+        lon: user?.profile?.longitude ? Number(user.profile.longitude) : undefined,
       };
 
       try {
@@ -168,7 +192,11 @@ export function Marketplace() {
       maxPrice,
       currency,
       verifiedOnly,
+      savedOnly,
       sortBy,
+      selectedRadius,
+      viewMode,
+      user,
     ],
   );
 
@@ -180,6 +208,23 @@ export function Marketplace() {
     return () => clearTimeout(timer);
   }, [loadCatalog]);
 
+  // Sync URL changes (e.g. browser back/forward or external navigation) into local state
+  useEffect(() => {
+    const q = searchParams.get("q") || "";
+    const r = (searchParams.get("role") as RFQRole) || "all";
+    const cat = searchParams.get("category") || "";
+    const sort = (searchParams.get("sort") as typeof sortBy) || "newest";
+    const ver = searchParams.get("verified") === "true";
+    const saved = searchParams.get("saved") === "true";
+
+    setSearchQuery((prev) => (prev !== q ? q : prev));
+    setActiveRole((prev) => (prev !== r ? r : prev));
+    setSelectedCategory((prev) => (prev !== cat ? cat : prev));
+    setSortBy((prev) => (prev !== sort ? sort : prev));
+    setVerifiedOnly((prev) => (prev !== ver ? ver : prev));
+    setSavedOnly((prev) => (prev !== saved ? saved : prev));
+  }, [searchParams]);
+
   // Sync state to URL params
   useEffect(() => {
     const nextParams = new URLSearchParams();
@@ -188,8 +233,9 @@ export function Marketplace() {
     if (selectedCategory) nextParams.set("category", selectedCategory);
     if (sortBy !== "newest") nextParams.set("sort", sortBy);
     if (verifiedOnly) nextParams.set("verified", "true");
+    if (savedOnly) nextParams.set("saved", "true");
     setSearchParams(nextParams, { replace: true });
-  }, [searchQuery, activeRole, selectedCategory, sortBy, verifiedOnly, setSearchParams]);
+  }, [searchQuery, activeRole, selectedCategory, sortBy, verifiedOnly, savedOnly, setSearchParams]);
 
   function handleResetFilters() {
     setSearchQuery("");
@@ -197,10 +243,13 @@ export function Marketplace() {
     setSelectedCategory("");
     setSortBy("newest");
     setVerifiedOnly(false);
+    setSavedOnly(false);
     setMinPrice("");
     setMaxPrice("");
     setCurrency("");
     setLocationQuery("");
+    setSelectedRadius(null);
+    setSearchParams(new URLSearchParams(), { replace: true });
   }
 
   async function handleConnect(item: CatalogItem) {
@@ -244,7 +293,41 @@ export function Marketplace() {
   function handleAskAI(item: CatalogItem) {
     const roleTerm = item.role === "seller" ? "supplier" : "buyer";
     const prompt = `Analyze this ${roleTerm} listing for "${item.title}" in category "${item.category}". Price is ${formatPrice(item)}, quantity ${formatQuantity(item)}. How does this compare with typical market conditions?`;
-    navigate(`/ai-chat?prompt=${encodeURIComponent(prompt)}`);
+    navigate(`/ai-chat?agent=market_research&prompt=${encodeURIComponent(prompt)}`);
+  }
+
+  async function handleToggleSave(item: CatalogItem) {
+    const nextSaved = !item.is_saved;
+    setItems((prev) =>
+      prev.map((it) => (it.id === item.id ? { ...it, is_saved: nextSaved } : it))
+    );
+    if (activeModalItem?.id === item.id) {
+      setActiveModalItem((prev) => (prev ? { ...prev, is_saved: nextSaved } : null));
+    }
+    setSavedCount((c) => Math.max(0, c + (nextSaved ? 1 : -1)));
+
+    try {
+      if (nextSaved) {
+        await rfqApi.save(item.id);
+        toast("Saved RFQ to your bookmarks! Access it anytime in 'Saved'.");
+      } else {
+        await rfqApi.unsave(item.id);
+        toast("Removed from saved RFQs.");
+        if (savedOnly) {
+          setItems((prev) => prev.filter((it) => it.id !== item.id));
+          setTotal((t) => Math.max(0, t - 1));
+        }
+      }
+    } catch {
+      setItems((prev) =>
+        prev.map((it) => (it.id === item.id ? { ...it, is_saved: !nextSaved } : it))
+      );
+      if (activeModalItem?.id === item.id) {
+        setActiveModalItem((prev) => (prev ? { ...prev, is_saved: !nextSaved } : null));
+      }
+      setSavedCount((c) => Math.max(0, c + (!nextSaved ? 1 : -1)));
+      toast("Could not update bookmark. Please try again.");
+    }
   }
 
   const activeFilterCount = useMemo(() => {
@@ -254,8 +337,10 @@ export function Marketplace() {
     if (verifiedOnly) count++;
     if (minPrice || maxPrice) count++;
     if (locationQuery.trim()) count++;
+    if (selectedRadius) count++;
+    if (searchQuery.trim()) count++;
     return count;
-  }, [activeRole, selectedCategory, verifiedOnly, minPrice, maxPrice, locationQuery]);
+  }, [activeRole, selectedCategory, verifiedOnly, minPrice, maxPrice, locationQuery, selectedRadius, searchQuery]);
 
   const priceActive = Boolean(minPrice || maxPrice);
 
@@ -281,6 +366,24 @@ export function Marketplace() {
       </div>
 
       <div className="filter-group">
+        <label className="filter-group-title" htmlFor="filter-radius">
+          Distance Radius
+        </label>
+        <select
+          id="filter-radius"
+          value={selectedRadius ?? ""}
+          onChange={(e) => setSelectedRadius(e.target.value ? Number(e.target.value) : null)}
+        >
+          <option value="">Any distance (Global)</option>
+          <option value="100">Within 100 km (Local Metro)</option>
+          <option value="250">Within 250 km (Regional Road)</option>
+          <option value="500">Within 500 km (State Corridor)</option>
+          <option value="1000">Within 1,000 km (Domestic)</option>
+          <option value="2500">Within 2,500 km (Intermodal)</option>
+        </select>
+      </div>
+
+      <div className="filter-group">
         <h3 className="filter-group-title">Category</h3>
         <div className="category-filter-list">
           <button
@@ -289,6 +392,20 @@ export function Marketplace() {
             onClick={() => setSelectedCategory("")}
           >
             <span className="cat-name">All categories</span>
+            <span className="cat-count">
+              {categories
+                .reduce(
+                  (acc, c) =>
+                    acc +
+                    (activeRole === "seller"
+                      ? c.seller_count
+                      : activeRole === "buyer"
+                        ? c.buyer_count
+                        : c.total_count),
+                  0,
+                )
+                .toLocaleString()}
+            </span>
           </button>
           {categories.map((c) => {
             const count =
@@ -297,9 +414,9 @@ export function Marketplace() {
                 : activeRole === "buyer"
                   ? c.buyer_count
                   : c.total_count;
-            if (count === 0 && activeRole !== "all") return null;
+            const isSelected = selectedCategory.trim().toLowerCase() === c.category.trim().toLowerCase();
+            if (count === 0 && activeRole !== "all" && !isSelected) return null;
 
-            const isSelected = selectedCategory.toLowerCase() === c.category.toLowerCase();
             return (
               <button
                 key={c.category}
@@ -410,9 +527,12 @@ export function Marketplace() {
               key={side.value}
               type="button"
               role="tab"
-              aria-selected={activeRole === side.value}
-              className={activeRole === side.value ? "tab active" : "tab"}
-              onClick={() => setActiveRole(side.value)}
+              aria-selected={!savedOnly && activeRole === side.value}
+              className={!savedOnly && activeRole === side.value ? "tab active" : "tab"}
+              onClick={() => {
+                setSavedOnly(false);
+                setActiveRole(side.value);
+              }}
               title={
                 side.value === "seller"
                   ? "Suppliers offering goods"
@@ -424,6 +544,18 @@ export function Marketplace() {
               {side.label}
             </button>
           ))}
+          <button
+            type="button"
+            role="tab"
+            aria-selected={savedOnly}
+            className={savedOnly ? "tab active" : "tab"}
+            onClick={() => setSavedOnly(true)}
+            title="View RFQs you saved / bookmarked for later"
+            style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}
+          >
+            <IconBookmark size={14} filled={savedOnly} />
+            Saved {savedCount > 0 ? `(${savedCount})` : ""}
+          </button>
         </div>
 
         <select
@@ -505,6 +637,17 @@ export function Marketplace() {
                 ? "Searching…"
                 : `${total.toLocaleString()} ${total === 1 ? "listing" : "listings"}`}
             </span>
+            {searchQuery.trim() && (
+              <button
+                type="button"
+                className="active-tag-chip"
+                onClick={() => setSearchQuery("")}
+                aria-label={`Remove keyword search "${searchQuery.trim()}"`}
+              >
+                Keyword: "{searchQuery.trim()}"
+                <IconClose size={12} />
+              </button>
+            )}
             {selectedCategory && (
               <button
                 type="button"
@@ -512,7 +655,20 @@ export function Marketplace() {
                 onClick={() => setSelectedCategory("")}
                 aria-label={`Remove filter ${selectedCategory}`}
               >
-                {selectedCategory}
+                Category: {selectedCategory}
+                <IconClose size={12} />
+              </button>
+            )}
+            {savedOnly && (
+              <button
+                type="button"
+                className="active-tag-chip"
+                onClick={() => setSavedOnly(false)}
+                aria-label="Remove saved filter"
+                style={{ color: "#f59e0b", borderColor: "rgba(245, 158, 11, 0.4)" }}
+              >
+                <IconBookmark size={12} filled />
+                Saved listings only
                 <IconClose size={12} />
               </button>
             )}
@@ -552,9 +708,90 @@ export function Marketplace() {
                 <IconClose size={12} />
               </button>
             )}
+            {selectedRadius && (
+              <button
+                type="button"
+                className="active-tag-chip"
+                onClick={() => setSelectedRadius(null)}
+                aria-label="Remove radius filter"
+              >
+                Within {selectedRadius} km
+                <IconClose size={12} />
+              </button>
+            )}
+            {(activeFilterCount > 0 || searchQuery.trim()) && (
+              <button
+                type="button"
+                className="active-tag-chip-clear"
+                onClick={handleResetFilters}
+              >
+                Clear all
+              </button>
+            )}
+
+            <div
+              className="view-mode-tabs"
+              role="group"
+              aria-label="Display mode"
+              style={{
+                marginLeft: "auto",
+                display: "inline-flex",
+                background: "var(--bg-subtle)",
+                borderRadius: "8px",
+                padding: "2px",
+                border: "1px solid var(--border)",
+              }}
+            >
+              <button
+                type="button"
+                className={`tab ${viewMode === "grid" ? "active" : ""}`}
+                style={{ padding: "4px 10px", fontSize: "12px", borderRadius: "6px" }}
+                onClick={() => setViewMode("grid")}
+              >
+                Grid View
+              </button>
+              <button
+                type="button"
+                className={`tab ${viewMode === "map" ? "active" : ""}`}
+                style={{
+                  padding: "4px 10px",
+                  fontSize: "12px",
+                  borderRadius: "6px",
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "5px",
+                }}
+                onClick={() => setViewMode("map")}
+              >
+                <IconMapPin size={13} />
+                Map Explorer 🗺️
+              </button>
+            </div>
           </div>
 
-          {loading && items.length === 0 ? (
+          {viewMode === "map" ? (
+            <MarketplaceMap
+              items={items}
+              selectedItem={activeMapItem}
+              onSelectItem={setActiveMapItem}
+              onConnect={(id) => {
+                const it = items.find((x) => x.id === id);
+                if (it) void handleConnect(it);
+              }}
+              connectingId={connectingId}
+              userLocation={
+                user?.profile?.latitude && user?.profile?.longitude
+                  ? {
+                      lat: Number(user.profile.latitude),
+                      lng: Number(user.profile.longitude),
+                    }
+                  : null
+              }
+              radiusKm={selectedRadius}
+              onRadiusChange={(rad) => setSelectedRadius(rad)}
+              onQuickView={(it) => setActiveModalItem(it)}
+            />
+          ) : loading && items.length === 0 ? (
             <div className="market-cards-grid" aria-busy="true">
               {Array.from({ length: 6 }).map((_, i) => (
                 <div key={i} className="market-card-skeleton skeleton" />
@@ -562,18 +799,31 @@ export function Marketplace() {
             </div>
           ) : items.length === 0 ? (
             <div className="panel">
-              <div className="empty-state">
-                <span className="empty-state-icon">
-                  <IconSearch size={18} />
-                </span>
-                <strong>No listings match</strong>
-                <p>Try a broader search term, or clear some filters.</p>
-                {(activeFilterCount > 0 || searchQuery) && (
-                  <button type="button" className="secondary" onClick={handleResetFilters}>
-                    Clear search and filters
+              {savedOnly ? (
+                <div className="empty-state">
+                  <span className="empty-state-icon bookmark-empty-icon">
+                    <IconBookmark size={20} filled />
+                  </span>
+                  <strong>No saved RFQs yet</strong>
+                  <p>Browse listings in the marketplace and click "Save" on any RFQ to keep it handy here without searching again.</p>
+                  <button type="button" className="secondary" onClick={() => setSavedOnly(false)}>
+                    Browse all marketplace RFQs
                   </button>
-                )}
-              </div>
+                </div>
+              ) : (
+                <div className="empty-state">
+                  <span className="empty-state-icon">
+                    <IconSearch size={18} />
+                  </span>
+                  <strong>No listings match</strong>
+                  <p>Try a broader search term, or clear some filters.</p>
+                  {(activeFilterCount > 0 || searchQuery) && (
+                    <button type="button" className="secondary" onClick={handleResetFilters}>
+                      Clear search and filters
+                    </button>
+                  )}
+                </div>
+              )}
             </div>
           ) : (
             <div className={`market-cards-grid ${loading ? "is-refreshing" : ""}`}>
@@ -588,6 +838,19 @@ export function Marketplace() {
                         {isSeller ? "Selling" : "Buying"}
                       </span>
                       <span className="card-category-tag">{item.category}</span>
+                      <button
+                        type="button"
+                        className={`card-bookmark-btn ${item.is_saved ? "is-saved" : ""}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          void handleToggleSave(item);
+                        }}
+                        title={item.is_saved ? "Saved (click to remove)" : "Save for later"}
+                        aria-label={item.is_saved ? "Remove from saved" : "Save for later"}
+                      >
+                        <IconBookmark size={14} filled={item.is_saved} />
+                        <span>{item.is_saved ? "Saved" : "Save"}</span>
+                      </button>
                     </div>
 
                     <button
@@ -665,7 +928,7 @@ export function Marketplace() {
             </div>
           )}
 
-          {!loading && items.length < total && (
+          {!loading && items.length < total && viewMode !== "map" && (
             <div className="load-more-row">
               <button
                 type="button"
@@ -706,6 +969,16 @@ export function Marketplace() {
         footer={
           activeModalItem && (
             <>
+              <button
+                type="button"
+                className={`secondary modal-save-btn ${activeModalItem.is_saved ? "is-saved" : ""}`}
+                onClick={() => {
+                  void handleToggleSave(activeModalItem);
+                }}
+              >
+                <IconBookmark size={15} filled={activeModalItem.is_saved} />
+                {activeModalItem.is_saved ? "Saved" : "Save for later"}
+              </button>
               <button
                 type="button"
                 className="secondary"
