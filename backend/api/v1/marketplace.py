@@ -1,12 +1,13 @@
 """Marketplace catalog and sourcing endpoints."""
 
 from typing import Annotated, Optional
+import uuid
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query, status
 
 from api.deps import CurrentUser, DbSession
 from models.enums import RFQRole
-from schemas.marketplace import CatalogListOut, CategoryCountOut
+from schemas.marketplace import CatalogItemOut, CatalogListOut, CategoryCountOut
 from services import catalog_service
 
 router = APIRouter(prefix="/marketplace", tags=["marketplace"])
@@ -69,3 +70,20 @@ async def get_marketplace_categories(
 ) -> list[CategoryCountOut]:
     """Retrieve top marketplace categories and active listing counts."""
     return await catalog_service.get_categories_summary(db)
+
+
+@router.get("/catalog/{rfq_id}", response_model=CatalogItemOut)
+async def get_marketplace_listing(
+    rfq_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DbSession,
+) -> CatalogItemOut:
+    """Retrieve details of a single marketplace listing to inspect or connect with."""
+    item = await catalog_service.get_catalog_item(db, current_user, rfq_id)
+    if not item:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="RFQ listing not found or is no longer available in the marketplace.",
+        )
+    return item
+

@@ -293,7 +293,13 @@ async def main() -> None:
     parser.add_argument("--reset", action="store_true")
     parser.add_argument("--rfqs", type=int, default=10000)
     parser.add_argument("--users", type=int, default=20, help="credentialed logins")
+    parser.add_argument("--qa", action="store_true", help="Seed full-stack QA test suite with complete deal rooms, escrow, shipments, reviews, etc.")
     args = parser.parse_args()
+
+    if args.qa:
+        from scripts import seed_qa_database
+        await seed_qa_database.main()
+        return
 
     if args.reset:
         async with SessionLocal() as db:

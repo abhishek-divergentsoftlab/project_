@@ -13,7 +13,7 @@ central rule -- a buyer is only ever shown sellers, and a seller only buyers.
 
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence
 
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -44,6 +44,19 @@ MIN_SCORE = 0.05
 # stock level against an unrelated requirement -- so both are left unscored
 # rather than being awarded full marks for a meaningless comparison.
 COMPARABLE_FLOOR = 0.35
+
+MATCHING_PRESETS: dict[str, dict[str, float]] = {
+    "quality_first": {
+        "relevance": 0.35, "attributes": 0.35, "price": 0.12, "location": 0.08, "quantity": 0.06, "deadline": 0.04
+    },
+    "price_first": {
+        "price": 0.36, "relevance": 0.22, "quantity": 0.18, "attributes": 0.12, "location": 0.08, "deadline": 0.04
+    },
+    "fast_delivery": {
+        "location": 0.30, "deadline": 0.25, "relevance": 0.20, "attributes": 0.12, "price": 0.08, "quantity": 0.05
+    },
+    "balanced": match_scoring.WEIGHTS,
+}
 
 
 async def _fetch_candidates(
@@ -167,11 +180,18 @@ async def _sql_candidates(
 
 
 def _score(
-    rfq: RFQ, candidate: RFQ, similarity: Optional[float] = None
+    rfq: RFQ,
+    candidate: RFQ,
+    similarity: Optional[float] = None,
+    matching_preferences: Optional[dict[str, Any]] = None,
 ) -> tuple[MatchScore, bool]:
     """Stage 2. Apply the compatibility rules to one candidate.
 
-    Returns the score and whether the candidate is worth showing at all.
+    Incorporates the 4 Pillars of Universal Dynamic B2B Matching:
+    - Pillar 1: Key-Agnostic & Inverted Attribute Semantic Alignment
+    - Pillar 2: Dynamic Asymmetric Specificity Check (Specifiers like 'Type-C' vs generic)
+    - Pillar 3: Two-Tier Multiplicative Gating (Feasibility x Commercial Utility)
+    - Pillar 4: User-Centric Dynamic Priority Vectors (Profile Matching Preferences)
     """
     # Price and quantity are directional: whoever is buying supplies the target
     # and the requirement, whoever is selling supplies the ask and the stock.
@@ -180,30 +200,61 @@ def _score(
     else:
         buyer, seller = candidate, rfq
 
+    # Resolve active weights from user matching preferences (Pillar 4)
+    active_weights = match_scoring.WEIGHTS
+    if matching_preferences:
+        preset_key = matching_preferences.get("preset")
+        if preset_key and preset_key in MATCHING_PRESETS:
+            active_weights = MATCHING_PRESETS[preset_key]
+        elif "weights" in matching_preferences and isinstance(matching_preferences["weights"], dict):
+            active_weights = {
+                k: float(v) for k, v in matching_preferences["weights"].items() if isinstance(v, (int, float))
+            }
+
     if similarity is not None:
-        # Cosine similarity from the vector index. Retrieval already applied the
-        # threshold, so anything that arrives here has cleared the semantic bar
-        # and does not need a second gate.
         relevance = similarity
         floor = 0.0
     else:
-        # Lexical fallback; its scores sit on a different scale, so it carries
-        # its own floor.
         relevance = match_scoring.relevance_score(
             rfq.search_tags, build_match_text(rfq),
             candidate.search_tags, build_match_text(candidate),
         )
         floor = COMPARABLE_FLOOR
 
+    # Dynamic Asymmetric Specificity Check (Pillar 2):
+    # When requester specifies distinguishing sub-type tokens (e.g. 'type-c', '316l', 'organic', 'fuji', 'cat6')
+    # and candidate does NOT mention them anywhere in title or specs, penalize relevance so generic products
+    # cannot masquerade as specific sub-variants.
+    req_text_all = f"{rfq.title or ''} {rfq.search_text or ''}".lower()
+    cand_text_all = f"{candidate.title or ''} {candidate.search_text or ''}".lower()
+
+    req_tokens_all = match_scoring.tokenize(req_text_all)
+    cand_tokens_all = match_scoring.tokenize(cand_text_all)
+
+    critical_missing = set()
+    for tok in req_tokens_all:
+        is_high_spec = (
+            (any(c.isdigit() for c in tok) and any(c.isalpha() for c in tok))
+            or tok in ("c", "organic", "seamless", "combed", "lightning", "fuji", "alphonso", "316l")
+        )
+        if is_high_spec and tok not in cand_tokens_all:
+            critical_missing.add(tok)
+
+    if critical_missing:
+        # Candidate is generic / under-specified compared to the request
+        relevance = max(0.10, relevance * 0.40)
+
     category = match_scoring.category_score(rfq.category, candidate.category)
     comparable = relevance >= floor
+
+    attr_score = match_scoring.attribute_score(
+        rfq.product_details or {}, candidate.product_details or {}
+    )
 
     scores: dict[str, Optional[float]] = {
         "relevance": relevance,
         "category": category,
-        "attributes": match_scoring.attribute_score(
-            rfq.product_details or {}, candidate.product_details or {}
-        ),
+        "attributes": attr_score,
         "price": match_scoring.price_score(
             buyer.price_amount, seller.price_amount, buyer.price_currency, seller.price_currency
         ) if comparable else None,
@@ -229,16 +280,32 @@ def _score(
     }
 
     keep = comparable
-    base_total = match_scoring.blend(scores)
+
+    # Two-Tier Multiplicative Gating (Pillar 3):
+    # Tier 1: Feasibility (F) = Does the product and its physical specs match?
+    # Tier 2: Commercial (C) = Price, Quantity, Location, Deadline
+    # Commercial terms (cheap price, close location) CANNOT compensate for an incorrect product or missing spec!
+    if attr_score is not None:
+        feasibility = relevance * (0.35 + 0.65 * attr_score)
+    else:
+        feasibility = relevance
+
+    # Commercial utility (Price, Quantity, Location, Deadline)
+    commercial_scores = {
+        k: v for k, v in scores.items() if k in ("price", "quantity", "location", "deadline") and v is not None
+    }
+    if commercial_scores:
+        commercial_utility = match_scoring.blend(commercial_scores, weights=active_weights)
+        # Gated formula: Feasibility acts as the physical bouncer
+        base_total = round(feasibility * (0.35 + 0.65 * commercial_utility), 4)
+    else:
+        base_total = round(feasibility, 4)
 
     # Core Product Gatekeeping:
-    # 1. Non-product dimensions (category, price, quantity, location) must never
-    # inflate a low product relevance (< RELEVANCE_FLOOR = 0.70) into a "Prime Match" (>= 0.85).
-    # Total score cannot exceed its product relevance.
     if relevance < settings.RELEVANCE_FLOOR:
         base_total = min(base_total, relevance)
 
-    # 2. Distinct commodity check: If requester named a specific product (e.g. "tomatos")
+    # Distinct commodity check: If requester named a specific product (e.g. "tomatos")
     # and candidate is an entirely different commodity (e.g. "Fuji apples") with zero
     # token overlap on product tokens, do not present it as a match unless it is a
     # high-confidence semantic match (vector similarity >= 0.85).
@@ -437,9 +504,19 @@ async def run_match(
     """
     candidates, similarities = await _fetch_candidates(db, rfq, user.id)
 
+    # Load user's profile matching preferences if available (Pillar 4)
+    user_prefs = None
+    if user and user.profile and getattr(user.profile, "matching_preferences", None):
+        user_prefs = user.profile.matching_preferences
+
     scored = []
     for candidate in candidates:
-        score, keep = _score(rfq, candidate, similarities.get(candidate.id))
+        score, keep = _score(
+            rfq,
+            candidate,
+            similarities.get(candidate.id),
+            matching_preferences=user_prefs,
+        )
         if keep and score.total >= MIN_SCORE:
             scored.append((candidate, score))
     # Tie-break on recency so equal scores return in a stable, sensible order.

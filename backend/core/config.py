@@ -27,11 +27,11 @@ class Settings(BaseSettings):
     QDRANT_URL: str = "http://localhost:6333"
     REDIS_URL: str = "redis://localhost:6379/0"
     OLLAMA_BASE_URL: str = "http://localhost:11434"
-    OLLAMA_MODEL: str = "gpt-oss:120b"
-    # OLLAMA_MODEL: str = "qwen3-coder-next:q4_K_M"
+    # OLLAMA_MODEL: str = "gpt-oss:120b"
+    OLLAMA_MODEL: str = "qwen3-coder-next:q4_K_M"
     OLLAMA_NUM_CTX: int = 65536
     EMBEDDING_MODEL: str = "qwen3-embedding:8b"
-    EMBEDDING_TIMEOUT_SECONDS: int = 30
+    EMBEDDING_TIMEOUT_SECONDS: int = 180
     QDRANT_COLLECTION: str = "marketplace_rfq_v2"
     # Cosine similarity below this is a different product, not a weak match.
     # Measured against the seed corpus with product-only embeddings: the right

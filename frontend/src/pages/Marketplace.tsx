@@ -234,8 +234,10 @@ export function Marketplace() {
     if (sortBy !== "newest") nextParams.set("sort", sortBy);
     if (verifiedOnly) nextParams.set("verified", "true");
     if (savedOnly) nextParams.set("saved", "true");
+    const rfqQuery = searchParams.get("rfq") || searchParams.get("rfq_id");
+    if (rfqQuery) nextParams.set("rfq", rfqQuery);
     setSearchParams(nextParams, { replace: true });
-  }, [searchQuery, activeRole, selectedCategory, sortBy, verifiedOnly, savedOnly, setSearchParams]);
+  }, [searchQuery, activeRole, selectedCategory, sortBy, verifiedOnly, savedOnly, searchParams, setSearchParams]);
 
   function handleResetFilters() {
     setSearchQuery("");
@@ -251,6 +253,36 @@ export function Marketplace() {
     setSelectedRadius(null);
     setSearchParams(new URLSearchParams(), { replace: true });
   }
+
+  // Open single RFQ quick-view modal if requested via URL query (e.g. from Chat AI or direct link)
+  useEffect(() => {
+    const targetRfqId = searchParams.get("rfq") || searchParams.get("rfq_id") || searchParams.get("id");
+    if (!targetRfqId) return;
+
+    if (activeModalItem?.id === targetRfqId) return;
+
+    const existing = items.find((x) => x.id === targetRfqId);
+    if (existing) {
+      setActiveModalItem(existing);
+      return;
+    }
+
+    let cancelled = false;
+    marketApi
+      .getListing(targetRfqId)
+      .then((listing) => {
+        if (!cancelled && listing) {
+          setActiveModalItem(listing);
+        }
+      })
+      .catch((err) => {
+        console.error("Could not load requested RFQ listing:", err);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [searchParams, items, activeModalItem?.id]);
 
   async function handleConnect(item: CatalogItem) {
     if (item.counterparty.connection_id && item.counterparty.connection_status === "accepted") {
@@ -282,6 +314,19 @@ export function Marketplace() {
             : c,
         ),
       );
+      setActiveModalItem((prev) =>
+        prev && prev.id === item.id
+          ? {
+              ...prev,
+              counterparty: {
+                ...prev.counterparty,
+                connection_id: conn.id,
+                connection_status: "pending",
+                connection_direction: "sent",
+              },
+            }
+          : prev,
+      );
       toast(`Request sent to ${item.counterparty.company_name || "the company"}. You'll see it under Messages.`);
     } catch (err) {
       setError(errorMessage(err, "Could not send connection request"));
@@ -293,7 +338,7 @@ export function Marketplace() {
   function handleAskAI(item: CatalogItem) {
     const roleTerm = item.role === "seller" ? "supplier" : "buyer";
     const prompt = `Analyze this ${roleTerm} listing for "${item.title}" in category "${item.category}". Price is ${formatPrice(item)}, quantity ${formatQuantity(item)}. How does this compare with typical market conditions?`;
-    navigate(`/ai-chat?agent=market_research&prompt=${encodeURIComponent(prompt)}`);
+    navigate(`/ai-chat?prompt=${encodeURIComponent(prompt)}`);
   }
 
   async function handleToggleSave(item: CatalogItem) {
@@ -956,7 +1001,15 @@ export function Marketplace() {
 
       <Modal
         open={activeModalItem !== null}
-        onClose={() => setActiveModalItem(null)}
+        onClose={() => {
+          setActiveModalItem(null);
+          if (searchParams.has("rfq") || searchParams.has("rfq_id")) {
+            const nextParams = new URLSearchParams(searchParams);
+            nextParams.delete("rfq");
+            nextParams.delete("rfq_id");
+            setSearchParams(nextParams, { replace: true });
+          }
+        }}
         size="lg"
         title={activeModalItem?.title ?? ""}
         description={
@@ -999,9 +1052,7 @@ export function Marketplace() {
                   activeModalItem.counterparty.connection_status === "pending"
                 }
                 onClick={() => {
-                  const it = activeModalItem;
-                  setActiveModalItem(null);
-                  void handleConnect(it);
+                  void handleConnect(activeModalItem);
                 }}
               >
                 {connectLabel(activeModalItem)}

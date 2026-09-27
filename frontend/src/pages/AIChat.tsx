@@ -36,6 +36,7 @@ interface MessageItem extends AIChatMessage {
   toolStep?: AIToolStep | null;
   createdRfq?: AICreatedRFQ | null;
   counterpartyMessage?: AICounterpartyMessage | null;
+  routedAgent?: AgentInfo | null;
   isStreaming?: boolean;
 }
 
@@ -55,19 +56,19 @@ const MATCH_PROMPT_CHIPS = [
 ];
 
 const SUGGESTED_PROMPTS = [
-  { label: "Buy apples in Indore", prompt: "I want to buy apple in Indore" },
-  { label: "Source 500 corrugated boxes", prompt: "I want to buy 500 corrugated boxes" },
-  { label: "Sell stainless steel pipes", prompt: "I am a seller of industrial stainless steel pipes" },
-  { label: "Negotiate payment terms", prompt: "How can I negotiate better payment terms with a supplier?" },
-  { label: "Supplier KYC checklist", prompt: "What are the key supplier KYC and verification checks?" },
-  { label: "FOB vs CIF vs EXW", prompt: "What is the difference between FOB, CIF, and EXW shipping terms?" },
+  { label: "Buy apples in Indore", prompt: "I want to buy 500kg apples in Indore" },
+  { label: "Compare prices & RFQ", prompt: "Compare prices and create an RFQ for industrial stainless steel pipes" },
+  { label: "Negotiate payment terms", prompt: "Help me negotiate 30-day net payment terms with my supplier" },
+  { label: "Market pricing for boxes", prompt: "What are the market trends and pricing for 500 corrugated boxes?" },
+  { label: "FOB vs CIF shipping", prompt: "What is the difference between FOB, CIF, and EXW for sea freight?" },
+  { label: "Supplier verification checks", prompt: "What verification checks and certifications should I demand from a new chemical supplier?" },
 ];
 
 const INITIAL_GREETING: MessageItem = {
   id: "initial-greeting",
   role: "assistant",
   content:
-    "Hello — I'm your B2B business assistant. I can help draft RFQs, negotiate with suppliers, work through pricing, and clarify trade terms.\n\nAre you looking to **buy** or **sell**? Or describe your request directly, for example: *I want to buy apples in Indore*.",
+    "Hello — I'm your **Business AI Super Agent**.\n\nI autonomously orchestrate specialized agents to handle your B2B commerce needs: **market intelligence & live pricing**, **RFQ drafting & supplier matching**, **autonomous negotiation**, **trade terms (Incoterms & logistics)**, and **supplier compliance**.\n\nHow can I help your business today? (e.g., *'I want to buy 500kg apples in Indore'* or *'Compare supplier prices and create an RFQ'* or *'Help me negotiate payment terms'*).",
   timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
 };
 
@@ -154,7 +155,13 @@ function MatchCartView({
                     {scorePct}%
                   </span>
                   <div className="ai-match-card-main-info">
-                    <span className="ai-match-card-title">{candidate.title}</span>
+                    <Link
+                      to={`/marketplace?rfq=${candidate.rfq_id}`}
+                      className="ai-match-card-title-link"
+                      title="View RFQ in Marketplace & Send Connection Request"
+                    >
+                      {candidate.title} ↗
+                    </Link>
                     <span className="ai-match-card-company">
                       {candidate.counterparty.company_name || "Unnamed company"}
                       {candidate.counterparty.gst_verified && (
@@ -189,6 +196,13 @@ function MatchCartView({
                     </span>
                   </div>
                   <div className="ai-match-card-action">
+                    <Link
+                      to={`/marketplace?rfq=${candidate.rfq_id}`}
+                      className="ghost small-btn ai-match-view-btn"
+                      title="View full RFQ details in marketplace"
+                    >
+                      View RFQ
+                    </Link>
                     {isConnected ? (
                       <span className="ai-match-connected-pill">
                         {status === "accepted" ? "Connected" : "Requested"}
@@ -257,55 +271,12 @@ export function AIChat() {
   const [editingDrafts, setEditingDrafts] = useState<Record<string, string>>({});
   const [activeEditDraftId, setActiveEditDraftId] = useState<string | null>(null);
   const [sendingDraftId, setSendingDraftId] = useState<string | null>(null);
-  const urlAgentParam = searchParams.get("agent");
-  const [agents, setAgents] = useState<AgentInfo[]>([]);
-  const [selectedAgentId, setSelectedAgentId] = useState<string>(urlAgentParam || "general");
   const activeConversationIdRef = useRef<string | null>(null);
   const loadingRef = useRef<boolean>(false);
   const currentRfqRef = useRef<Record<string, any>>({});
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
-
-  useEffect(() => {
-    if (urlAgentParam) {
-      setSelectedAgentId(urlAgentParam);
-    }
-  }, [urlAgentParam]);
-
-  useEffect(() => {
-    aiChat
-      .listAgents()
-      .then((data) => {
-        if (data && data.length > 0) {
-          setAgents(data);
-        }
-      })
-      .catch((err) => {
-        console.error("Failed to load agents:", err);
-      });
-  }, []);
-
-  const currentAgent = agents.find((a) => a.id === selectedAgentId) || null;
-  const activeSuggestedPrompts =
-    currentAgent && currentAgent.suggested_prompts && currentAgent.suggested_prompts.length > 0
-      ? currentAgent.suggested_prompts
-      : SUGGESTED_PROMPTS;
-
-  const handleSelectAgent = (agentId: string) => {
-    setSelectedAgentId(agentId);
-    const ag = agents.find((a) => a.id === agentId);
-    if (messages.length <= 1 && ag) {
-      setMessages([
-        {
-          id: `greeting-${Date.now()}`,
-          role: "assistant",
-          content: `**${ag.name}** — ${ag.description}\n\nHow can I help with ${ag.short_description.toLowerCase()}?`,
-          timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-        },
-      ]);
-    }
-  };
 
   const loadConversation = async (id: string) => {
     if (abortControllerRef.current) {
@@ -330,6 +301,7 @@ export function AIChat() {
           toolStep: m.tool_step || null,
           createdRfq: m.created_rfq || null,
           counterpartyMessage: m.counterparty_message || null,
+          routedAgent: (m as any).routed_agent || null,
           timestamp: new Date(m.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
         }));
         setMessages(mapped);
@@ -703,6 +675,10 @@ export function AIChat() {
             setReadiness(chunk.readiness);
           }
 
+          if (chunk.matched_candidates && chunk.matched_candidates.length > 0) {
+            setActiveMatchedCandidates(chunk.matched_candidates);
+          }
+
           if (chunk.created_rfq) {
             setLastCreatedRfq(chunk.created_rfq);
           }
@@ -724,6 +700,7 @@ export function AIChat() {
               const nextToolStep = chunk.tool_step || msg.toolStep || null;
               const nextCreatedRfq = chunk.created_rfq || msg.createdRfq || null;
               const nextCounterpartyMsg = chunk.counterparty_message || msg.counterpartyMessage || null;
+              const nextRoutedAgent = chunk.routed_agent || msg.routedAgent || null;
               return {
                 ...msg,
                 content: nextContent,
@@ -732,6 +709,7 @@ export function AIChat() {
                 toolStep: nextToolStep,
                 createdRfq: nextCreatedRfq,
                 counterpartyMessage: nextCounterpartyMsg,
+                routedAgent: nextRoutedAgent,
                 isStreaming: !chunk.done,
               };
             })
@@ -746,7 +724,7 @@ export function AIChat() {
         activeConversationId,
         activeMatchedCandidates.length > 0 ? activeMatchedCandidates : null,
         activeConnectionId,
-        selectedAgentId === "general" ? null : selectedAgentId,
+        null, // Super Agent autonomously routes based on user intent
       );
     } catch (err: unknown) {
       if (abortController.signal.aborted) {
@@ -790,7 +768,6 @@ export function AIChat() {
   const hasDraft = Object.keys(currentRfq).length > 0;
   const showEmptyHero = messages.length <= 1 && !loading;
   const showSuggestions = messages.length <= 2 && !loading && !showEmptyHero;
-  const isSpecialist = Boolean(currentAgent && currentAgent.id !== "general");
 
   const draftChips: string[] = [];
   if (currentRfq.category && currentRfq.product_details?.name) draftChips.push(currentRfq.category);
@@ -813,22 +790,15 @@ export function AIChat() {
         <div className="ai-chat-container">
           <header className="ai-chat-header">
             <div className="ai-chat-header-info">
-              {agents.length === 0 && <h2 className="ai-chat-title">Business AI</h2>}
-              {agents.length > 0 && (
-                <select
-                  className="ai-agent-select"
-                  value={selectedAgentId}
-                  onChange={(e) => handleSelectAgent(e.target.value)}
-                  aria-label="Assistant"
-                  title={currentAgent?.description}
+              <div className="ai-super-agent-title-row">
+                <h2 className="ai-chat-title">✨ Business AI Super Agent</h2>
+                <span
+                  className="ai-super-agent-badge"
+                  title="Super Agent dynamically routes every turn to the optimal specialist: Market Intelligence, RFQ Drafting, Autonomous Negotiation, Price Analysis, Logistics, or Compliance."
                 >
-                  {agents.map((ag) => (
-                    <option key={ag.id} value={ag.id}>
-                      {ag.name}
-                    </option>
-                  ))}
-                </select>
-              )}
+                  ⚡ Autonomous Multi-Agent
+                </span>
+              </div>
               {loading && (
                 <span className="ai-header-live-dot" title="Responding">
                   <span className="spinner" />
@@ -889,16 +859,12 @@ export function AIChat() {
                 <div className="ai-empty-hero-icon" aria-hidden="true">
                   <IconSparkles size={20} />
                 </div>
-                <h3 className="ai-empty-hero-title">
-                  {isSpecialist ? currentAgent!.name : "How can I help?"}
-                </h3>
+                <h3 className="ai-empty-hero-title">Business AI Super Agent</h3>
                 <p className="ai-empty-hero-desc">
-                  {isSpecialist
-                    ? currentAgent!.description
-                    : "Draft an RFQ, find suppliers, negotiate a deal, or ask about trade terms."}
+                  Your autonomous B2B commerce copilot. Directly draft RFQs, analyze live market data, negotiate with suppliers, compare prices, or clarify logistics and compliance.
                 </p>
                 <div className="ai-empty-hero-grid">
-                  {activeSuggestedPrompts.map((item) => (
+                  {SUGGESTED_PROMPTS.map((item) => (
                     <button
                       key={item.prompt}
                       type="button"
@@ -927,6 +893,13 @@ export function AIChat() {
                     )}
 
                     <div className={`ai-message-bubble ${isUser ? "user-bubble" : "ai-bubble"}`}>
+                      {!isUser && msg.routedAgent && (
+                        <div className="ai-msg-routed-badge" title={msg.routedAgent.description}>
+                          <span className="ai-routed-icon">{msg.routedAgent.icon || "🎯"}</span>
+                          <span className="ai-routed-label">Routed to:</span>
+                          <strong className="ai-routed-name">{msg.routedAgent.name}</strong>
+                        </div>
+                      )}
                       {showShimmer ? (
                         <div className="ai-shimmer-placeholder" aria-label="Thinking">
                           <span />
@@ -1089,6 +1062,13 @@ export function AIChat() {
                                     : `Show matching ${msg.createdRfq.role === "buyer" ? "suppliers" : "buyers"}${rfqMatches[msg.createdRfq.id]?.total ? ` (${rfqMatches[msg.createdRfq.id].total})` : ""}`}
                               </button>
                             )}
+                            <Link
+                              to={`/marketplace?rfq=${msg.createdRfq.id}`}
+                              className="button secondary small-btn"
+                              title="View this RFQ in the marketplace"
+                            >
+                              View in Marketplace ↗
+                            </Link>
                             <Link to="/rfqs" className="button ghost small-btn">
                               View in My RFQs
                             </Link>
@@ -1129,7 +1109,7 @@ export function AIChat() {
           <footer className="ai-chat-footer">
             {showSuggestions && (
               <div className="ai-chips-grid" aria-label="Suggestions">
-                {activeSuggestedPrompts.map((item) => (
+                {SUGGESTED_PROMPTS.map((item) => (
                   <button
                     key={item.prompt}
                     type="button"
@@ -1154,7 +1134,7 @@ export function AIChat() {
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={handleKeyDown}
-                placeholder={`Message ${currentAgent?.name ?? "Business AI"}…`}
+                placeholder="Message Business AI Super Agent (RFQs, market research, price comparison, negotiation, shipping)…"
                 disabled={loading}
                 maxLength={5000}
                 aria-label="Message"

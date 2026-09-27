@@ -2,6 +2,7 @@
 
 from datetime import UTC, datetime
 from decimal import Decimal
+import re
 from typing import Optional, Sequence
 import uuid
 
@@ -89,16 +90,40 @@ async def get_catalog(
         conditions.append(RFQ.price_amount <= Decimal(str(max_price)))
 
     if q and q.strip():
-        term = f"%{q.strip()}%"
-        conditions.append(
-            or_(
-                RFQ.title.ilike(term),
-                RFQ.category.ilike(term),
-                RFQ.description.ilike(term),
-                RFQ.search_text.ilike(term),
-                RFQ.location_city.ilike(term),
+        # Tokenize search phrase so compound queries like 'office chair in mumbai'
+        # match across product title and location/category seamlessly.
+        raw_terms = [
+            w.strip()
+            for w in re.split(r"[^\w\+\-\./]+", q.strip())
+            if w.strip()
+            and w.lower() not in ("in", "at", "from", "for", "the", "a", "an", "to", "with", "and", "or", "of", "on", "by", "is")
+            and (len(w.strip()) >= 2 or w.isalnum())
+        ]
+        if raw_terms:
+            token_conditions = []
+            for t in raw_terms:
+                term = f"%{t}%"
+                token_conditions.append(
+                    or_(
+                        RFQ.title.ilike(term),
+                        RFQ.category.ilike(term),
+                        RFQ.description.ilike(term),
+                        RFQ.search_text.ilike(term),
+                        RFQ.location_city.ilike(term),
+                    )
+                )
+            conditions.append(and_(*token_conditions))
+        else:
+            term = f"%{q.strip()}%"
+            conditions.append(
+                or_(
+                    RFQ.title.ilike(term),
+                    RFQ.category.ilike(term),
+                    RFQ.description.ilike(term),
+                    RFQ.search_text.ilike(term),
+                    RFQ.location_city.ilike(term),
+                )
             )
-        )
 
     # Base query
     base_query = (
@@ -349,3 +374,155 @@ async def get_categories_summary(db: AsyncSession) -> list[CategoryCountOut]:
         )
         for row in rows
     ]
+
+
+async def get_catalog_item(
+    db: AsyncSession,
+    viewer: User,
+    rfq_id: uuid.UUID,
+) -> Optional[CatalogItemOut]:
+    """Retrieve a single active or accessible RFQ listing with full counterparty trust data."""
+    query = (
+        select(RFQ)
+        .options(
+            selectinload(RFQ.user).selectinload(User.profile),
+        )
+        .where(RFQ.id == rfq_id)
+    )
+    rfq = (await db.scalars(query)).first()
+    if not rfq:
+        return None
+
+    # Load owner's verified certs
+    certs_query = select(Certificate.name).where(
+        Certificate.user_id == rfq.user_id,
+        Certificate.verification_status == CertificationStatus.VERIFIED,
+    )
+    verified_certs = list((await db.scalars(certs_query)).all())
+
+    # Check connection between viewer and this RFQ
+    conn_query = select(Connection).where(
+        Connection.rfq_id == rfq.id,
+        or_(
+            Connection.sender_id == viewer.id,
+            Connection.receiver_id == viewer.id,
+        ),
+    )
+    conn = (await db.scalars(conn_query)).first()
+    conn_id = conn.id if conn else None
+    conn_status = conn.status.value if conn else None
+    conn_direction = (
+        ("sent" if conn.sender_id == viewer.id else "received") if conn else None
+    )
+
+    # Check saved status
+    saved_query = select(SavedRFQ.rfq_id).where(
+        SavedRFQ.user_id == viewer.id,
+        SavedRFQ.rfq_id == rfq.id,
+    )
+    is_saved = bool((await db.scalars(saved_query)).first())
+
+    # Coordinates and distance
+    viewer_lat = getattr(viewer.profile, "latitude", None) if viewer.profile else None
+    viewer_lon = getattr(viewer.profile, "longitude", None) if viewer.profile else None
+
+    loc_lat = rfq.latitude
+    loc_lon = rfq.longitude
+    owner_profile = rfq.user.profile if rfq.user else None
+    if (loc_lat is None or loc_lon is None) and (rfq.location_city or rfq.location_state):
+        loc_candidate = locations.find_location(rfq.location_city or "") or locations.find_location(rfq.location_state or "")
+        if loc_candidate:
+            loc_lat = locations.as_decimal(loc_candidate.latitude)
+            loc_lon = locations.as_decimal(loc_candidate.longitude)
+    if (loc_lat is None or loc_lon is None) and owner_profile and owner_profile.latitude and owner_profile.longitude:
+        loc_lat = owner_profile.latitude
+        loc_lon = owner_profile.longitude
+
+    dist_km: Optional[float] = None
+    if viewer_lat is not None and viewer_lon is not None and loc_lat is not None and loc_lon is not None:
+        try:
+            raw_dist = haversine_km(
+                float(viewer_lat),
+                float(viewer_lon),
+                float(loc_lat),
+                float(loc_lon),
+            )
+            dist_km = round(raw_dist, 1)
+        except Exception:
+            dist_km = None
+
+    company_name = (
+        (owner_profile.company_name or owner_profile.name)
+        if owner_profile
+        else "Enterprise Trader"
+    ) or "Enterprise Trader"
+
+    counterparty_out = CatalogCounterpartyOut(
+        company_name=company_name,
+        contact_name=owner_profile.name if owner_profile else None,
+        city=rfq.location_city or (owner_profile.city if owner_profile else None),
+        country=rfq.location_country or (owner_profile.country if owner_profile else None),
+        kyc_status=owner_profile.kyc_status if owner_profile else KYCStatus.UNVERIFIED,
+        trust_score=owner_profile.trust_score if owner_profile else 20,
+        verified_certs=verified_certs,
+        connection_id=conn_id,
+        connection_status=conn_status,
+        connection_direction=conn_direction,
+    )
+
+    quantity = (
+        Quantity(value=float(rfq.quantity_value), unit=rfq.quantity_unit or "units")
+        if rfq.quantity_value is not None
+        else None
+    )
+    min_order = (
+        Quantity(value=float(rfq.min_order_value), unit=rfq.min_order_unit or "units")
+        if rfq.min_order_value is not None
+        else None
+    )
+    price_target = (
+        Money(
+            amount=float(rfq.price_amount),
+            currency=rfq.price_currency,
+            per_unit=rfq.price_per_unit,
+        )
+        if rfq.price_amount is not None
+        else None
+    )
+    location = Location(
+        city=rfq.location_city,
+        state=rfq.location_state,
+        country=rfq.location_country,
+        latitude=loc_lat,
+        longitude=loc_lon,
+        raw=rfq.location_raw,
+    )
+    deadline = (
+        DeadlineOut(
+            date=rfq.deadline_at.isoformat() if rfq.deadline_at else None,
+            raw=rfq.deadline_raw,
+        )
+        if rfq.deadline_at or rfq.deadline_raw
+        else None
+    )
+
+    return CatalogItemOut(
+        id=rfq.id,
+        user_id=rfq.user_id,
+        role=rfq.role,
+        category=rfq.category,
+        title=rfq.title,
+        description=rfq.description,
+        quantity=quantity,
+        minimum_order=min_order,
+        price_target=price_target,
+        location=location,
+        deadline=deadline,
+        product_details=rfq.product_details or {},
+        search_tags=rfq.search_tags or [],
+        created_at=rfq.created_at,
+        counterparty=counterparty_out,
+        distance_km=dist_km,
+        is_saved=is_saved,
+    )
+

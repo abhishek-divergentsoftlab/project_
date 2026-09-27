@@ -39,10 +39,11 @@ const ROLE_BADGE: Record<UserRole, string> = {
   both: "Buyer & seller",
 };
 
-type Tab = "general" | "kyc" | "certificates" | "reviews";
+type Tab = "general" | "matching" | "kyc" | "certificates" | "reviews";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "general", label: "Account" },
+  { id: "matching", label: "Matching Criteria" },
   { id: "kyc", label: "KYC & GST" },
   { id: "certificates", label: "Certificates" },
   { id: "reviews", label: "Reviews" },
@@ -96,6 +97,19 @@ export function Profile() {
   const [role, setRole] = useState<UserRole>("buyer");
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+
+  const [matchingPreset, setMatchingPreset] = useState<
+    "quality_first" | "price_first" | "fast_delivery" | "balanced" | "custom"
+  >("balanced");
+  const [customWeights, setCustomWeights] = useState({
+    relevance: 28,
+    attributes: 22,
+    price: 16,
+    quantity: 12,
+    location: 8,
+    deadline: 4,
+  });
+  const [savingMatching, setSavingMatching] = useState(false);
 
   const [kycForm, setKycForm] = useState<KYCVerificationPayload>({
     gst_number: "",
@@ -172,6 +186,22 @@ export function Profile() {
       pan_number: profile.pan_number ?? "",
       signatory_name: profile.signatory_name ?? profile.name ?? "",
     });
+
+    if (profile.matching_preferences) {
+      if (profile.matching_preferences.preset) {
+        setMatchingPreset(profile.matching_preferences.preset);
+      }
+      if (profile.matching_preferences.weights) {
+        setCustomWeights({
+          relevance: Math.round((profile.matching_preferences.weights.relevance ?? 0.28) * 100),
+          attributes: Math.round((profile.matching_preferences.weights.attributes ?? 0.22) * 100),
+          price: Math.round((profile.matching_preferences.weights.price ?? 0.16) * 100),
+          quantity: Math.round((profile.matching_preferences.weights.quantity ?? 0.12) * 100),
+          location: Math.round((profile.matching_preferences.weights.location ?? 0.08) * 100),
+          deadline: Math.round((profile.matching_preferences.weights.deadline ?? 0.04) * 100),
+        });
+      }
+    }
   }, [user]);
 
   useEffect(() => {
@@ -245,6 +275,43 @@ export function Profile() {
       setError(errorMessage(err, "Could not verify company KYC"));
     } finally {
       setKycSaving(false);
+    }
+  }
+
+  function applyPreset(preset: "quality_first" | "price_first" | "fast_delivery" | "balanced" | "custom") {
+    setMatchingPreset(preset);
+    if (preset === "quality_first") {
+      setCustomWeights({ relevance: 35, attributes: 35, price: 12, location: 8, quantity: 6, deadline: 4 });
+    } else if (preset === "price_first") {
+      setCustomWeights({ price: 36, relevance: 22, quantity: 18, attributes: 12, location: 8, deadline: 4 });
+    } else if (preset === "fast_delivery") {
+      setCustomWeights({ location: 30, deadline: 25, relevance: 20, attributes: 12, price: 8, quantity: 5 });
+    } else if (preset === "balanced") {
+      setCustomWeights({ relevance: 28, attributes: 22, price: 16, quantity: 12, location: 8, deadline: 4 });
+    }
+  }
+
+  async function handleSaveMatching(e: FormEvent) {
+    e.preventDefault();
+    clearAlerts();
+    setSavingMatching(true);
+    try {
+      const sum = Object.values(customWeights).reduce((a, b) => a + b, 0);
+      const normalizedWeights = Object.fromEntries(
+        Object.entries(customWeights).map(([k, v]) => [k, sum > 0 ? Number((v / sum).toFixed(4)) : 0])
+      );
+      await users.updateProfile({
+        matching_preferences: {
+          preset: matchingPreset,
+          weights: normalizedWeights,
+        },
+      });
+      await refreshUser();
+      toast("Matching priority criteria saved! Your RFQ matches now follow these weights.");
+    } catch (err) {
+      setError(errorMessage(err, "Could not save matching preferences"));
+    } finally {
+      setSavingMatching(false);
     }
   }
 
@@ -579,6 +646,149 @@ export function Profile() {
           <div className="form-footer">
             <button type="submit" disabled={saving}>
               {saving ? "Saving…" : "Save changes"}
+            </button>
+          </div>
+        </form>
+      )}
+
+      {activeTab === "matching" && (
+        <form className="panel form-panel" onSubmit={handleSaveMatching}>
+          <div className="form-section">
+            <div className="form-section-head">
+              <h2>Matchmaking Priority &amp; Dynamic Criteria</h2>
+              <p>
+                Configure how our Match Engine scores prospective counterparties for your RFQs.
+                Physical Feasibility &amp; Spec Compatibility are strictly prioritized above commercial terms.
+              </p>
+            </div>
+
+            <div style={{ display: "grid", gap: "1rem", marginBottom: "1.5rem" }}>
+              <div
+                style={{
+                  background: "var(--color-bg-secondary, #f8fafc)",
+                  padding: "1rem",
+                  borderRadius: "8px",
+                  border: "1px solid var(--color-border, #e2e8f0)",
+                }}
+              >
+                <h4 style={{ margin: "0 0 0.5rem 0", fontSize: "0.95rem", display: "flex", alignItems: "center", gap: "0.5rem" }}>
+                  <span>🛡️</span> 4-Pillars Match Engine Active
+                </h4>
+                <p style={{ margin: 0, fontSize: "0.85rem", color: "var(--color-text-secondary, #64748b)", lineHeight: "1.4" }}>
+                  <strong>Key-Agnostic Fact Inversion</strong> (e.g. <code>type: organic</code> ↔ <code>organic: true</code>),
+                  <strong> Physical Dimensional SI Reduction</strong> (e.g. <code>2cm == 20mm</code>),
+                  <strong> Asymmetric Specificity Guard</strong> (generic items cannot beat specific variants), and
+                  <strong> Two-Tier Multiplicative Gating</strong> are dynamically enforced on every search.
+                </p>
+              </div>
+
+              <div className="form-group">
+                <label style={{ fontWeight: 600, display: "block", marginBottom: "0.5rem" }}>
+                  Choose a Trade Priority Strategy
+                </label>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: "0.75rem" }}>
+                  {[
+                    {
+                      id: "quality_first" as const,
+                      title: "Quality & Specs First",
+                      desc: "Specs & Relevance take 70% weight. Ideal for manufacturing & OEM.",
+                      icon: "🎯",
+                    },
+                    {
+                      id: "balanced" as const,
+                      title: "Balanced (Default)",
+                      desc: "Standard enterprise distribution across specs, price & logistics.",
+                      icon: "⚖️",
+                    },
+                    {
+                      id: "price_first" as const,
+                      title: "Budget & Price Focus",
+                      desc: "Price carries 36% weight. Best for commodities & raw bulk materials.",
+                      icon: "💰",
+                    },
+                    {
+                      id: "fast_delivery" as const,
+                      title: "Rapid Dispatch & Local",
+                      desc: "Proximity & deadline take 55% weight. Best for urgent fulfillment.",
+                      icon: "🚚",
+                    },
+                  ].map((p) => (
+                    <div
+                      key={p.id}
+                      onClick={() => applyPreset(p.id)}
+                      style={{
+                        padding: "1rem",
+                        borderRadius: "8px",
+                        border: matchingPreset === p.id ? "2px solid var(--color-primary, #2563eb)" : "1px solid var(--color-border, #e2e8f0)",
+                        background: matchingPreset === p.id ? "rgba(37, 99, 235, 0.05)" : "var(--color-surface, #ffffff)",
+                        cursor: "pointer",
+                        transition: "all 0.15s ease",
+                      }}
+                    >
+                      <div style={{ fontSize: "1.25rem", marginBottom: "0.25rem" }}>{p.icon}</div>
+                      <div style={{ fontWeight: 600, fontSize: "0.9rem", color: "var(--color-text, #0f172a)" }}>{p.title}</div>
+                      <div style={{ fontSize: "0.8rem", color: "var(--color-text-secondary, #64748b)", marginTop: "0.25rem" }}>{p.desc}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="form-group" style={{ marginTop: "1rem" }}>
+                <label style={{ fontWeight: 600, display: "block", marginBottom: "0.75rem" }}>
+                  Dimension Weights Breakdown
+                </label>
+                <div style={{ display: "grid", gap: "0.85rem" }}>
+                  {[
+                    { key: "relevance" as const, label: "Core Product Relevance", desc: "Semantic alignment with requested product", max: 50 },
+                    { key: "attributes" as const, label: "Technical Specifications & Tolerance", desc: "Exact spec values, SI dimensional units & materials", max: 50 },
+                    { key: "price" as const, label: "Target vs Ask Price", desc: "Seller ask price vs your target budget with currency FX", max: 50 },
+                    { key: "quantity" as const, label: "Quantity Capacity", desc: "Fulfillment volume with mass/container conversion", max: 50 },
+                    { key: "location" as const, label: "Proximity & Distance", desc: "Haversine km distance and regional logistics mode", max: 50 },
+                    { key: "deadline" as const, label: "Delivery Lead Time", desc: "Counterparty dispatch window before required delivery", max: 50 },
+                  ].map((dim) => (
+                    <div
+                      key={dim.key}
+                      style={{
+                        display: "grid",
+                        gridTemplateColumns: "180px 1fr 60px",
+                        alignItems: "center",
+                        gap: "1rem",
+                        padding: "0.5rem 0.75rem",
+                        borderRadius: "6px",
+                        background: "var(--color-bg-secondary, #f8fafc)",
+                      }}
+                    >
+                      <div>
+                        <div style={{ fontWeight: 600, fontSize: "0.85rem" }}>{dim.label}</div>
+                        <div style={{ fontSize: "0.75rem", color: "var(--color-text-secondary, #64748b)" }}>{dim.desc}</div>
+                      </div>
+                      <input
+                        type="range"
+                        min="0"
+                        max={dim.max}
+                        value={customWeights[dim.key]}
+                        onChange={(e) => {
+                          setMatchingPreset("custom");
+                          setCustomWeights((prev) => ({
+                            ...prev,
+                            [dim.key]: Number(e.target.value),
+                          }));
+                        }}
+                        style={{ width: "100%", cursor: "pointer" }}
+                      />
+                      <div style={{ textAlign: "right", fontWeight: 700, fontSize: "0.85rem" }}>
+                        {customWeights[dim.key]}%
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="form-footer">
+            <button type="submit" disabled={savingMatching}>
+              {savingMatching ? "Saving Preferences…" : "Save Matching Preferences"}
             </button>
           </div>
         </form>

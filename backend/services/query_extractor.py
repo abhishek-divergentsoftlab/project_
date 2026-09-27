@@ -163,7 +163,7 @@ _ORDINALS = frozenset(
 _FILLER = frozenset(
     """i we want need looking for buy sell selling buying supply supplying show me
     find get me some any please pls of the a an at in on to from with and or for is
-    are be will would can could should must my our your it its that this these those now next
+    are am was were been be will would can could should must my our your it its that this these those now next
     also plus per each price prices priced pricing cost costs costing rate rates
     pay pays paying paid payment budget budgets target targets spend spending spent
     afford offer offering quote quoted quoting charge charges charged
@@ -186,7 +186,12 @@ _FILLER = frozenset(
     unit units pcs piece pieces
     color colour colours shade size under below above over between
     good best cheap cheapest quality
-    contain contains cantain cantains containing containig packed packaging packing""".split()
+    contain contains cantain cantains containing containig packed packaging packing
+    confused decide deciding decision analyze analyse analysis analyzing
+    suitable there many how what which where tell telling know market
+    seller sellers buyer buyers supplier suppliers vendor vendors listing listings
+    plan plans planning planned wish wishing aim aiming ready
+    bhai mujhe chahiye karna krna hoga karo mera meri hum hume ka ki ke ko se me mein""".split()
     + list(_ORDINALS)
 )
 
@@ -679,7 +684,35 @@ def _extract_quantity(text: str) -> tuple[Optional[Decimal], Optional[str], str]
 
 
 def _extract_role(text: str) -> Optional[RFQRole]:
-    lowered = text.lower()
+    lowered = f" {text.lower()} "
+
+    # 1. High-confidence compound phrases first (overrides standalone "i want" or "looking")
+    compound_sell = [
+        r"\b(?:i\s+)?(?:want|looking|plan|planning|ready|wish|wishing|aim|aiming)\s+to\s+(?:supply|sell|offer|provide)\b",
+        r"\b(?:i\s+)?(?:can|could|will|would)\s+(?:supply|sell|offer|provide)\b",
+        r"\b(?:i\s+)?(?:am|'m|we\s+are|we're)\s+(?:selling|supplying|offering|providing)\b",
+        r"\b(?:have|got)\s+(?:stock|inventory|supplies|availability)\b",
+        r"\b(?:for\s+sale|to\s+sell|to\s+supply)\b",
+        r"\b(?:supply|selling)\s+of\b",
+        r"\b(?:bechna|bechne|vikreta)\b",
+    ]
+    compound_buy = [
+        r"\b(?:i\s+)?(?:want|looking|plan|planning|ready|wish|wishing|aim|aiming)\s+to\s+(?:buy|purchase|procure|order)\b",
+        r"\b(?:i\s+)?(?:can|could|will|would)\s+(?:buy|purchase|procure)\b",
+        r"\b(?:i\s+)?(?:am|'m|we\s+are|we're)\s+(?:buying|purchasing|procuring)\b",
+        r"\b(?:need|require|seeking|looking\s+for|in\s+search\s+of)\b",
+        r"\b(?:requirement\s+of|quote\s+for|rfq\s+for)\b",
+        r"\b(?:khareedna|khareedne|chahiye|mangwana)\b",
+    ]
+
+    for pat in compound_sell:
+        if re.search(pat, lowered):
+            return RFQRole.SELLER
+    for pat in compound_buy:
+        if re.search(pat, lowered):
+            return RFQRole.BUYER
+
+    # 2. General cues fallback
     sell_at = min((lowered.find(cue) for cue in _SELL_CUES if cue in lowered), default=-1)
     buy_at = min((lowered.find(cue) for cue in _BUY_CUES if cue in lowered), default=-1)
 
@@ -863,6 +896,17 @@ def _extract_product(
 ) -> Optional[str]:
     lowered = text.lower()
 
+    # 1. Strip secondary conversational/analytical/question clauses so doubt questions
+    # do not pollute the core commodity noun phrase (e.g. "but i am confused what price...")
+    clause_splits = re.split(
+        r"\b(?:but|however|although|though|can you|could you|please tell|how many|what is|what are|what price|what should|tell me|analyze|analyse|help me decide|am confused|confused about)\b",
+        lowered,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )
+    if clause_splits and clause_splits[0].strip():
+        lowered = clause_splits[0]
+
     if location:
         lowered = re.sub(rf"\b{re.escape(location.name.lower())}\b", " ", lowered)
         if location.matched_key:
@@ -875,6 +919,11 @@ def _extract_product(
             lowered = re.sub(rf"\b{re.escape(location.country.lower())}\b", " ", lowered)
     elif city:
         lowered = re.sub(rf"\b{re.escape(city.name.lower())}\b", " ", lowered)
+
+    # Dynamically strip all known cities from gazetteer so location names never form product names
+    from services.locations import CITIES
+    city_regex = r"\b(?:" + "|".join(re.escape(k) for k in CITIES.keys()) + r")\b"
+    lowered = re.sub(city_regex, " ", lowered)
 
     # Strip common states, regions and country markers so they never become a product name
     _GEO_WORDS = (

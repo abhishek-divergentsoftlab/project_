@@ -57,9 +57,59 @@
   min-width: 0;
 }
 
+.ai-super-agent-title-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
 .ai-chat-title {
   font-size: var(--text-base);
   white-space: nowrap;
+}
+
+.ai-super-agent-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.2rem 0.65rem;
+  font-size: 0.72rem;
+  font-weight: var(--weight-medium, 600);
+  letter-spacing: 0.02em;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-muted);
+  border-radius: var(--radius-full, 9999px);
+  white-space: nowrap;
+}
+
+.ai-msg-routed-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin-bottom: var(--space-2);
+  padding: 0.2rem 0.55rem;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm, 6px);
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  width: fit-content;
+}
+
+.ai-msg-routed-badge .ai-routed-icon {
+  font-size: 0.85rem;
+  line-height: 1;
+}
+
+.ai-msg-routed-badge .ai-routed-label {
+  opacity: 0.85;
+}
+
+.ai-msg-routed-badge .ai-routed-name {
+  color: var(--text-primary);
+  font-weight: 600;
 }
 
 .ai-agent-select {
@@ -765,13 +815,21 @@
   gap: 0.0625rem;
 }
 
-.ai-match-card-title {
+.ai-match-card-title,
+.ai-match-card-title-link {
   font-size: var(--text-sm);
   font-weight: var(--weight-medium);
   color: var(--text);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  text-decoration: none;
+  transition: color 0.15s ease;
+}
+
+.ai-match-card-title-link:hover {
+  color: var(--accent);
+  text-decoration: underline;
 }
 
 .ai-match-card-company {
@@ -805,6 +863,13 @@
 
 .ai-match-card-action {
   flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.ai-match-view-btn {
+  text-decoration: none;
 }
 
 .ai-match-connected-pill {

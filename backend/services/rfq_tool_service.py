@@ -487,7 +487,7 @@ def preprocess_message_to_rfq(
         directive_words = {
             "mention", "mantion", "aslo", "also", "say", "tell", "inform", "clarify",
             "state", "note", "add", "message", "msg", "negotiate", "deal", "seller",
-            "supplier", "user", "location", "away", "not", "indore",
+            "supplier", "user", "location", "away", "not",
             "analyze", "analyse", "listing", "market",
         }
         has_directive_word = any(w in directive_words for w in words)
@@ -657,7 +657,11 @@ MATCH_QUERY_INTENT_REGEXES = [
         r"\bcompare\b.*\b(supplier|buyer|seller|candidate|match|price|quote|three|3|five|5|\d+)\b",
         r"\b(who|which)\s+is\s+(the\s+)?(cheapest|best|closest|most\s+reliable)\b",
         r"\bmatching\s+(suppliers?|sellers?|buyers?|candidates?|counterparties?)\b",
-        r"\b(view|show|display)\s+(the\s+)?(matches|matching|suppliers|buyers|sellers)\b",
+        r"\b(view|show|display|list|find|give\s+me|get|browse|search)\s+(the\s+|any\s+|all\s+|some\s+)?(rfqs?|listings?|matches|matching|suppliers?|buyers?|sellers?|counterparties?)\b",
+        r"\b(rfqs?|listings?)\s+(link|links|url|urls)\b",
+        r"\b(link|links|url|urls)\s+(of|for|to)\s+(the\s+|any\s+)?(rfqs?|listings?|counterparties?|suppliers?|buyers?|candidates?)\b",
+        r"\b(show|give|provide|send)\s+.*(rfq|rfqs|listing|listings)\b",
+        r"\b(connection\s+requests?|connect\s+to|connect\s+with)\b",
     ]
 ]
 

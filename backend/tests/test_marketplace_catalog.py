@@ -107,3 +107,30 @@ async def test_marketplace_categories_summary(make_actor):
     cats = res.json()
     assert isinstance(cats, list)
     assert any(c["category"] == "Textiles" and c["seller_count"] >= 1 for c in cats)
+
+
+async def test_marketplace_single_listing_and_link(make_actor):
+    seller = await make_actor("seller")
+    buyer = await make_actor("buyer")
+
+    seller_rfq = (
+        await seller.post(
+            "/rfqs",
+            json=rfq_body(
+                role="seller",
+                category="Industrial",
+                title="CNC Machined Precision Aluminum Brackets",
+                status="active",
+            ),
+        )
+    ).json()
+
+    # Buyer accesses the single listing using the RFQ ID (e.g. from Chat AI link /marketplace?rfq=...)
+    res = await buyer.get(f"/marketplace/catalog/{seller_rfq['id']}")
+    assert res.status_code == 200
+    listing = res.json()
+    assert listing["id"] == seller_rfq["id"]
+    assert listing["title"] == "CNC Machined Precision Aluminum Brackets"
+    assert listing["category"] == "Industrial"
+    assert listing["counterparty"]["company_name"] is not None
+

@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 import httpx
 from httpx import AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from services import ai_chat_service
 
@@ -1249,6 +1250,133 @@ async def test_ai_chat_message_analysis_query_bypasses_tools(client: AsyncClient
         assert "MARKET ANALYSIS & BENCHMARKING DIRECTIVE" in sys_msg
         # RFQ draft is not populated with corrupted listing text
         assert data["rfq_draft"] == {}
+
+
+@pytest.mark.asyncio
+async def test_super_agent_autonomous_routing():
+    """Verify the Super Agent router accurately identifies intents and provisions correct delegates and tools."""
+    from services.agent_router import route_query_to_agent
+
+    # 1. Market Research routing
+    agent, tools, meta = route_query_to_agent("What does the rice market look like? How many active sellers exist?")
+    assert agent.id == "market_research"
+    assert meta["action_intents"]["is_pure_analysis"] is True
+    assert tools == []
+
+    # 2. Logistics routing
+    agent, tools, meta = route_query_to_agent("Explain FOB vs CIF shipping terms for export to Dubai")
+    assert agent.id == "logistics"
+    assert meta["action_intents"]["is_pure_analysis"] is True
+    assert tools == []
+
+    # 3. Verification routing
+    agent, tools, meta = route_query_to_agent("What KYC documents and GST checks should I verify?")
+    assert agent.id == "verification"
+    assert meta["action_intents"]["is_pure_analysis"] is True
+    assert tools == []
+
+    # 4. Negotiation routing
+    agent, tools, meta = route_query_to_agent("Help me compose a counter-offer to negotiate a 15% discount on price")
+    assert agent.id == "negotiation"
+    tool_names = [t["function"]["name"] for t in tools]
+    assert "draft_counterparty_message" in tool_names
+
+    # 5. RFQ Drafting routing
+    agent, tools, meta = route_query_to_agent("I want to buy 500 tons of Basmati rice in Indore")
+    assert agent.id == "rfq_drafting"
+    tool_names = [t["function"]["name"] for t in tools]
+    assert "update_rfq_draft" in tool_names
+    assert "create_rfq" in tool_names
+
+
+@pytest.mark.asyncio
+async def test_combined_action_intent_preserves_rfq_tools():
+    """Verify that combined queries (e.g. price analysis + create RFQ) preserve RFQ tools and do not dead-end."""
+    from services.agent_router import route_query_to_agent
+
+    agent, tools, meta = route_query_to_agent(
+        "Compare the top 3 suppliers and create an RFQ for the cheapest one",
+        matched_candidates=[{"rfq_id": "test-1"}, {"rfq_id": "test-2"}],
+    )
+    assert agent.id == "price_analyst"
+    tool_names = [t["function"]["name"] for t in tools]
+    assert "create_rfq" in tool_names
+    assert "update_rfq_draft" in tool_names
+    assert meta["action_intents"]["requires_create_rfq"] is True
+
+
+@pytest.mark.asyncio
+async def test_context_sliding_window_memory():
+    """Verify that sliding window keeps prompt size bounded on 20+ turns while summarizing older context."""
+    from services.ai_chat_service import build_sliding_window_messages
+
+    # Create 22 turns of alternating user and assistant messages
+    mock_messages = []
+    for i in range(22):
+        if i % 2 == 0:
+            mock_messages.append({"role": "user", "content": f"User question turn {i}: specify specs for order {i}"})
+        else:
+            mock_messages.append({"role": "assistant", "content": f"Assistant reply turn {i}: acknowledging turn {i}"})
+
+    window_msgs, older_summary = build_sliding_window_messages(mock_messages, max_history_turns=8)
+    assert len(window_msgs) == 8
+    # The last message in the window should be the last message overall
+    assert window_msgs[-1]["content"] == "Assistant reply turn 21: acknowledging turn 21"
+    # Older messages (the first 14 turns) are summarized
+    assert older_summary is not None
+    assert "User inquired:" in older_summary
+
+
+@pytest.mark.asyncio
+async def test_live_marketplace_database_aggregates(db: AsyncSession):
+    """Verify that live database marketplace aggregation returns real metrics without hallucination."""
+    from services.ai_chat_service import _fetch_live_marketplace_aggregates, format_marketplace_aggregates_prompt
+
+    aggs = await _fetch_live_marketplace_aggregates(
+        db=db,
+        query_text="rice",
+        category="Agriculture",
+    )
+    assert isinstance(aggs, dict)
+    assert "total_active_marketplace" in aggs
+    assert "match_count" in aggs
+    prompt_str = format_marketplace_aggregates_prompt(aggs)
+    assert "LIVE MARKETPLACE DATABASE BENCHMARK" in prompt_str
+
+
+@pytest.mark.asyncio
+async def test_api_message_returns_routed_agent_info(client: AsyncClient, make_actor):
+    """Verify POST /ai-chat/message returns routed_agent metadata indicating which specialist handled the turn."""
+    actor = await make_actor("buyer")
+    orig_post = httpx.AsyncClient.post
+
+    async def mock_post(self, url, *args, **kwargs):
+        if "api/chat" in str(url):
+            mock_resp = AsyncMock()
+            mock_resp.status_code = 200
+            mock_resp.json = lambda: {
+                "message": {
+                    "role": "assistant",
+                    "content": "To verify this counterparty, check their GST registration and ISO certificate.",
+                    "thinking": "Evaluated KYC and trust signals.",
+                }
+            }
+            return mock_resp
+        return await orig_post(self, url, *args, **kwargs)
+
+    with patch.object(httpx.AsyncClient, "post", mock_post):
+        res = await actor.post(
+            "/ai-chat/message",
+            json={"messages": [{"role": "user", "content": "How do I check if a supplier's GST and KYC is verified?"}]},
+        )
+        assert res.status_code == 200
+        data = res.json()
+        assert "routed_agent" in data
+        assert data["routed_agent"] is not None
+        assert data["routed_agent"]["id"] == "verification"
+        assert data["routed_agent"]["name"] == "Supplier Verification"
+        assert data["routed_agent"]["icon"] == "✅"
+
 
 
 

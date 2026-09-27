@@ -263,7 +263,11 @@ export function Dashboard() {
               {agents.map((agent) => (
                 <li key={agent.id}>
                   <Link
-                    to={`/ai-chat?agent=${encodeURIComponent(agent.id)}`}
+                    to={
+                      agent.suggested_prompts && agent.suggested_prompts.length > 0
+                        ? `/ai-chat?prompt=${encodeURIComponent(agent.suggested_prompts[0].prompt)}`
+                        : `/ai-chat?prompt=${encodeURIComponent(`Help me with ${agent.name.toLowerCase()}`)}`
+                    }
                     className="agent-item"
                   >
                     <span className="agent-text">

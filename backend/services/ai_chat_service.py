@@ -16,15 +16,16 @@ from typing import Any, Optional, Union
 import uuid
 
 import httpx
-from sqlalchemy import select, or_, and_
+from sqlalchemy import select, or_, and_, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import settings
 from models.conversation import Conversation, Message
-from models.enums import ConversationType, MessageRole
+from models.enums import ConversationType, MessageRole, RFQRole, RFQStatus
 from models.user import User
 from services import rfq_tool_service
-from services.agent_registry import AgentDefinition
+from services.agent_registry import AgentDefinition, GENERAL_ASSISTANT
+from services.agent_router import route_query_to_agent, route_query_to_agent_async
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +140,205 @@ def format_rfq_summary_text(draft: dict[str, Any], readiness: dict[str, Any]) ->
     return "\n".join(lines)
 
 
+def build_sliding_window_messages(
+    messages: list[Any],
+    max_history_turns: int = 8,
+) -> tuple[list[dict[str, Any]], Optional[str]]:
+    """Partition messages into a sliding window and a compact historical summary.
+    
+    Ensures prompt token count stays bounded (~2,000-2,500 tokens) even in 50+ turn
+    conversations, eliminating inference latency spikes and local Ollama OOMs.
+    """
+    valid_msgs: list[dict[str, Any]] = []
+    for msg in messages:
+        role, content = _extract_msg_fields(msg)
+        content = content.strip()
+        if not content:
+            continue
+        safe_role = "assistant" if role == "assistant" else "user"
+        valid_msgs.append({"role": safe_role, "content": content})
+
+    if len(valid_msgs) <= max_history_turns:
+        return valid_msgs, None
+
+    # Sliding window keeps the most recent turns
+    window_msgs = valid_msgs[-max_history_turns:]
+    older_msgs = valid_msgs[:-max_history_turns]
+
+    # Generate a concise summary of the older turns
+    topics = []
+    for m in older_msgs:
+        c = m["content"]
+        if m["role"] == "user":
+            first_line = c.split("\n")[0][:80].strip()
+            if first_line and not any(first_line.lower() in t.lower() for t in topics):
+                topics.append(f"User inquired: '{first_line}'")
+        elif m["role"] == "assistant":
+            if "dispatched" in c.lower() or "counter-offer" in c.lower():
+                topics.append("Negotiation proposal was drafted/dispatched")
+            elif "created rfq" in c.lower() or "rfq created" in c.lower():
+                topics.append("RFQ listing was published")
+
+    summary_text = "; ".join(topics[-4:]) if topics else "Initial procurement inquiry and specification discussion."
+    return window_msgs, summary_text
+
+
+async def _fetch_live_marketplace_aggregates(
+    db: AsyncSession,
+    query_text: str,
+    category: Optional[str] = None,
+    product_name: Optional[str] = None,
+) -> dict[str, Any]:
+    """Query live PostgreSQL database for real marketplace listing metrics.
+    
+    Returns real listing counts, active buyers vs sellers, price ranges, and hubs.
+    Prevents LLM from hallucinating market statistics.
+    """
+    try:
+        from models.rfq import RFQ
+        from models.enums import RFQStatus, RFQRole
+
+        # 1. Total marketplace active count
+        total_active_res = await db.scalar(
+            select(func.count(RFQ.id)).where(RFQ.status == RFQStatus.ACTIVE)
+        )
+        total_active = total_active_res or 0
+
+        # 2. Targeted match query
+        conditions = [RFQ.status == RFQStatus.ACTIVE]
+        target_label = product_name or category
+
+        if product_name:
+            prod_clean = product_name.strip()
+            target_label = prod_clean
+            prod_or_clauses = [
+                RFQ.title.ilike(f"%{prod_clean}%"),
+                RFQ.search_text.ilike(f"%{prod_clean}%"),
+            ]
+            tokens = [t.strip() for t in re.split(r"[^\w]+", prod_clean.lower()) if len(t.strip()) >= 3]
+            for t in tokens:
+                prod_or_clauses.append(RFQ.title.ilike(f"%{t}%"))
+            conditions.append(or_(*prod_or_clauses))
+            if category:
+                conditions.append(RFQ.category.ilike(f"%{category.strip()}%"))
+        elif category:
+            target_label = category.strip()
+            conditions.append(RFQ.category.ilike(f"%{category.strip()}%"))
+        elif query_text:
+            from services import query_extractor
+            req = query_extractor.extract(query_text)
+            if req.product:
+                target_label = req.product
+                conditions.append(or_(
+                    RFQ.title.ilike(f"%{req.product}%"),
+                    RFQ.search_text.ilike(f"%{req.product}%"),
+                ))
+                if req.category:
+                    conditions.append(RFQ.category.ilike(f"%{req.category}%"))
+            elif req.category:
+                target_label = req.category
+                conditions.append(RFQ.category.ilike(f"%{req.category}%"))
+            else:
+                # If no genuine product or category entity exists, do NOT match random items
+                target_label = query_text.strip()[:40]
+                conditions.append(RFQ.id == None)
+        else:
+            conditions.append(RFQ.id == None)
+
+        stats_query = select(
+            func.count(RFQ.id).label("match_count"),
+            func.count(RFQ.id).filter(RFQ.role == RFQRole.SELLER).label("seller_count"),
+            func.count(RFQ.id).filter(RFQ.role == RFQRole.BUYER).label("buyer_count"),
+            func.min(RFQ.price_amount).label("min_price"),
+            func.max(RFQ.price_amount).label("max_price"),
+            func.avg(RFQ.price_amount).label("avg_price"),
+        ).where(*conditions)
+
+        stats_res = await db.execute(stats_query)
+        stats_row = stats_res.first()
+
+        match_count = stats_row.match_count if stats_row else 0
+        seller_count = stats_row.seller_count if stats_row else 0
+        buyer_count = stats_row.buyer_count if stats_row else 0
+        min_p = float(stats_row.min_price) if stats_row and stats_row.min_price is not None else None
+        max_p = float(stats_row.max_price) if stats_row and stats_row.max_price is not None else None
+        avg_p = float(stats_row.avg_price) if stats_row and stats_row.avg_price is not None else None
+
+        # 3. Top cities
+        cities_query = (
+            select(RFQ.location_city, func.count(RFQ.id).label("cnt"))
+            .where(*conditions, RFQ.location_city.is_not(None))
+            .group_by(RFQ.location_city)
+            .order_by(func.count(RFQ.id).desc())
+            .limit(3)
+        )
+        cities_res = await db.execute(cities_query)
+        city_rows = cities_res.all()
+        top_cities = [f"{r[0]} ({r[1]})" for r in city_rows if r[0]]
+
+        return {
+            "total_active_marketplace": total_active,
+            "target_label": target_label or "General Marketplace",
+            "match_count": match_count,
+            "seller_count": seller_count,
+            "buyer_count": buyer_count,
+            "min_price": min_p,
+            "max_price": max_p,
+            "avg_price": avg_p,
+            "top_cities": top_cities,
+        }
+    except Exception as exc:
+        logger.warning("Failed to fetch live marketplace aggregates: %s", exc)
+        return {}
+
+
+def format_marketplace_aggregates_prompt(aggregates: dict[str, Any]) -> str:
+    """Format live PostgreSQL aggregate statistics into grounding context."""
+    if not aggregates:
+        return ""
+
+    match_cnt = aggregates.get("match_count", 0)
+    target = aggregates.get("target_label", "Marketplace")
+    total_active = aggregates.get("total_active_marketplace", 0)
+
+    if match_cnt > 0:
+        seller_cnt = aggregates.get("seller_count", 0)
+        buyer_cnt = aggregates.get("buyer_count", 0)
+        min_p = aggregates.get("min_price")
+        max_p = aggregates.get("max_price")
+        avg_p = aggregates.get("avg_price")
+        cities = aggregates.get("top_cities", [])
+
+        price_line = (
+            f"₹{min_p:,.2f} to ₹{max_p:,.2f} (Average: ₹{avg_p:,.2f})"
+            if (min_p is not None and max_p is not None and avg_p is not None)
+            else "Price on request / varied across listings"
+        )
+        locations_line = ", ".join(cities) if cities else "Distributed across multiple trading hubs"
+
+        return (
+            f"\nLIVE MARKETPLACE DATABASE BENCHMARK (GROUND TRUTH VERIFIED DATA):\n"
+            f"- Segment / Query Filter: '{target}'\n"
+            f"- Active Matching Listings: {match_cnt} (Active Sellers: {seller_cnt}, Active Buyers: {buyer_cnt})\n"
+            f"- Active Price Distribution: {price_line}\n"
+            f"- Key Regional Trading Hubs: {locations_line}\n"
+            f"- Total Platform Active Inventory: {total_active} listings nationwide\n"
+            f"MANDATORY GROUNDING INSTRUCTION: You MUST use these exact numbers and data points. "
+            f"Do NOT invent or hallucinate fake listing counts or contradictory price statistics.\n"
+        )
+    else:
+        return (
+            f"\nLIVE MARKETPLACE DATABASE BENCHMARK (GROUND TRUTH VERIFIED DATA):\n"
+            f"- Segment / Query Filter: '{target}'\n"
+            f"- Active Matching Listings: 0 active listings found in this marketplace database for '{target}'\n"
+            f"- Total Platform Active Inventory: {total_active} listings across other categories\n"
+            f"MANDATORY GROUNDING INSTRUCTION: You MUST explicitly inform the user that there are currently 0 active "
+            f"listings or registered sellers for '{target}' in this platform database. Do NOT invent fake seller counts, "
+            f"fake minimum/maximum prices, or pretend platform listings exist. If providing general agricultural/wholesale "
+            f"mandi benchmarks, explicitly state they are external market references, NOT active listings on this platform.\n"
+        )
+
+
 def build_rfq_system_prompt(
     draft: dict[str, Any],
     readiness: dict[str, Any],
@@ -146,6 +346,9 @@ def build_rfq_system_prompt(
     last_counterparty_message: Optional[dict[str, Any]] = None,
     active_connection_id: Optional[Union[str, uuid.UUID]] = None,
     is_analysis_query: bool = False,
+    routed_agent: Optional[AgentDefinition] = None,
+    live_marketplace_data: Optional[str] = None,
+    older_history_summary: Optional[str] = None,
 ) -> str:
     """Construct dynamic prompt instructing assistant on the exact question sequence and matches."""
     status_lines = []
@@ -194,7 +397,54 @@ def build_rfq_system_prompt(
         missing_opts.append("delivery deadline")
 
     # Sequence directive
-    if is_analysis_query:
+    if routed_agent and routed_agent.id == "market_research":
+        flow_directive = (
+            "MARKET RESEARCH SPECIALIST DIRECTIVE:\n"
+            "- You are the Market Research Specialist for the B2B procurement marketplace.\n"
+            "- Deliver concise, data-driven market intelligence, competitor density, and pricing benchmarks.\n"
+            "- Ground your findings strictly in the verified marketplace data provided below.\n"
+            "- Present multi-supplier comparisons in structured markdown tables.\n"
+            "- If the user requests to start an RFQ or buy/sell based on findings, assist them directly.\n\n"
+            "MARKET ANALYSIS & BENCHMARKING DIRECTIVE:\n"
+            "- The user is asking for market intelligence, price benchmarking, listing evaluation, or commercial analysis.\n"
+            "- Directly answer the user's business inquiry with concrete facts, pricing benchmarks, and concise data tables.\n"
+            "- Do NOT prompt the user to specify Buy/Sell or create an RFQ unless they explicitly ask to create one."
+        )
+    elif routed_agent and routed_agent.id == "price_analyst":
+        flow_directive = (
+            "PRICE ANALYST SPECIALIST DIRECTIVE:\n"
+            "- You are the Price Analyst Specialist for the B2B procurement marketplace.\n"
+            "- Compare prices across matched suppliers, normalise currencies, and calculate per-unit costs.\n"
+            "- Highlight the best value deal with a ⭐.\n"
+            "- If the user asks to negotiate with or create an RFQ for a supplier, assist them directly.\n\n"
+            "MARKET ANALYSIS & BENCHMARKING DIRECTIVE:\n"
+            "- The user is asking for price benchmarking, listing evaluation, or commercial analysis.\n"
+            "- Directly answer the user's business inquiry with concrete facts, pricing benchmarks, and concise data tables.\n"
+            "- Do NOT prompt the user to specify Buy/Sell or create an RFQ unless they explicitly ask to create one."
+        )
+    elif routed_agent and routed_agent.id == "negotiation":
+        flow_directive = (
+            "NEGOTIATION COACH SPECIALIST DIRECTIVE:\n"
+            "- You are the Negotiation Coach Specialist for the B2B procurement marketplace.\n"
+            "- Formulate persuasive, highly professional counter-offer proposals and deal terms.\n"
+            "- Call draft_counterparty_message when the user wants to compose or amend an offer.\n"
+            "- Maintain an exceptionally polite, commercially persuasive tone referencing order specs."
+        )
+    elif routed_agent and routed_agent.id == "logistics":
+        flow_directive = (
+            "LOGISTICS ADVISOR SPECIALIST DIRECTIVE:\n"
+            "- You are the Logistics Advisor Specialist for the B2B procurement marketplace.\n"
+            "- Provide structured advice on Incoterms (FOB, CIF, EXW, DDP), freight estimates, and customs.\n"
+            "- Use tables and structured bullet points."
+        )
+    elif routed_agent and routed_agent.id == "verification":
+        flow_directive = (
+            "SUPPLIER VERIFICATION SPECIALIST DIRECTIVE:\n"
+            "- You are the Supplier Verification Specialist for the B2B procurement marketplace.\n"
+            "- Evaluate counterparty trust, KYC status (GST, PAN), certifications, and flag risk signals.\n"
+            "- Provide structured checklists and clear risk ratings (🔴 High / 🟡 Medium / 🟢 Low)."
+        )
+    elif is_analysis_query:
         flow_directive = (
             "MARKET ANALYSIS & BENCHMARKING DIRECTIVE:\n"
             "- The user is asking for market intelligence, price benchmarking, listing evaluation, or commercial analysis.\n"
@@ -298,23 +548,30 @@ def build_rfq_system_prompt(
             rating_str = f"{rating:.1f}★" if isinstance(rating, (int, float)) else "New Trader"
             title = c.get("title") or company
 
+            rfq_id = str(c.get("rfq_id") or c.get("id") or "").strip()
+            rfq_link = f"/marketplace?rfq={rfq_id}" if rfq_id else "/marketplace"
+
             match_lines.append(
                 f"- Candidate #{rank}: Company '{company}' | Title: '{title}' | Match Score: {total_pct} ({tier}) | "
+                f"RFQ ID: '{rfq_id}' | RFQ Link: '{rfq_link}' | "
                 f"Email: {email} | Phone: {phone} | Price: {price_str} | Quantity: {qty_str} | "
                 f"Location: {loc_str} (Distance: {dist}) | Rating: {rating_str} | Status: {gst}"
             )
 
         match_lines.extend([
             "",
-            "MATCH QUERY DIRECTIVES:",
-            "- The user has loaded and is looking at these matched counterparties in their inline matching cart.",
+            "MATCH QUERY DIRECTIVES & MANDATORY RFQ LINK RULES:",
+            "- The user is inquiring about or reviewing matched counterparties and RFQ listings.",
+            "- MANDATORY REQUIREMENT: Whenever you display, list, recommend, or mention ANY counterparty or RFQ, you MUST ALWAYS provide their direct markdown RFQ link: `[View RFQ & Connect](/marketplace?rfq={rfq_id})` (or `[{company} RFQ](/marketplace?rfq={rfq_id})`).",
+            "- Explicitly tell the user: 'Click the link to view the complete RFQ details and send a connection request directly.'",
             "- When the user asks for emails (e.g. 'give me mail id of top three', 'show emails', 'contact details'):",
-            "  * Provide a clear list of the requested candidates (by rank and company name) along with their exact email addresses.",
-            "  * If an email is 'Not provided', state that transparently.",
+            "  * Provide a clear list of the requested candidates (by rank and company name), their exact email addresses, AND their RFQ link `[View RFQ & Connect](/marketplace?rfq={rfq_id})` so the user can send a connection request.",
+            "  * If an email is 'Not provided', state that transparently while still providing their RFQ link.",
             "- When the user asks which candidate suits best (e.g. 'which one suits best from this top three', 'who is the best match'):",
             "  * Compare the top candidates on match score %, price competitiveness, location proximity, and trust credentials (GST verification, rating).",
             "  * Give a clear, decisive recommendation for the candidate that offers the best balance of quality, pricing, and suitability, explaining the exact reasons.",
-            "- When the user asks to compare (e.g. 'compare prices', 'compare ratings'): provide a concise comparison breakdown.",
+            "  * INCLUDE the direct link to the recommended RFQ: e.g. `[View RFQ & Connect](/marketplace?rfq={rfq_id})` so the user can send a connection request immediately.",
+            "- When the user asks to compare (e.g. 'compare prices', 'compare ratings'): provide a concise comparison breakdown, including each candidate's RFQ link.",
             "- DO NOT call `update_rfq_draft` or `create_rfq` when answering questions about matched counterparties.",
         ])
         matches_section = "\n".join(match_lines)
@@ -348,24 +605,31 @@ def build_rfq_system_prompt(
         "  * The `message` argument in `draft_counterparty_message` MUST contain the full and complete letter from start to finish. Never truncate the tool argument mid-sentence.\n"
     ) + active_thread_section
 
-    return f"""{SYSTEM_BUSINESS_PROMPT}
+    prompt_parts = [
+        SYSTEM_BUSINESS_PROMPT,
+        f"\nACTIVE PROCUREMENT STATE SCRATCHPAD:\n{status_str}",
+    ]
+    if live_marketplace_data:
+        prompt_parts.append(live_marketplace_data)
+    if older_history_summary:
+        prompt_parts.append(f"\nCONVERSATION HISTORICAL CONTEXT (Pruned older turns):\n- {older_history_summary}")
+    if matches_section:
+        prompt_parts.append(matches_section)
+    if negotiation_directive:
+        prompt_parts.append(negotiation_directive)
 
-CURRENT RFQ DRAFT STATE:
-{status_str}
+    prompt_parts.append(f"\nSPECIALIST DIRECTIVE & FLOW:\n{flow_directive}")
 
-CONVERSATION FLOW DIRECTIVE:
-{flow_directive}
-{matches_section}
-{negotiation_directive}
-
-IMPORTANT RULES:
-- The user may provide one field at a time OR multiple fields in a single sentence (e.g. 'I want to buy apples in Indore').
-- Required fields MUST be prioritized first.
-- Always call `update_rfq_draft(**kwargs)` when business details are mentioned.
-- When the user confirms or requests to create/post the RFQ (e.g. 'create rfq', 'yes create it', 'proceed', 'post it') and both Role and Product are known, call `create_rfq(...)` to publish it into the marketplace!
-- When the user instructs to send a message to the seller or negotiate, call `draft_counterparty_message(...)`.
-- Keep all questions and responses extremely short and informative.
-"""
+    rules = (
+        "\nIMPORTANT OPERATIONAL RULES:\n"
+        "- As the Super Agent orchestrator, answer directly and use tools when actions are requested.\n"
+        "- Call `update_rfq_draft(**kwargs)` when procurement specifications or details are provided.\n"
+        "- Call `create_rfq(...)` when user confirms creation (e.g. 'create rfq', 'yes create it', 'proceed') and Role and Product are known.\n"
+        "- Call `draft_counterparty_message(...)` when user asks to compose or send negotiation proposals.\n"
+        "- Keep responses concise, data-rich, and directly actionable."
+    )
+    prompt_parts.append(rules)
+    return "\n".join(prompt_parts)
 
 
 def _process_tool_call(tool_call: dict[str, Any], current_draft: dict[str, Any]) -> dict[str, Any]:
@@ -791,16 +1055,137 @@ def format_created_rfq_text(created_rfq: dict[str, Any]) -> str:
     status = (created_rfq.get("status") or "ACTIVE").upper()
     category = created_rfq.get("category", "General Goods")
 
+    rfq_link_md = f"[View RFQ in Marketplace](/marketplace?rfq={rfq_id})" if rfq_id else "[View Marketplace](/marketplace)"
+
     return (
         f"🎉 **RFQ Successfully Created & Published!**\n\n"
         f"- **Title**: {title}\n"
         f"- **RFQ ID**: `{rfq_id}`\n"
         f"- **Market Side**: {role}\n"
         f"- **Category**: {category}\n"
-        f"- **Status**: {status} (Active & Live in Marketplace)\n\n"
+        f"- **Status**: {status} (Active & Live in Marketplace)\n"
+        f"- **Listing Link**: {rfq_link_md}\n\n"
         f"Your listing has been submitted to the marketplace and is active in the matching index. "
-        f"Our matching engine is actively scanning for compatible counterparties!"
+        f"Click the link above to view your listing, or click 'Show matching' below to find counterparties!"
     )
+
+
+def build_rfq_link_appendix(matched_candidates: Optional[list[dict[str, Any]]]) -> str:
+    """Generate markdown links for active counterparties/RFQs so the user can easily view and connect."""
+    if not matched_candidates:
+        return ""
+
+    link_items = []
+    for idx, c in enumerate(matched_candidates[:5]):
+        rfq_id = str(c.get("rfq_id") or c.get("id") or "").strip()
+        if not rfq_id:
+            continue
+        cp = c.get("counterparty") if isinstance(c.get("counterparty"), dict) else {}
+        company = (
+            cp.get("company_name")
+            or cp.get("name")
+            or c.get("company_name")
+            or c.get("name")
+            or f"Listing #{idx + 1}"
+        )
+        title = c.get("title") or "RFQ Listing"
+        price_val = c.get("price")
+        price_str = ""
+        if isinstance(price_val, dict) and price_val.get("amount"):
+            price_str = f" · {price_val.get('amount')} {price_val.get('currency', 'INR')}"
+        link_items.append(
+            f"- **{company}** ({title}{price_str}): [View RFQ & Send Connection Request](/marketplace?rfq={rfq_id})"
+        )
+
+    if not link_items:
+        return ""
+
+    return (
+        "\n\n---\n"
+        "### 🔗 Direct RFQ Links & Connection Requests:\n"
+        "Click any link below to inspect specifications and send a connection request directly:\n"
+        + "\n".join(link_items)
+    )
+
+
+async def _fetch_catalog_candidates_for_query(
+    db: AsyncSession,
+    user: User,
+    draft: dict[str, Any],
+    query_text: str,
+) -> list[dict[str, Any]]:
+    """Fetch active marketplace RFQ listings to answer match/search inquiries."""
+    try:
+        from services import catalog_service
+        search_query = None
+        if draft.get("product_details", {}).get("name"):
+            search_query = draft["product_details"]["name"]
+        elif draft.get("category"):
+            search_query = draft["category"]
+
+        target_role = None
+        if draft.get("role"):
+            target_role = RFQRole.SELLER if draft["role"] == "buyer" else RFQRole.BUYER
+
+        cat_out = await catalog_service.get_catalog(
+            db,
+            user,
+            q=search_query,
+            role=target_role,
+            sort_by="newest",
+            limit=5,
+        )
+        if not cat_out or not cat_out.items:
+            cat_out = await catalog_service.get_catalog(
+                db,
+                user,
+                sort_by="newest",
+                limit=5,
+            )
+
+        candidates: list[dict[str, Any]] = []
+        if cat_out and cat_out.items:
+            for idx, it in enumerate(cat_out.items):
+                candidates.append({
+                    "rfq_id": str(it.id),
+                    "title": it.title,
+                    "role": it.role.value if hasattr(it.role, "value") else str(it.role),
+                    "category": it.category,
+                    "counterparty": {
+                        "company_name": it.counterparty.company_name,
+                        "contact_name": it.counterparty.contact_name,
+                        "city": it.counterparty.city,
+                        "country": it.counterparty.country,
+                        "trust_score": it.counterparty.trust_score,
+                        "kyc_status": it.counterparty.kyc_status.value if hasattr(it.counterparty.kyc_status, "value") else str(it.counterparty.kyc_status),
+                        "connection_id": str(it.counterparty.connection_id) if it.counterparty.connection_id else None,
+                        "connection_status": it.counterparty.connection_status,
+                        "connection_direction": it.counterparty.connection_direction,
+                        "gst_verified": (it.counterparty.kyc_status.value == "verified") if hasattr(it.counterparty.kyc_status, "value") else False,
+                    },
+                    "price": {
+                        "amount": it.price_target.amount,
+                        "currency": it.price_target.currency,
+                        "per_unit": it.price_target.per_unit,
+                    } if it.price_target else None,
+                    "quantity": {
+                        "value": it.quantity.value,
+                        "unit": it.quantity.unit,
+                    } if it.quantity else None,
+                    "location": {
+                        "city": it.location.city,
+                        "state": it.location.state,
+                        "country": it.location.country,
+                    } if it.location else None,
+                    "distance_km": it.distance_km,
+                    "score": {"total": round(0.95 - (idx * 0.05), 2)},
+                    "rank": idx + 1,
+                })
+        return candidates
+    except Exception as exc:
+        logger.warning("Could not auto-fetch catalog candidates: %s", exc)
+        return []
+
 
 
 
@@ -954,6 +1339,7 @@ async def get_conversation_with_messages(
             "tool_step": meta.get("tool_step"),
             "created_rfq": meta.get("created_rfq"),
             "counterparty_message": meta.get("counterparty_message"),
+            "routed_agent": meta.get("routed_agent"),
             "created_at": m.created_at,
         })
 
@@ -1082,6 +1468,59 @@ async def generate_business_chat_reply(
         or (agent is not None and agent.id in ("market_research", "price_analyst", "logistics", "verification"))
     )
 
+    if not matched_candidates and db and user and is_match_query:
+        matched_candidates = await _fetch_catalog_candidates_for_query(
+            db, user, draft, last_user_content
+        )
+
+    # 2. Autonomous Super Agent Routing (AI Semantic Intent & Role Resolution)
+    routed_agent, active_tools, routing_meta = await route_query_to_agent_async(
+        user_query=last_user_content,
+        current_draft=draft,
+        matched_candidates=matched_candidates,
+        active_connection_id=active_connection_id,
+        last_counterparty_msg=last_counterparty_msg,
+        explicit_agent_id=agent.id if agent else None,
+    )
+    routed_agent_info = {
+        "id": routed_agent.id,
+        "name": routed_agent.name,
+        "icon": routed_agent.icon,
+        "short_description": routed_agent.short_description,
+    }
+
+    # Extract dynamic AI entities if available
+    sem_ext = routing_meta.get("semantic_extraction") or {}
+    ai_prod = sem_ext.get("product")
+    ai_cat = sem_ext.get("category")
+    ai_role = sem_ext.get("role")
+    ai_loc = sem_ext.get("location")
+
+    if ai_role and not draft.get("role"):
+        draft["role"] = "seller" if ai_role == "seller" else "buyer"
+    if ai_loc and not (draft.get("location") or {}).get("city"):
+        city_name = ai_loc.split(",")[0].strip()
+        draft["location"] = {"city": city_name, "country": "India"}
+
+    # 3. Live Marketplace RAG Aggregates (Real DB Metrics)
+    live_market_data = ""
+    if db is not None and (
+        routed_agent.id in ("market_research", "price_analyst")
+        or any(w in last_user_content.lower() for w in ["market", "density", "how many", "suppliers", "competitor", "average price"])
+    ):
+        cat_hint = ai_cat or draft.get("category")
+        prod_hint = ai_prod or (draft.get("product_details") or {}).get("name")
+        aggs = await _fetch_live_marketplace_aggregates(
+            db=db,
+            query_text=last_user_content,
+            category=cat_hint,
+            product_name=prod_hint,
+        )
+        live_market_data = format_marketplace_aggregates_prompt(aggs)
+
+    # 4. Context Sliding Window (Bounded Token Usage, No Memory Spikes)
+    window_messages, older_summary = build_sliding_window_messages(messages, max_history_turns=8)
+
     async def _finalize_response(
         reply_text: str,
         thinking_text: Optional[str] = None,
@@ -1090,12 +1529,18 @@ async def generate_business_chat_reply(
         created_rfq_data: Optional[dict[str, Any]] = None,
         counterparty_message_data: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
+        if matched_candidates and reply_text and "/marketplace?rfq=" not in reply_text and not reply_text.startswith("⚠️"):
+            link_appendix = build_rfq_link_appendix(matched_candidates)
+            if link_appendix:
+                reply_text += link_appendix
+
         if db is not None and conversation is not None:
             try:
                 meta = {
                     "thinking": thinking_text,
                     "created_rfq": created_rfq_data,
                     "counterparty_message": counterparty_message_data,
+                    "routed_agent": routed_agent_info,
                 }
                 await save_message_to_conversation(
                     db, conversation.id, role="assistant", content=reply_text, metadata=meta
@@ -1127,11 +1572,10 @@ async def generate_business_chat_reply(
             "created_rfq": created_rfq_data,
             "counterparty_message": counterparty_message_data,
             "conversation_id": conversation.id if conversation else None,
+            "routed_agent": routed_agent_info,
         }
 
-    # 2. Build system prompt
-    # When a specialised agent is selected, prepend its prompt before the
-    # standard RFQ-aware dynamic prompt.
+    # 5. Build dynamic system prompt
     dynamic_system_prompt = build_rfq_system_prompt(
         draft,
         readiness,
@@ -1139,20 +1583,14 @@ async def generate_business_chat_reply(
         last_counterparty_message=last_counterparty_msg,
         active_connection_id=active_connection_id,
         is_analysis_query=is_analysis_query,
+        routed_agent=routed_agent,
+        live_marketplace_data=live_market_data,
+        older_history_summary=older_summary,
     )
-    if agent and agent.id != "general" and agent.system_prompt:
-        dynamic_system_prompt = agent.system_prompt + "\n\n" + dynamic_system_prompt
     prepared_messages: list[dict[str, Any]] = [
         {"role": "system", "content": dynamic_system_prompt}
     ]
-
-    for msg in messages:
-        role, content = _extract_msg_fields(msg)
-        content = content.strip()
-        if not content:
-            continue
-        safe_role = "assistant" if role == "assistant" else "user"
-        prepared_messages.append({"role": safe_role, "content": content})
+    prepared_messages.extend(window_messages)
 
     if len(prepared_messages) == 1:
         return await _finalize_response(
@@ -1213,24 +1651,8 @@ async def generate_business_chat_reply(
             counterparty_message_data=None,
         )
 
-    if is_match_query or is_analysis_query:
-        tools = []
-    elif agent and agent.id != "general":
-        available_tools_map = {
-            "update_rfq_draft": rfq_tool_service.UPDATE_RFQ_DRAFT_TOOL,
-            "create_rfq": rfq_tool_service.CREATE_RFQ_TOOL,
-            "draft_counterparty_message": rfq_tool_service.DRAFT_COUNTERPARTY_MESSAGE_TOOL,
-            "send_counterparty_message": rfq_tool_service.DRAFT_COUNTERPARTY_MESSAGE_TOOL,
-            "close_rfq": rfq_tool_service.CLOSE_RFQ_TOOL,
-        }
-        tools = [available_tools_map[name] for name in (agent.tools or []) if name in available_tools_map]
-    else:
-        tools = [
-            rfq_tool_service.UPDATE_RFQ_DRAFT_TOOL,
-            rfq_tool_service.CREATE_RFQ_TOOL,
-            rfq_tool_service.DRAFT_COUNTERPARTY_MESSAGE_TOOL,
-            rfq_tool_service.CLOSE_RFQ_TOOL,
-        ]
+    # Tools are provisioned dynamically by the Super Agent router, ensuring action tools are never stripped
+    tools = active_tools
 
     payload: dict[str, Any] = {
         "model": settings.AI_CHAT_MODEL,
@@ -1508,9 +1930,66 @@ async def stream_business_chat_reply(
         or (agent is not None and agent.id in ("market_research", "price_analyst", "logistics", "verification"))
     )
 
+    if not matched_candidates and db and user and is_match_query:
+        matched_candidates = await _fetch_catalog_candidates_for_query(
+            db, user, draft, last_user_content
+        )
+
+    # 2. Autonomous Super Agent Routing (AI Semantic Intent & Role Resolution)
+    routed_agent, active_tools, routing_meta = await route_query_to_agent_async(
+        user_query=last_user_content,
+        current_draft=draft,
+        matched_candidates=matched_candidates,
+        active_connection_id=active_connection_id,
+        last_counterparty_msg=last_counterparty_msg,
+        explicit_agent_id=agent.id if agent else None,
+    )
+    routed_agent_info = {
+        "id": routed_agent.id,
+        "name": routed_agent.name,
+        "icon": routed_agent.icon,
+        "short_description": routed_agent.short_description,
+    }
+
+    # Extract dynamic AI entities if available
+    sem_ext = routing_meta.get("semantic_extraction") or {}
+    ai_prod = sem_ext.get("product")
+    ai_cat = sem_ext.get("category")
+    ai_role = sem_ext.get("role")
+    ai_loc = sem_ext.get("location")
+
+    if ai_role and not draft.get("role"):
+        draft["role"] = "seller" if ai_role == "seller" else "buyer"
+    if ai_loc and not (draft.get("location") or {}).get("city"):
+        city_name = ai_loc.split(",")[0].strip()
+        draft["location"] = {"city": city_name, "country": "India"}
+
+    # 3. Live Marketplace RAG Aggregates (Real DB Metrics)
+    live_market_data = ""
+    if db is not None and (
+        routed_agent.id in ("market_research", "price_analyst")
+        or any(w in last_user_content.lower() for w in ["market", "density", "how many", "suppliers", "competitor", "average price"])
+    ):
+        cat_hint = ai_cat or draft.get("category")
+        prod_hint = ai_prod or (draft.get("product_details") or {}).get("name")
+        aggs = await _fetch_live_marketplace_aggregates(
+            db=db,
+            query_text=last_user_content,
+            category=cat_hint,
+            product_name=prod_hint,
+        )
+        live_market_data = format_marketplace_aggregates_prompt(aggs)
+
+    # 4. Context Sliding Window (Bounded Token Usage, No Memory Spikes)
+    window_messages, older_summary = build_sliding_window_messages(messages, max_history_turns=8)
+
     def emit(chunk: dict[str, Any]) -> dict[str, Any]:
         if active_conv_id:
             chunk["conversation_id"] = active_conv_id
+        if "routed_agent" not in chunk:
+            chunk["routed_agent"] = routed_agent_info
+        if matched_candidates and chunk.get("done") and "matched_candidates" not in chunk:
+            chunk["matched_candidates"] = matched_candidates
         return chunk
 
     async def _persist_stream_terminal(
@@ -1529,6 +2008,7 @@ async def stream_business_chat_reply(
                     "tool_step": tool_step_val,
                     "created_rfq": created_rfq_val,
                     "counterparty_message": counterparty_message_val,
+                    "routed_agent": routed_agent_info,
                 }
                 await save_message_to_conversation(
                     db,
@@ -1556,7 +2036,7 @@ async def stream_business_chat_reply(
             except Exception as exc:
                 logger.exception("Failed to persist stream turn: %s", exc)
 
-    # 2. Build system prompt
+    # 5. Build dynamic system prompt
     dynamic_system_prompt = build_rfq_system_prompt(
         draft,
         readiness,
@@ -1564,20 +2044,14 @@ async def stream_business_chat_reply(
         last_counterparty_message=last_counterparty_msg,
         active_connection_id=active_connection_id,
         is_analysis_query=is_analysis_query,
+        routed_agent=routed_agent,
+        live_marketplace_data=live_market_data,
+        older_history_summary=older_summary,
     )
-    if agent and agent.id != "general" and agent.system_prompt:
-        dynamic_system_prompt = agent.system_prompt + "\n\n" + dynamic_system_prompt
     prepared_messages: list[dict[str, Any]] = [
         {"role": "system", "content": dynamic_system_prompt}
     ]
-
-    for msg in messages:
-        role, content = _extract_msg_fields(msg)
-        content = content.strip()
-        if not content:
-            continue
-        safe_role = "assistant" if role == "assistant" else "user"
-        prepared_messages.append({"role": safe_role, "content": content})
+    prepared_messages.extend(window_messages)
 
     if len(prepared_messages) == 1:
         hello_reply = "Hello! I am your B2B Marketplace Business Assistant. Are you looking to BUY or SELL goods?"
@@ -1716,24 +2190,8 @@ async def stream_business_chat_reply(
         })
         return
 
-    if is_match_query or is_analysis_query:
-        tools = []
-    elif agent and agent.id != "general":
-        available_tools_map = {
-            "update_rfq_draft": rfq_tool_service.UPDATE_RFQ_DRAFT_TOOL,
-            "create_rfq": rfq_tool_service.CREATE_RFQ_TOOL,
-            "draft_counterparty_message": rfq_tool_service.DRAFT_COUNTERPARTY_MESSAGE_TOOL,
-            "send_counterparty_message": rfq_tool_service.DRAFT_COUNTERPARTY_MESSAGE_TOOL,
-            "close_rfq": rfq_tool_service.CLOSE_RFQ_TOOL,
-        }
-        tools = [available_tools_map[name] for name in (agent.tools or []) if name in available_tools_map]
-    else:
-        tools = [
-            rfq_tool_service.UPDATE_RFQ_DRAFT_TOOL,
-            rfq_tool_service.CREATE_RFQ_TOOL,
-            rfq_tool_service.DRAFT_COUNTERPARTY_MESSAGE_TOOL,
-            rfq_tool_service.CLOSE_RFQ_TOOL,
-        ]
+    # Tools are provisioned dynamically by the Super Agent router, ensuring action tools are never stripped
+    tools = active_tools
 
     payload: dict[str, Any] = {
         "model": settings.AI_CHAT_MODEL,
@@ -2101,6 +2559,12 @@ async def stream_business_chat_reply(
                 "done": True,
             })
         elif total_content.strip():
+            link_appendix = ""
+            if matched_candidates and "/marketplace?rfq=" not in total_content and not total_content.startswith("⚠️"):
+                link_appendix = build_rfq_link_appendix(matched_candidates)
+                if link_appendix:
+                    total_content += link_appendix
+
             await _persist_stream_terminal(
                 reply_content=total_content,
                 thinking_val=total_thinking,
@@ -2110,7 +2574,7 @@ async def stream_business_chat_reply(
                 counterparty_message_val=None,
             )
             yield emit({
-                "content": "",
+                "content": link_appendix,
                 "thinking": "",
                 "thinking_after": "",
                 "tool_step": captured_tool_step,

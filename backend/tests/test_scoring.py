@@ -389,3 +389,39 @@ def test_estimate_logistics_cross_border():
     assert res["customs_required"] is True
     assert "International" in res["label"]
 
+
+# --- four pillars matching enhancements --------------------------------------
+
+
+def test_key_to_value_inversion_organic():
+    """Buyer specifies type: organic and seller specifies organic: True -> 100% match."""
+    assert ms.attribute_score({"type": "organic"}, {"organic": True}) == 1.0
+    assert ms.attribute_score({"type": "organic"}, {"is_organic": True}) == 1.0
+    assert ms.attribute_score({"organic": True}, {"type": "organic"}) == 1.0
+
+
+def test_dimensional_length_conversion_2cm_vs_20mm():
+    """2cm and 20mm are mathematically equal -> 100% match."""
+    assert ms.attribute_score({"length": "2cm"}, {"length": "20mm"}) == 1.0
+    assert ms.attribute_score({"dia": "20mm"}, {"thickness": "2cm"}) == 1.0
+    assert (
+        ms.attribute_score(
+            {"size": {"value": 2, "unit": "cm"}},
+            {"size": {"value": 20, "unit": "mm"}},
+        )
+        == 1.0
+    )
+
+
+def test_key_synonyms_material_fabric():
+    """material: cotton vs fabric: cotton -> 100% match."""
+    assert ms.attribute_score({"material": "cotton"}, {"fabric": "cotton"}) == 1.0
+
+
+def test_custom_user_weights_in_blend():
+    """Blend respects user-provided custom priority weights."""
+    custom = {"relevance": 0.50, "location": 0.50}
+    scores = {"relevance": 1.0, "location": 0.5}
+    assert ms.blend(scores, weights=custom) == 0.75
+
+

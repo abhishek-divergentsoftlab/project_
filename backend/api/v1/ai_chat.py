@@ -143,6 +143,7 @@ async def chat_message(
         created_rfq=result.get("created_rfq"),
         counterparty_message=result.get("counterparty_message"),
         conversation_id=result.get("conversation_id"),
+        routed_agent=result.get("routed_agent"),
     )
 
 

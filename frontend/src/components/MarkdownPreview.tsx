@@ -1,4 +1,5 @@
 import { Fragment, useMemo, type ReactNode } from "react";
+import { Link } from "react-router-dom";
 
 interface MarkdownPreviewProps {
   content: string;
@@ -46,6 +47,13 @@ function renderInline(text: string): ReactNode {
       // Only permit safe http, https or relative links
       const isSafeUrl = /^https?:\/\//i.test(linkUrl) || linkUrl.startsWith("/") || linkUrl.startsWith("#");
       if (isSafeUrl) {
+        if (linkUrl.startsWith("/") || linkUrl.startsWith("#")) {
+          return (
+            <Link key={index} to={linkUrl} className="md-link">
+              {linkText}
+            </Link>
+          );
+        }
         return (
           <a key={index} href={linkUrl} target="_blank" rel="noopener noreferrer" className="md-link">
             {linkText}

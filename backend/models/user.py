@@ -11,7 +11,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Optional
 
 from sqlalchemy import DateTime, Enum, ForeignKey, Index, Integer, Numeric, String, text
-from sqlalchemy.dialects.postgresql import UUID as PGUUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -117,5 +117,6 @@ class UserProfile(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     trust_score: Mapped[int] = mapped_column(Integer, nullable=False, default=20, server_default="20")
     average_rating: Mapped[Optional[Decimal]] = mapped_column(Numeric(3, 2), nullable=True, default=None)
     total_reviews: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    matching_preferences: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True, default=None)
 
     user: Mapped["User"] = relationship(back_populates="profile")

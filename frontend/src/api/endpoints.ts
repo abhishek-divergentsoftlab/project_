@@ -378,6 +378,7 @@ export interface AIChatResponse {
   created_rfq?: AICreatedRFQ | null;
   counterparty_message?: AICounterpartyMessage | null;
   conversation_id?: string | null;
+  routed_agent?: AgentInfo | null;
 }
 
 export interface AIToolStep {
@@ -397,6 +398,8 @@ export interface AIChatChunk {
   created_rfq?: AICreatedRFQ | null;
   counterparty_message?: AICounterpartyMessage | null;
   conversation_id?: string | null;
+  matched_candidates?: MatchCandidate[] | null;
+  routed_agent?: AgentInfo | null;
   done: boolean;
 }
 
@@ -420,6 +423,7 @@ export interface AIConversationMessage {
   tool_step?: AIToolStep | null;
   created_rfq?: AICreatedRFQ | null;
   counterparty_message?: AICounterpartyMessage | null;
+  routed_agent?: AgentInfo | null;
   created_at: string;
 }
 
@@ -594,6 +598,10 @@ export const marketplace = {
   },
   async getCategories(): Promise<CategoryCount[]> {
     const { data } = await api.get<CategoryCount[]>("/marketplace/categories");
+    return data;
+  },
+  async getListing(rfqId: string): Promise<CatalogItem> {
+    const { data } = await api.get<CatalogItem>(`/marketplace/catalog/${rfqId}`);
     return data;
   },
 };

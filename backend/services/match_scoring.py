@@ -541,6 +541,11 @@ def _value_similarity(wanted: Any, offered: Any) -> float:
     if isinstance(wanted, bool) or isinstance(offered, bool):
         return 1.0 if bool(wanted) == bool(offered) else 0.0
 
+    # Physical dimensional measurement comparison (e.g. 2cm vs 20mm -> 1.0, 1 tonne vs 1000kg -> 1.0)
+    meas_sim = unit_converter.compare_measurements(wanted, None, offered, None)
+    if meas_sim is not None:
+        return meas_sim
+
     if (
         isinstance(wanted, dict) and isinstance(offered, dict)
         and "value" in wanted and "value" in offered
@@ -570,15 +575,79 @@ def _value_similarity(wanted: Any, offered: Any) -> float:
     return _semantic_text_similarity(w_str, o_str)
 
 
+# Synonymous attribute keys across different industry conventions.
+_KEY_SYNONYMS: dict[str, frozenset[str]] = {
+    "type": frozenset({"type", "variety", "grade", "kind", "category", "farming_type", "quality", "nature", "spec"}),
+    "grade": frozenset({"grade", "type", "quality", "standard", "alloy", "steel_grade", "purity"}),
+    "material": frozenset({"material", "fabric", "composition", "alloy", "metal", "fiber", "cloth", "substance"}),
+    "port": frozenset({"port", "connector", "interface", "plug", "socket", "connection"}),
+    "dia": frozenset({"dia", "diameter", "thickness", "gauge", "width", "od", "id", "size"}),
+    "thickness": frozenset({"thickness", "dia", "diameter", "gauge", "depth", "width"}),
+    "length": frozenset({"length", "len", "bar_len", "span", "dimension"}),
+    "finish": frozenset({"finish", "coating", "treatment", "surface", "plating"}),
+    "color": frozenset({"color", "colour", "shade", "hue", "tint"}),
+}
+
+
+def _find_best_attribute_match(wanted_key: str, wanted_val: Any, offered: dict[str, Any]) -> tuple[float, bool]:
+    """Finds best matching attribute in offered dict, supporting:
+    1. Direct key match (e.g., {"color": "black"} vs {"color": "black"})
+    2. Key-to-Value Inversion (e.g., {"type": "organic"} vs {"organic": True})
+    3. Key Synonyms (e.g., {"material": "cotton"} vs {"fabric": "cotton"})
+    4. Cross-Measurement Match (e.g. {"dia": "20mm"} vs {"thickness": "2cm"})
+
+    Returns (score: float, found: bool).
+    """
+    wk_clean = wanted_key.strip().lower()
+
+    # 1. Direct key match
+    if wanted_key in offered and offered[wanted_key] not in (None, ""):
+        return _value_similarity(wanted_val, offered[wanted_key]), True
+    for k in offered:
+        if k.strip().lower() == wk_clean and offered[k] not in (None, ""):
+            return _value_similarity(wanted_val, offered[k]), True
+
+    # 2. Key-to-Value Inversion:
+    # Case A: Requester wanted string value (e.g. type: "organic") and counterparty has boolean key (e.g. organic: True)
+    if isinstance(wanted_val, str) and wanted_val.strip():
+        val_clean = wanted_val.strip().lower()
+        for ok, ov in offered.items():
+            ok_clean = ok.strip().lower()
+            if ok_clean == val_clean or val_clean in ok_clean or ok_clean.endswith(f"_{val_clean}"):
+                if isinstance(ov, bool) and ov:
+                    return 1.0, True
+                if str(ov).strip().lower() in ("true", "yes", "1", "certified", val_clean):
+                    return 1.0, True
+
+    # Case B: Requester specified boolean (e.g. organic: True) and counterparty has string value (e.g. type: "organic")
+    if isinstance(wanted_val, bool) and wanted_val:
+        for ok, ov in offered.items():
+            if isinstance(ov, str) and ov.strip().lower() in (wk_clean, f"is_{wk_clean}"):
+                return 1.0, True
+
+    # 3. Key Synonym Resolution
+    synonyms = _KEY_SYNONYMS.get(wk_clean, frozenset())
+    for ok, ov in offered.items():
+        ok_clean = ok.strip().lower()
+        if ok_clean in synonyms:
+            sim = _value_similarity(wanted_val, ov)
+            if sim >= 0.70:
+                return sim, True
+
+    # 4. Cross-Measurement Match
+    # If wanted_val is a measurement, check if any offered measurement in the same dimension matches
+    if unit_converter.parse_measurement(wanted_val) is not None:
+        for ok, ov in offered.items():
+            meas_sim = unit_converter.compare_measurements(wanted_val, None, ov, None)
+            if meas_sim is not None and meas_sim >= 0.70:
+                return meas_sim, True
+
+    return 0.5, False
+
+
 # Suffix the UI appends to flag an attribute for heavier matching weight.
 _MUST_MATCH_SUFFIX = "__must_match"
-
-# Must-match attributes count this many times more than regular ones.
 _MUST_MATCH_WEIGHT = 3.0
-
-# When a candidate does not mention a must-match attribute at all, it gets this
-# score instead of the normal 0.5 — silence is more suspect when the requester
-# explicitly flagged the attribute.
 _MUST_MATCH_MISSING = 0.15
 
 
@@ -587,14 +656,8 @@ def attribute_score(
 ) -> Optional[float]:
     """How well the candidate satisfies the attributes the requester named.
 
-    A candidate that declares the attribute and differs scores zero for it. One
-    that never mentions it scores a half: silence is not a contradiction, but it
-    is not a confirmation either, so it should not outrank a stated match.
-
-    Attributes flagged with a sibling ``<key>__must_match`` key in the
-    requester's product_details carry 3× weight and a harsher missing-value
-    penalty, so the weighted average shifts towards what the requester cares
-    about most.
+    Supports Key-to-Value Inversion, Key Synonym Graphs, and Multi-Dimensional
+    Unit Normalization (e.g. 2cm vs 20mm -> 1.0).
     """
     # Collect which attributes the requester flagged as critical.
     must_match_keys: set[str] = set()
@@ -628,10 +691,9 @@ def attribute_score(
         is_must = key in must_match_keys
         weight = _MUST_MATCH_WEIGHT if is_must else 1.0
 
-        if key not in offered_clean or offered_clean[key] in (None, ""):
+        score, found = _find_best_attribute_match(key, value, offered_clean)
+        if not found:
             score = _MUST_MATCH_MISSING if is_must else 0.5
-        else:
-            score = _value_similarity(value, offered_clean[key])
 
         total += weight * score
         weight_sum += weight
@@ -838,13 +900,20 @@ def deadline_score(
     return max(0.0, 1.0 - shortfall_days / 14)
 
 
-def blend(scores: dict[str, Optional[float]]) -> float:
-    """Weighted mean over the dimensions that could actually be evaluated."""
+def blend(
+    scores: dict[str, Optional[float]],
+    weights: Optional[dict[str, float]] = None,
+) -> float:
+    """Weighted mean over the dimensions that could actually be evaluated.
+
+    Supports custom dynamic weights passed from user profile preferences.
+    """
+    active_weights = weights or WEIGHTS
     total = weight_sum = 0.0
     for dimension, value in scores.items():
         if value is None:
             continue
-        weight = WEIGHTS.get(dimension, 0.0)
+        weight = active_weights.get(dimension, WEIGHTS.get(dimension, 0.0))
         total += weight * value
         weight_sum += weight
     if weight_sum == 0:

@@ -13,6 +13,19 @@ export interface TokenPair {
   expires_in: number;
 }
 
+export interface MatchingPreferences {
+  preset?: "quality_first" | "price_first" | "fast_delivery" | "balanced" | "custom";
+  weights?: {
+    relevance?: number;
+    attributes?: number;
+    price?: number;
+    quantity?: number;
+    location?: number;
+    deadline?: number;
+    category?: number;
+  };
+}
+
 export interface Profile {
   name: string;
   company_name: string | null;
@@ -33,6 +46,7 @@ export interface Profile {
   signatory_name?: string | null;
   kyc_status?: KYCStatus;
   trust_score?: number;
+  matching_preferences?: MatchingPreferences | null;
 }
 
 export interface User {

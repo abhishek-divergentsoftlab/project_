@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 from decimal import Decimal
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_serializer
 
@@ -33,6 +33,7 @@ class ProfileUpdate(BaseModel):
     website: Optional[str] = Field(default=None, max_length=255)
     pan_number: Optional[str] = Field(default=None, max_length=20)
     signatory_name: Optional[str] = Field(default=None, max_length=120)
+    matching_preferences: Optional[dict[str, Any]] = Field(default=None)
 
 
 class AccountUpdate(BaseModel):
@@ -69,6 +70,7 @@ class ProfileOut(BaseModel):
     signatory_name: Optional[str] = None
     kyc_status: KYCStatus = KYCStatus.UNVERIFIED
     trust_score: int = 20
+    matching_preferences: Optional[dict[str, Any]] = None
 
     @field_serializer("latitude", "longitude")
     def _serialise_coord(self, value: Optional[Decimal]) -> int | float | None:

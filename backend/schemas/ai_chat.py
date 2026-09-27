@@ -51,6 +51,7 @@ class AIChatResponse(BaseModel):
     created_rfq: Optional[dict[str, Any]] = None
     counterparty_message: Optional[dict[str, Any]] = None
     conversation_id: Optional[uuid.UUID] = None
+    routed_agent: Optional[dict[str, Any]] = None
 
 
 class AIConversationSummary(BaseModel):
@@ -73,6 +74,7 @@ class AIConversationMessage(BaseModel):
     tool_step: Optional[dict[str, Any]] = None
     created_rfq: Optional[dict[str, Any]] = None
     counterparty_message: Optional[dict[str, Any]] = None
+    routed_agent: Optional[dict[str, Any]] = None
     created_at: datetime
 
 

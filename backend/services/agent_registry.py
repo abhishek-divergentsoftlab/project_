@@ -58,8 +58,7 @@ WHEN ANSWERING:
 4. Flag opportunities: "Only 3 sellers offer X in Y region — low competition"
 
 SCOPE: Market intelligence, product research, competitive analysis, pricing benchmarks, and buyer/seller listing evaluation.
-If the query is not about market research, business intelligence, or listing analysis:
-Respond with ONLY: "I specialise in market research. Try the general Business AI for other queries."
+Address the market data directly. If related commercial actions (like drafting an RFQ) are requested, integrate your market findings smoothly.
 """,
     tools=[],
     suggested_prompts=[
@@ -105,8 +104,7 @@ ALWAYS call `update_rfq_draft` when the user provides any business detail.
 When the user confirms, call `create_rfq` to publish.
 
 SCOPE: RFQ creation, product specification, trade terms.
-If the query is not about creating or editing RFQs:
-Respond with ONLY: "I specialise in RFQ drafting. Try the general Business AI for other queries."
+Prioritize capturing clean product specifications and commercial terms while assisting the user naturally.
 """,
     tools=["update_rfq_draft", "create_rfq"],
     suggested_prompts=[
@@ -152,8 +150,7 @@ WHEN COMPOSING MESSAGES:
 - Call `draft_counterparty_message` to prepare the message draft for user review and approval
 
 SCOPE: Negotiation strategy, message composition, deal terms.
-If the query is not about negotiation or deal-making:
-Respond with ONLY: "I specialise in negotiation. Try the general Business AI for other queries."
+Provide clear, actionable negotiation tactics and compose professional messages for the counterparty.
 """,
     tools=["draft_counterparty_message", "send_counterparty_message", "update_rfq_draft"],
     suggested_prompts=[
@@ -200,8 +197,7 @@ PRICE EVALUATION CRITERIA:
 - Trust premium (verified suppliers may command higher prices legitimately)
 
 SCOPE: Price analysis, cost comparison, value assessment, and market condition benchmarking.
-If the query is not about pricing, cost analysis, or market benchmarking:
-Respond with ONLY: "I specialise in price analysis. Try the general Business AI for other queries."
+Provide concrete mathematical comparisons, per-unit economics, and deal evaluations.
 """,
     tools=[],
     suggested_prompts=[
@@ -248,8 +244,7 @@ ALWAYS provide:
 5. Risk factors to watch for
 
 SCOPE: Logistics, shipping, Incoterms, customs, freight.
-If the query is not about logistics or shipping:
-Respond with ONLY: "I specialise in logistics. Try the general Business AI for other queries."
+Provide clear, structured logistics guidance, shipping mode comparisons, and compliance advice.
 """,
     tools=[],
     suggested_prompts=[
@@ -301,8 +296,7 @@ ALWAYS provide:
 4. Recommendation: proceed / proceed with caution / avoid
 
 SCOPE: Supplier verification, due diligence, trust assessment.
-If the query is not about verification or due diligence:
-Respond with ONLY: "I specialise in supplier verification. Try the general Business AI for other queries."
+Provide structured risk ratings, credibility audits, and actionable KYC checklists.
 """,
     tools=[],
     suggested_prompts=[
@@ -313,15 +307,15 @@ Respond with ONLY: "I specialise in supplier verification. Try the general Busin
     ],
 )
 
-# The general-purpose assistant — this is the default (no agent_id selected)
+# The general-purpose Super Agent — orchestrates all specialized domains
 GENERAL_ASSISTANT = AgentDefinition(
     id="general",
-    name="Business AI",
+    name="Business AI Super Agent",
     icon="✨",
-    description="Your all-purpose B2B business assistant. Helps with RFQs, negotiations, pricing, logistics, and marketplace questions.",
-    short_description="General business assistant",
-    system_prompt="",  # Uses the existing SYSTEM_BUSINESS_PROMPT
-    tools=["update_rfq_draft", "create_rfq", "draft_counterparty_message", "send_counterparty_message"],
+    description="Autonomous B2B Super Agent. Orchestrates market research, RFQ drafting, price comparison, supplier negotiations, logistics, and verification.",
+    short_description="Autonomous B2B Super Agent",
+    system_prompt="",  # Uses the unified Super Agent dynamic prompt
+    tools=["update_rfq_draft", "create_rfq", "draft_counterparty_message", "send_counterparty_message", "close_rfq"],
     suggested_prompts=[
         {"label": "🍎 Buy apples in Indore", "prompt": "I want to buy apple in Indore"},
         {"label": "📦 Source corrugated boxes", "prompt": "I want to buy 500 corrugated boxes"},
