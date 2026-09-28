@@ -64,7 +64,10 @@ class Connection(Base, UUIDPrimaryKeyMixin, TimestampMixin):
 
 class ConnectionMessage(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     __tablename__ = "connection_messages"
-    __table_args__ = (Index("ix_connection_messages_connection_created", "connection_id", "created_at"),)
+    __table_args__ = (
+        Index("ix_connection_messages_connection_created", "connection_id", "created_at"),
+        Index("ix_connection_messages_sender_id", "sender_id"),
+    )
 
     connection_id: Mapped[uuid.UUID] = mapped_column(
         PGUUID(as_uuid=True),

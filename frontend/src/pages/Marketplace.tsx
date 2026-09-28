@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 
 import { errorMessage } from "@/api/client";
@@ -13,7 +13,7 @@ import {
   IconSparkles,
 } from "@/components/icons";
 import { Modal } from "@/components/ui/Modal";
-import { MarketplaceMap } from "@/components/map/MarketplaceMap";
+import { MarketplaceMap } from "@/components/map/lazy";
 import { useAuth } from "@/context/useAuth";
 import { useFeedback } from "@/context/useFeedback";
 import { formatShortDate, formatDate } from "@/utils/format";
@@ -117,17 +117,9 @@ export function Marketplace() {
   // Sidebar filter toggle for mobile
   const [showFiltersMobile, setShowFiltersMobile] = useState(false);
 
-  // Load categories and saved count summary on mount
+  // Load saved count summary on mount
   useEffect(() => {
     let cancelled = false;
-    async function loadCats() {
-      try {
-        const data = await marketApi.getCategories();
-        if (!cancelled) setCategories(data);
-      } catch (err) {
-        console.error("Failed to load categories", err);
-      }
-    }
     async function loadSavedCount() {
       try {
         const ids = await rfqApi.getSavedIds();
@@ -136,16 +128,34 @@ export function Marketplace() {
         // silent fallback
       }
     }
-    void loadCats();
     void loadSavedCount();
     return () => {
       cancelled = true;
     };
   }, []);
 
-  // Fetch catalog items
+  // Stale-response guard. Typing "cable" fires several debounced searches; a
+  // slow early one ("ca") used to land last and overwrite the newer results.
+  // Every fresh search bumps the generation and aborts the previous request;
+  // "load more" joins the current generation, so a new search discards it too.
+  const catalogGenerationRef = useRef(0);
+  const catalogAbortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => () => catalogAbortRef.current?.abort(), []);
+
+  // Fetch catalog items and matching category facets
   const loadCatalog = useCallback(
     async (offset = 0, append = false) => {
+      if (!append) {
+        catalogAbortRef.current?.abort();
+        catalogAbortRef.current = new AbortController();
+        catalogGenerationRef.current += 1;
+      }
+      const generation = catalogGenerationRef.current;
+      const controller = catalogAbortRef.current ?? new AbortController();
+      const isCurrent = () =>
+        generation === catalogGenerationRef.current && !controller.signal.aborted;
+
       if (append) setLoadingMore(true);
       else setLoading(true);
       setError(null);
@@ -168,19 +178,41 @@ export function Marketplace() {
         lon: user?.profile?.longitude ? Number(user.profile.longitude) : undefined,
       };
 
+      const catParams: Partial<CatalogFilterParams> = {
+        q: searchQuery.trim() || undefined,
+        city: locationQuery.trim() || undefined,
+        min_price: minPrice ? Number(minPrice) : undefined,
+        max_price: maxPrice ? Number(maxPrice) : undefined,
+        currency: currency || undefined,
+        verified_only: verifiedOnly ? true : undefined,
+        saved_only: savedOnly ? true : undefined,
+      };
+
       try {
-        const res = await marketApi.getCatalog(params);
-        if (append) {
-          setItems((prev) => [...prev, ...res.items]);
-        } else {
+        if (!append) {
+          const [res, cats] = await Promise.all([
+            marketApi.getCatalog(params, controller.signal),
+            marketApi.getCategories(catParams, controller.signal),
+          ]);
+          if (!isCurrent()) return;
           setItems(res.items);
+          setTotal(res.total);
+          setCategories(cats);
+        } else {
+          const res = await marketApi.getCatalog(params, controller.signal);
+          if (!isCurrent()) return;
+          setItems((prev) => [...prev, ...res.items]);
+          setTotal(res.total);
         }
-        setTotal(res.total);
       } catch (err) {
+        // Aborted/superseded requests are expected, not errors.
+        if (!isCurrent()) return;
         setError(errorMessage(err, "Could not load marketplace catalog"));
       } finally {
-        setLoading(false);
-        setLoadingMore(false);
+        if (generation === catalogGenerationRef.current) {
+          if (append) setLoadingMore(false);
+          else if (!controller.signal.aborted) setLoading(false);
+        }
       }
     },
     [
@@ -475,6 +507,20 @@ export function Marketplace() {
               </button>
             );
           })}
+          {selectedCategory &&
+            !categories.some(
+              (c) => c.category.trim().toLowerCase() === selectedCategory.trim().toLowerCase(),
+            ) && (
+              <button
+                type="button"
+                aria-pressed={true}
+                className="cat-pill-btn selected"
+                onClick={() => setSelectedCategory("")}
+              >
+                <span className="cat-name">{selectedCategory}</span>
+                <span className="cat-count">0</span>
+              </button>
+            )}
         </div>
       </div>
 

@@ -47,3 +47,22 @@ async def get_current_user(
 
 
 CurrentUser = Annotated[User, Depends(get_current_user)]
+
+
+async def get_optional_current_user(
+    db: DbSession,
+    credentials: Annotated[
+        HTTPAuthorizationCredentials | None, Depends(bearer_scheme)
+    ] = None,
+) -> User | None:
+    if credentials is None:
+        return None
+    try:
+        payload = decode_token(credentials.credentials, expected_type="access")
+        user_id = uuid.UUID(payload["sub"])
+    except (TokenError, ValueError, KeyError):
+        return None
+    return await auth_service.get_user(db, user_id)
+
+
+CurrentUserOptional = Annotated[User | None, Depends(get_optional_current_user)]

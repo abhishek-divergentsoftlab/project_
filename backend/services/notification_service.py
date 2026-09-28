@@ -124,6 +124,136 @@ async def notify_quotation_accepted(
     )
 
 
+async def notify_connection_rejected(
+    db: AsyncSession, *, sender_id: UUID, rejecter_name: str, connection_id: UUID
+) -> None:
+    """A connection request was declined."""
+    await create_notification(
+        db,
+        user_id=sender_id,
+        type="connection_rejected",
+        title="Connection Declined",
+        body=f"{rejecter_name} declined your connection request",
+        link=f"/messages?connection={connection_id}",
+    )
+
+
+async def notify_escrow_funded(
+    db: AsyncSession, *, seller_id: UUID, connection_id: UUID, currency: str, amount: Any
+) -> None:
+    """The buyer deposited the order value into escrow."""
+    await create_notification(
+        db,
+        user_id=seller_id,
+        type="escrow_funded",
+        title="Escrow Funded",
+        body=f"The buyer deposited {currency} {amount:,.2f} into escrow for your order",
+        link=f"/messages?connection={connection_id}",
+    )
+
+
+async def notify_milestone_release_requested(
+    db: AsyncSession, *, buyer_id: UUID, connection_id: UUID, milestone_title: str
+) -> None:
+    """The seller asked the buyer to release a milestone."""
+    await create_notification(
+        db,
+        user_id=buyer_id,
+        type="escrow_release_requested",
+        title="Milestone Release Requested",
+        body=f"The supplier requested release of '{milestone_title}'",
+        link=f"/messages?connection={connection_id}",
+    )
+
+
+async def notify_escrow_released(
+    db: AsyncSession, *, seller_id: UUID, connection_id: UUID, currency: str, amount: Any, milestone_title: str
+) -> None:
+    """The buyer released a milestone payment to the seller."""
+    await create_notification(
+        db,
+        user_id=seller_id,
+        type="escrow_released",
+        title="Escrow Payment Released",
+        body=f"{currency} {amount:,.2f} released for '{milestone_title}'",
+        link=f"/messages?connection={connection_id}",
+    )
+
+
+async def notify_dispute_raised(
+    db: AsyncSession, *, user_id: UUID, connection_id: UUID, dispute_title: str
+) -> None:
+    """A formal dispute was opened against this user's deal."""
+    await create_notification(
+        db,
+        user_id=user_id,
+        type="dispute_raised",
+        title="Formal Dispute Opened",
+        body=f"A dispute was opened: '{dispute_title}'. Escrow releases are frozen.",
+        link=f"/messages?connection={connection_id}",
+    )
+
+
+async def notify_dispute_resolved(
+    db: AsyncSession, *, user_id: UUID, connection_id: UUID, dispute_title: str, resolution: str
+) -> None:
+    """A dispute on this user's deal was resolved."""
+    await create_notification(
+        db,
+        user_id=user_id,
+        type="dispute_resolved",
+        title="Dispute Resolved",
+        body=f"Dispute '{dispute_title}' resolved: {resolution.replace('_', ' ')}",
+        link=f"/messages?connection={connection_id}",
+    )
+
+
+async def notify_shipment_dispatched(
+    db: AsyncSession, *, buyer_id: UUID, connection_id: UUID, carrier_name: str, tracking_number: str
+) -> None:
+    """The seller dispatched the order."""
+    await create_notification(
+        db,
+        user_id=buyer_id,
+        type="shipment_dispatched",
+        title="Order Dispatched",
+        body=f"Your order was dispatched with {carrier_name} (tracking {tracking_number})",
+        link=f"/messages?connection={connection_id}",
+    )
+
+
+async def notify_shipment_delivered(
+    db: AsyncSession, *, seller_id: UUID, connection_id: UUID, tracking_number: str
+) -> None:
+    """The buyer confirmed delivery of the shipment."""
+    await create_notification(
+        db,
+        user_id=seller_id,
+        type="shipment_delivered",
+        title="Delivery Confirmed",
+        body=f"The buyer confirmed delivery of shipment {tracking_number}",
+        link=f"/messages?connection={connection_id}",
+    )
+
+
+async def notify_safely(db: AsyncSession, notifier: Any, /, **kwargs: Any) -> None:
+    """Run one ``notify_*`` helper and commit, never failing the caller.
+
+    Notifications are a side channel: the business event has already been
+    committed, so a failure here is logged and rolled back rather than turned
+    into an error response.
+    """
+    try:
+        await notifier(db, **kwargs)
+        await db.commit()
+    except Exception:  # noqa: BLE001
+        logger.warning("Notification %s failed (non-fatal)", getattr(notifier, "__name__", notifier), exc_info=True)
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Query
 # ---------------------------------------------------------------------------

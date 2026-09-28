@@ -8,7 +8,7 @@ from api.deps import CurrentUser, DbSession
 from schemas.quotation import QuotationOut
 from schemas.review import ReviewCreate, ReviewOut, UserReviewStatsOut
 from services import quotation_service, review_service
-from services.review_service import ReviewError
+from services.review_service import ReviewError, ReviewNotFoundError
 
 router = APIRouter()
 
@@ -125,7 +125,13 @@ async def list_quote_reviews(
     current_user: CurrentUser,
     db: DbSession,
 ) -> list[ReviewOut]:
-    return await review_service.list_quote_reviews(db, connection_id=connection_id, quote_id=quote_id)
+    """Only the two parties to the quotation may read its reviews (404 otherwise)."""
+    try:
+        return await review_service.list_quote_reviews(
+            db, connection_id=connection_id, quote_id=quote_id, viewer_id=current_user.id
+        )
+    except ReviewNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
 
 
 @router.get(
@@ -135,6 +141,11 @@ async def list_quote_reviews(
 )
 async def get_user_reviews(
     user_id: uuid.UUID,
+    current_user: CurrentUser,
     db: DbSession,
 ) -> UserReviewStatsOut:
-    return await review_service.get_user_review_stats(db, user_id)
+    """Requires login; 404 for an unknown user id."""
+    try:
+        return await review_service.get_user_review_stats(db, user_id)
+    except ReviewNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc

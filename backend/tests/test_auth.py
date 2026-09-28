@@ -172,12 +172,20 @@ async def test_a_partial_profile_update_leaves_other_fields_alone(make_actor):
     assert profile["city"] == "Pune"
 
 
-async def test_an_account_can_switch_which_side_it_posts_on(make_actor):
+async def test_an_account_can_switch_which_side_it_posts_on(make_actor, db):
     """Signing up to buy should not mean opening a second account to sell."""
     from tests.conftest import rfq_body
+    from sqlalchemy import text
 
     actor = await make_actor("buyer")
     assert (await actor.post("/rfqs", json=rfq_body("seller"))).status_code == 422
+
+    # Verify KYC so role switch to seller is permitted
+    await db.execute(
+        text("UPDATE user_profiles SET kyc_status = 'verified' WHERE user_id = :u"),
+        {"u": actor.id},
+    )
+    await db.commit()
 
     changed = await actor.patch("/users/me", json={"role": "both"})
     assert changed.status_code == 200

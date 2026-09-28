@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -11,20 +12,40 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from models.connection import Connection
-from models.enums import ConnectionStatus, QuotationStatus, RFQRole
+from models.enums import ConnectionStatus, QuotationStatus, RFQRole, RFQStatus
 from models.quotation import Quotation
 from models.rfq import RFQ
 from models.user import User
 from schemas.quotation import QuotationCreate, QuotationOut
-from services import currency
 from services.websocket_manager import ws_manager
 
+logger = logging.getLogger(__name__)
+
+# A quote in any of these states is a live order: while one exists on a
+# connection, no other quote may be created or accepted there (one PO per deal).
+ACTIVE_ORDER_STATUSES = (
+    QuotationStatus.ACCEPTED,
+    QuotationStatus.DISPATCHED,
+    QuotationStatus.DELIVERED,
+)
 
 
 async def _get_accepted_connection(
-    db: AsyncSession, connection_id: uuid.UUID, user_id: uuid.UUID
+    db: AsyncSession, connection_id: uuid.UUID, user_id: uuid.UUID, *, lock: bool = False
 ) -> Connection:
-    conn = await db.get(Connection, connection_id)
+    if lock:
+        # Serializes quote creation/acceptance on one connection, so two
+        # concurrent requests cannot both pass the "no live order" check.
+        conn = (
+            await db.execute(
+                select(Connection)
+                .where(Connection.id == connection_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalars().first()
+    else:
+        conn = await db.get(Connection, connection_id)
     if conn is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Connection not found")
     if user_id not in (conn.sender_id, conn.receiver_id):
@@ -37,6 +58,37 @@ async def _get_accepted_connection(
         )
     return conn
 
+
+async def _ensure_no_live_order(
+    db: AsyncSession, connection_id: uuid.UUID, exclude_id: Optional[uuid.UUID] = None
+) -> None:
+    stmt = select(Quotation.quote_number, Quotation.status).where(
+        Quotation.connection_id == connection_id,
+        Quotation.status.in_(ACTIVE_ORDER_STATUSES),
+    )
+    if exclude_id is not None:
+        stmt = stmt.where(Quotation.id != exclude_id)
+    live = (await db.execute(stmt.limit(1))).first()
+    if live is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Quotation {live.quote_number} is already {live.status.value} on this deal; "
+            "complete or close that order before issuing another",
+        )
+
+
+async def _ensure_rfq_open(db: AsyncSession, rfq_id: uuid.UUID) -> RFQ:
+    rfq = await db.get(RFQ, rfq_id)
+    if rfq is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "RFQ not found")
+    expired = rfq.expires_at is not None and rfq.expires_at < datetime.now(UTC)
+    if rfq.status is not RFQStatus.ACTIVE or expired:
+        state = "expired" if expired else rfq.status.value
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"This listing is {state}; quotations can no longer be issued on it",
+        )
+    return rfq
 
 
 def to_out(quote: Quotation, viewer_id: uuid.UUID) -> QuotationOut:
@@ -72,7 +124,9 @@ async def create_quotation(
     user_id: uuid.UUID,
     payload: QuotationCreate,
 ) -> Quotation:
-    conn = await _get_accepted_connection(db, connection_id, user_id)
+    conn = await _get_accepted_connection(db, connection_id, user_id, lock=True)
+    await _ensure_rfq_open(db, conn.rfq_id)
+    await _ensure_no_live_order(db, connection_id)
 
     receiver_id = conn.receiver_id if conn.sender_id == user_id else conn.sender_id
 
@@ -95,7 +149,7 @@ async def create_quotation(
 
     valid_days = payload.valid_days or 14
     valid_until = datetime.now(UTC) + timedelta(days=valid_days)
-    total_amount = Decimal(str(round(payload.unit_price * payload.quantity, 4)))
+    total_amount = (payload.unit_price * payload.quantity).quantize(Decimal("0.0001"))
 
     quote = Quotation(
         connection_id=connection_id,
@@ -106,7 +160,7 @@ async def create_quotation(
         version=next_version,
         status=QuotationStatus.PENDING,
         unit_price=payload.unit_price,
-        currency=currency.normalize_currency(payload.currency) or payload.currency.upper(),
+        currency=payload.currency,
         quantity=payload.quantity,
         quantity_unit=payload.quantity_unit,
         total_amount=total_amount,
@@ -147,7 +201,8 @@ async def create_quotation(
         )
         await db.commit()
     except Exception:
-        pass
+        logger.warning("Quotation notification failed (non-fatal)", exc_info=True)
+        await db.rollback()
 
     return quote
 
@@ -170,9 +225,9 @@ async def list_quotations(
 async def accept_quotation(
     db: AsyncSession, connection_id: uuid.UUID, quote_id: uuid.UUID, user_id: uuid.UUID
 ) -> Quotation:
-    await _get_accepted_connection(db, connection_id, user_id)
+    await _get_accepted_connection(db, connection_id, user_id, lock=True)
 
-    quote = await db.get(Quotation, quote_id)
+    quote = await db.get(Quotation, quote_id, populate_existing=True)
     if quote is None or quote.connection_id != connection_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Quotation not found")
 
@@ -180,6 +235,8 @@ async def accept_quotation(
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST, "You cannot accept your own quotation"
         )
+
+    await _ensure_no_live_order(db, connection_id, exclude_id=quote.id)
 
     if quote.status is not QuotationStatus.PENDING:
         raise HTTPException(
@@ -225,7 +282,8 @@ async def accept_quotation(
         )
         await db.commit()
     except Exception:
-        pass
+        logger.warning("Quotation-accepted notification failed (non-fatal)", exc_info=True)
+        await db.rollback()
 
     return quote
 
@@ -281,6 +339,7 @@ async def get_quote_documents_context(
         QuotationStatus.ACCEPTED,
         QuotationStatus.DISPATCHED,
         QuotationStatus.DELIVERED,
+        QuotationStatus.RECEIVED,
         QuotationStatus.COMPLETED,
     }
     if quote.status not in allowed_statuses:

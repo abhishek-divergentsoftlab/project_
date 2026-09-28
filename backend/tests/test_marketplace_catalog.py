@@ -134,3 +134,78 @@ async def test_marketplace_single_listing_and_link(make_actor):
     assert listing["category"] == "Industrial"
     assert listing["counterparty"]["company_name"] is not None
 
+
+async def test_marketplace_search_rice_precision_and_category_count_alignment(make_actor):
+    seller1 = await make_actor("seller")
+    seller2 = await make_actor("seller")
+    buyer = await make_actor("buyer")
+
+    # Seller 1 creates non-rice listing with target price (search_text contains 'Target price:')
+    chair_rfq = (
+        await seller1.post(
+            "/rfqs",
+            json=rfq_body(
+                role="seller",
+                category="Furniture",
+                title="Ergonomic High-Back Executive Office Chair",
+                status="active",
+                price=(150.0, "INR", "pcs"),
+            ),
+        )
+    ).json()
+
+    # Seller 2 creates genuine Basmati Rice listing
+    rice_rfq = (
+        await seller2.post(
+            "/rfqs",
+            json=rfq_body(
+                role="seller",
+                category="Agriculture",
+                title="Premium Traditional Basmati Rice 1121",
+                status="active",
+                price=(80.0, "INR", "kg"),
+            ),
+        )
+    ).json()
+
+    # 1. Search for "rice" must ONLY return the rice listing, NOT the chair
+    search_res = (await buyer.get("/marketplace/catalog?q=rice")).json()
+    assert search_res["total"] == 1
+    assert len(search_res["items"]) == 1
+    assert search_res["items"][0]["id"] == rice_rfq["id"]
+    assert all(item["id"] != chair_rfq["id"] for item in search_res["items"])
+
+    # 2. Category summary for "rice" must only show Agriculture, not Furniture
+    cat_res = (await buyer.get("/marketplace/categories?q=rice")).json()
+    agri_cat = next((c for c in cat_res if c["category"] == "Agriculture"), None)
+    assert agri_cat is not None
+    assert agri_cat["total_count"] == 1
+    assert not any(c["category"] == "Furniture" for c in cat_res)
+
+    # 3. Viewer exclusion alignment: Buyer creates their own Agriculture rice RFQ
+    buyer_own_rfq = (
+        await buyer.post(
+            "/rfqs",
+            json=rfq_body(
+                role="buyer",
+                category="Agriculture",
+                title="Need 50 Tons Basmati Rice",
+                status="active",
+                price=(75.0, "INR", "kg"),
+            ),
+        )
+    ).json()
+
+    # Buyer must not see their own RFQ in catalog
+    buyer_catalog = (await buyer.get("/marketplace/catalog?q=rice")).json()
+    assert buyer_catalog["total"] == 1
+    assert all(item["id"] != buyer_own_rfq["id"] for item in buyer_catalog["items"])
+
+    # Buyer's category count must match their catalog count (1, not 2)
+    buyer_cats = (await buyer.get("/marketplace/categories?q=rice")).json()
+    buyer_agri = next((c for c in buyer_cats if c["category"] == "Agriculture"), None)
+    assert buyer_agri is not None
+    assert buyer_agri["total_count"] == 1
+    assert buyer_agri["total_count"] == buyer_catalog["total"]
+
+

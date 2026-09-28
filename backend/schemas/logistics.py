@@ -5,7 +5,25 @@ from decimal import Decimal
 from typing import Any, Optional
 import uuid
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from models.enums import ShipmentStatus, ShippingMode
+
+# Storage bounds: shipments.weight_kg is Numeric(12, 3) and volume_cbm is
+# Numeric(10, 3); keep inputs well inside them so oversize values are a 422.
+MAX_WEIGHT_KG = Decimal("10000000")  # 10,000 tonnes
+MAX_VOLUME_CBM = Decimal("1000000")
+MAX_DIMENSION_CM = Decimal("100000")
+MAX_CARGO_VALUE = Decimal("100000000000000")
+
+
+def _validate_currency_code(value: str) -> str:
+    from services import currency as currency_service
+
+    code = currency_service.normalize_currency(value)
+    if not code or code not in currency_service.RATES:
+        raise ValueError(f"Unsupported currency '{value}'")
+    return code
 
 
 class TrackingEventOut(BaseModel):
@@ -81,16 +99,21 @@ class FreightEstimateRequest(BaseModel):
     origin_country: str = Field(default="India")
     destination_city: Optional[str] = Field(default=None)
     destination_country: str = Field(default="India")
-    weight_kg: Decimal = Field(..., gt=0)
-    gross_weight_kg: Optional[Decimal] = Field(default=None, gt=0)
-    volume_cbm: Optional[Decimal] = Field(default=None, ge=0)
-    cbm: Optional[Decimal] = Field(default=None, ge=0)
-    length_cm: Optional[Decimal] = Field(default=None, ge=0)
-    width_cm: Optional[Decimal] = Field(default=None, ge=0)
-    height_cm: Optional[Decimal] = Field(default=None, ge=0)
-    cargo_value: Optional[Decimal] = Field(default=None, ge=0)
+    weight_kg: Decimal = Field(..., gt=0, le=MAX_WEIGHT_KG, allow_inf_nan=False)
+    gross_weight_kg: Optional[Decimal] = Field(default=None, gt=0, le=MAX_WEIGHT_KG, allow_inf_nan=False)
+    volume_cbm: Optional[Decimal] = Field(default=None, ge=0, le=MAX_VOLUME_CBM, allow_inf_nan=False)
+    cbm: Optional[Decimal] = Field(default=None, ge=0, le=MAX_VOLUME_CBM, allow_inf_nan=False)
+    length_cm: Optional[Decimal] = Field(default=None, ge=0, le=MAX_DIMENSION_CM, allow_inf_nan=False)
+    width_cm: Optional[Decimal] = Field(default=None, ge=0, le=MAX_DIMENSION_CM, allow_inf_nan=False)
+    height_cm: Optional[Decimal] = Field(default=None, ge=0, le=MAX_DIMENSION_CM, allow_inf_nan=False)
+    cargo_value: Optional[Decimal] = Field(default=None, ge=0, le=MAX_CARGO_VALUE, allow_inf_nan=False)
     currency: str = Field(default="USD", max_length=3)
-    incoterm: Optional[str] = Field(default="FOB")
+    incoterm: Optional[str] = Field(default="FOB", max_length=16)
+
+    @field_validator("currency")
+    @classmethod
+    def _supported_currency(cls, value: str) -> str:
+        return _validate_currency_code(value)
 
     @model_validator(mode="before")
     @classmethod
@@ -148,24 +171,24 @@ class FreightEstimateResponse(BaseModel):
 class ShipmentCreatePayload(BaseModel):
     carrier_name: str = Field(..., min_length=1, max_length=120)
     carrier_service: Optional[str] = Field(default=None, max_length=120)
-    shipping_mode: str = Field(default="road")
+    shipping_mode: ShippingMode = Field(default=ShippingMode.ROAD)
     tracking_number: Optional[str] = Field(default=None, max_length=64)
     bill_of_lading_number: Optional[str] = Field(default=None, max_length=100)
-    origin_address: Optional[str] = None
-    origin_city: Optional[str] = None
-    origin_country: Optional[str] = None
-    destination_address: Optional[str] = None
-    destination_city: Optional[str] = None
-    destination_country: Optional[str] = None
-    weight_kg: Optional[Decimal] = Field(default=None, ge=0)
-    gross_weight_kg: Optional[Decimal] = Field(default=None, ge=0)
-    volume_cbm: Optional[Decimal] = Field(default=None, ge=0)
-    cbm: Optional[Decimal] = Field(default=None, ge=0)
-    package_count: int = Field(default=1, ge=1)
-    packages_count: Optional[int] = Field(default=None, ge=1)
+    origin_address: Optional[str] = Field(default=None, max_length=1000)
+    origin_city: Optional[str] = Field(default=None, max_length=120)
+    origin_country: Optional[str] = Field(default=None, max_length=120)
+    destination_address: Optional[str] = Field(default=None, max_length=1000)
+    destination_city: Optional[str] = Field(default=None, max_length=120)
+    destination_country: Optional[str] = Field(default=None, max_length=120)
+    weight_kg: Optional[Decimal] = Field(default=None, gt=0, le=MAX_WEIGHT_KG, allow_inf_nan=False)
+    gross_weight_kg: Optional[Decimal] = Field(default=None, gt=0, le=MAX_WEIGHT_KG, allow_inf_nan=False)
+    volume_cbm: Optional[Decimal] = Field(default=None, ge=0, le=MAX_VOLUME_CBM, allow_inf_nan=False)
+    cbm: Optional[Decimal] = Field(default=None, ge=0, le=MAX_VOLUME_CBM, allow_inf_nan=False)
+    package_count: int = Field(default=1, ge=1, le=1_000_000)
+    packages_count: Optional[int] = Field(default=None, ge=1, le=1_000_000)
     package_type: str = Field(default="Boxes", max_length=60)
     estimated_delivery_days: Optional[int] = Field(default=5, ge=1, le=120)
-    dispatch_note: Optional[str] = None
+    dispatch_note: Optional[str] = Field(default=None, max_length=2000)
     trigger_escrow_milestone: bool = True
 
     @model_validator(mode="before")
@@ -190,9 +213,10 @@ class ShipmentCreatePayload(BaseModel):
 
 
 class ShipmentStatusUpdatePayload(BaseModel):
-    status: str = Field(..., max_length=32)
+    # Enum, not free text; transitions are checked (forward only) in the service.
+    status: ShipmentStatus
     location: str = Field(..., max_length=120)
-    note: Optional[str] = None
+    note: Optional[str] = Field(default=None, max_length=2000)
 
 
 class ShipmentOut(BaseModel):

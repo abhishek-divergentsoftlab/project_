@@ -438,6 +438,9 @@ def preprocess_message_to_rfq(
     if (
         not message
         or not config.auto_preprocess
+        # "what are common payment terms" asks for advice; it states no requirement.
+        or (is_question(message) and query_extractor.detect_role(message) is None)
+        or check_close_rfq_intent(message)
         or check_create_rfq_intent(message)
         or check_match_query_intent(message)
         or check_analysis_query_intent(message)
@@ -453,9 +456,11 @@ def preprocess_message_to_rfq(
     req = query_extractor.extract(message)
     extracted_kwargs: dict[str, Any] = {}
 
-    # Extract role
-    if req.role:
-        extracted_kwargs["role"] = req.role.value
+    # Extract role: only one the user stated. req.role defaults to BUYER, which
+    # would reset a seller's draft on every message.
+    stated_role = query_extractor.detect_role(message)
+    if stated_role:
+        extracted_kwargs["role"] = stated_role.value
 
     # Extract product and category (filtering out pure role phrases and prepositions)
     if req.product:
@@ -613,35 +618,94 @@ def evaluate_rfq_readiness(
 # =============================================================================
 # RFQ Creation Intent and Payload Builder
 # =============================================================================
+_CREATE_VERB = r"(?:create|crate|creat|craete|cerate|creste|make|post|submit|publish|generate|raise|rais|raize|riase)"
+
 CREATE_INTENT_REGEXES = [
     re.compile(p, re.IGNORECASE)
     for p in [
-        r"\b(create|crate|creat|craete|cerate|creste|make|post|submit|publish|generate)\s+(the\s+|this\s+|an?\s+|my\s+)?rfq\b",
+        rf"\b{_CREATE_VERB}\s+(the\s+|this\s+|an?\s+|my\s+|that\s+)?(rfq|listing)\b",
         r"\b(create|crate|creat|craete|cerate|creste)\s+(it|this)\b",
-        r"\b(please\s+)?(create|crate|creat|craete|cerate)\b",
-        r"\byes\s*,?\s*(please\s*)?(create|crate|creat|craete|cerate)\b",
-        r"\bproceed\s+(to\s+)?(create|crate|creat|craete|cerate)\b",
-        r"\bproceed\s+with\s+((creating|crating)\s+)?(the\s+|this\s+)?rfq\b",
-        r"\bproceed\b",
-        r"\bpost\s+(the\s+|this\s+|an?\s+)?rfq\b",
-        r"\bpost\s+(it|this)\b",
-        r"\bsubmit\s+(the\s+|this\s+|an?\s+)?rfq\b",
-        r"\bsubmit\s+(it|this)\b",
-        r"\bpublish\s+(the\s+|this\s+|an?\s+)?rfq\b",
-        r"\bpublish\s+(it|this)\b",
+        r"\byes\s*,?\s*(please\s*)?(create|crate|creat|craete|cerate|publish|post|submit)\b",
+        r"\bproceed\s+(to\s+|and\s+)?(create|crate|creat|craete|cerate|publish|post|submit)\b",
+        r"\bproceed\s+with\s+((creating|crating|publishing)\s+)?(the\s+|this\s+|my\s+)?(rfq|listing)\b",
+        r"\b(post|submit|publish)\s+(it|this)\b",
         r"\bconfirm\s+and\s+(create|crate|creat|publish|submit)\b",
-        r"\bgo\s+ahead\s+and\s+(create|crate|creat|publish|submit)\b",
-        r"^(yes|create|crate|creat|proceed|publish|submit)(\s+rfq)?$",
+        r"\bgo\s+ahead\s+and\s+(create|crate|creat|publish|submit|post)\b",
+        r"^(yes|create|crate|creat|proceed|publish|submit)(\s+(the\s+)?rfq)?[.!]*$",
+        # "raise the rfq", "rais the rfq", "raise it"
+        r"\b(raise|rais|raize|riase|rise)\s+(the\s+|this\s+|an?\s+|my\s+)?(rfq|listing|request|it)\b",
+        # Hinglish: "rfq bana do", "haan bana do", "publish kar do", "create kar do"
+        r"\b(rfq|listing)\s+(bana|banao|banado|bana\s*do|bana\s+dijiye|bana\s+dena|create\s+kar|publish\s+kar|post\s+kar|daal|dal)\b",
+        r"\b(bana|banao)\s+(do|de|dijiye|dena)\b",
+        r"\bbanado\b",
+        r"\b(create|publish|post|submit|raise|live|upload)\s+kar\s*(do|de|dijiye|dena|dain|den)\b",
+        r"\b(create|publish|post|submit)\s+kardo\b",
     ]
 ]
 
+# "don't create", "not ready to proceed", "rfq mat banao", "abhi nahi".
+_CREATE_NEGATION_RE = re.compile(
+    r"\b(don'?t|dont|do\s+not|does\s+not|didn'?t|not|never|no\s+need|without|hold\s+off|stop|avoid|"
+    r"mat|nahi|nahin|nai)\b",
+    re.IGNORECASE,
+)
+# A polite request phrased as a question still asks for the action.
+_CREATE_REQUEST_QUESTION_RE = re.compile(
+    rf"^\s*(please\s+)?(can|could|would|will)\s+(you|u)\s+(please\s+)?(now\s+)?{_CREATE_VERB}\b"
+    r"|^\s*kya\s+(aap|ap|tum)\b.*\b(bana|create|publish|post)\b.*\b(sakte|sakti|sakoge|doge|denge|do)\b",
+    re.IGNORECASE,
+)
+_QUESTION_START_RE = re.compile(
+    r"^\s*(how|what|why|when|where|which|who|whom|whose|should|shall|is|are|am|was|were|do|does|did|"
+    r"can\s+i|could\s+i|may\s+i|would\s+it|will\s+it|is\s+it|kya|kaise|kyun|kab)\b",
+    re.IGNORECASE,
+)
+_BARE_AFFIRMATIVE_RE = re.compile(
+    r"^\s*(yes|yeah|yep|yup|ok|okay|sure|haan|han|ha|ji|ji\s+haan|confirm|confirmed|go\s+ahead|do\s+it)\s*[.!]*\s*$",
+    re.IGNORECASE,
+)
+_NON_RFQ_OBJECT_RE = re.compile(
+    r"\b(message|msg|mail|email|letter|note|reply|description|table|summary|list|chart|report)\b", re.IGNORECASE
+)
+_ASKED_TO_CREATE_RE = re.compile(r"\b(create|publish|post|submit|raise)\b", re.IGNORECASE)
 
-def check_create_rfq_intent(user_message: str) -> bool:
-    """Check if the user message expresses intent to finalize/create the RFQ."""
+
+def is_question(user_message: str) -> bool:
+    """True for an interrogative message ("should I publish it?", "how do I ...")."""
+    text = (user_message or "").strip()
+    return bool(text) and (text.endswith("?") or bool(_QUESTION_START_RE.search(text)))
+
+
+def is_negated_request(user_message: str) -> bool:
+    return bool(_CREATE_NEGATION_RE.search(user_message or ""))
+
+
+def check_create_rfq_intent(user_message: str, previous_assistant: Optional[str] = None) -> bool:
+    """True only for an explicit request to publish the RFQ now.
+
+    Negated ("don't create the rfq yet", "I am not ready to proceed") and
+    questioning ("should I publish it or wait?", "how do I create a good
+    description?") messages never count, apart from polite requests such as
+    "can you create the rfq?". A bare "yes"/"haan" counts only when the previous
+    assistant turn offered to create or publish (when that turn is known).
+    """
     if not user_message:
         return False
     text = user_message.strip()
+    if _CREATE_NEGATION_RE.search(text):
+        return False
+    if is_question(text) and not _CREATE_REQUEST_QUESTION_RE.search(text):
+        return False
+    if previous_assistant is not None and _BARE_AFFIRMATIVE_RE.match(text):
+        return bool(_ASKED_TO_CREATE_RE.search(previous_assistant))
+    # "create a message for the seller", "message bana do": the object is not the RFQ.
+    if _NON_RFQ_OBJECT_RE.search(text) and not re.search(r"\b(rfq|listing)\b", text, re.IGNORECASE):
+        return False
     return any(rx.search(text) for rx in CREATE_INTENT_REGEXES)
+
+
+def is_bare_affirmative(user_message: str) -> bool:
+    return bool(_BARE_AFFIRMATIVE_RE.match(user_message or ""))
 
 
 MATCH_QUERY_INTENT_REGEXES = [
@@ -662,6 +726,14 @@ MATCH_QUERY_INTENT_REGEXES = [
         r"\b(link|links|url|urls)\s+(of|for|to)\s+(the\s+|any\s+)?(rfqs?|listings?|counterparties?|suppliers?|buyers?|candidates?)\b",
         r"\b(show|give|provide|send)\s+.*(rfq|rfqs|listing|listings)\b",
         r"\b(connection\s+requests?|connect\s+to|connect\s+with)\b",
+        # "show me sellers of basmati rice", "find us buyers for cotton"
+        r"\b(view|show|display|list|find|give|get|browse|search|recommend|suggest)\s+(me\s+|us\s+)?(the\s+|any\s+|all\s+|some\s+|a\s+few\s+|top\s+)?(rfqs?|listings?|matches|suppliers?|buyers?|sellers?|vendors?|manufacturers?|dealers?|counterparties?)\b",
+        # "who sells basmati rice?", "who is buying cotton"
+        r"\bwho\s+(sells|supplies|stocks|manufactures|makes|exports|deals\s+in|buys|imports|is\s+(selling|supplying|buying)|are\s+(selling|supplying|buying)|can\s+(supply|sell|provide))\b",
+        r"\b(any|are\s+there\s+(any)?)\s+(sellers?|suppliers?|buyers?|vendors?|manufacturers?)\s+(of|for|selling|supplying|buying)\b",
+        # Hinglish: "koi supplier hai basmati ka?", "supplier chahiye"
+        r"\b(koi|kaun|kon|kaunsa|konsa)\s+(sa\s+)?(supplier|seller|vendor|buyer|dealer|manufacturer|wholesaler)s?\b",
+        r"\b(supplier|seller|dealer|vendor|buyer)s?\s+(chahiye|batao|bataiye|milega|milenge|dikhao|dikhaiye)\b",
     ]
 ]
 
@@ -701,15 +773,22 @@ def check_analysis_query_intent(user_message: str) -> bool:
     return any(rx.search(text) for rx in ANALYSIS_QUERY_INTENT_REGEXES)
 
 
+_CLOSE_VERB = r"(?:close|closed|closing|cancel|cancell?ing|deactivate|remove|delete|withdraw|take\s+down|shut\s+down|unpublish|band\s+kar)"
+_CLOSE_OBJECT = r"(?:rfqs?|listings?|postings?|posts?|requirements?|orders?|requests?)"
+
 CLOSE_RFQ_INTENT_REGEXES = [
     re.compile(p, re.IGNORECASE)
     for p in [
-        r"\b(close|closed|closing|cancel|cancelling|deactivate|remove)\s+(this|the|my|active|current)?\s*rfq\b",
-        r"^(close|cancel|deactivate)(\s+this)?\s*rfq?$",
-        r"\bclose\s+(the\s+)?(deal|listing|request|rfq)\b",
-        r"\b(please\s+)?close\s+(this\s+|the\s+)?(rfq|listing|posting)\b",
+        # "close my cotton rfq", "cancel the order", "shut down that listing I posted"
+        rf"\b{_CLOSE_VERB}\s+(?:(?:this|the|my|our|that|active|current)\s+)?(?:[\w-]+\s+){{0,3}}?{_CLOSE_OBJECT}\b",
+        r"^(close|cancel|deactivate|remove)(\s+this)?(\s+rfq)?[.!]*$",
+        # Hinglish: "rfq band kar do", "listing hata do"
+        rf"\b{_CLOSE_OBJECT}\s+(band|hata|hatao|cancel|close)\s*(kar|karo|kardo|do|de|dijiye)?\b",
     ]
 ]
+
+# "close the deal" is negotiation, not closing a listing.
+_CLOSE_DEAL_RE = re.compile(r"\bclos(e|ing)\s+(the\s+|this\s+|a\s+)?deal\b", re.IGNORECASE)
 
 
 def check_close_rfq_intent(user_message: str) -> bool:
@@ -717,34 +796,65 @@ def check_close_rfq_intent(user_message: str) -> bool:
     if not user_message:
         return False
     text = user_message.strip()
+    if _CLOSE_DEAL_RE.search(text) and not re.search(r"\b(rfq|listing)\b", text, re.IGNORECASE):
+        return False
+    if _CREATE_NEGATION_RE.search(text):
+        return False
+    if is_question(text) and not re.match(
+        rf"^\s*(please\s+)?(can|could|would|will)\s+(you|u)\s+(please\s+)?{_CLOSE_VERB}\b", text, re.IGNORECASE
+    ):
+        return False
     return any(rx.search(text) for rx in CLOSE_RFQ_INTENT_REGEXES)
 
+
+_CP_TARGET = r"(seller|supplier|buyer|counterparty|vendor|them|him|her|user|that\s+user|this\s+user|counter\s+user)s?"
 
 COUNTERPARTY_MESSAGE_INTENT_REGEXES = [
     re.compile(p, re.IGNORECASE)
     for p in [
         # Negotiation keywords and typos: negotiate, nagitiation, nagotiation, natotiation, natogiation, draft, negociate, bargain, deal
-        r"\b(send|write|drop|deliver|draft|compose|prepare)\s+(a\s+)?(nagitiation|nagotiation|natotiation|natogiation|negotiation|bargain|counter|offer|proposal|deal|discount)?\s*(message|msg|text|note|email|mail)?\s*(to|for)\s+(the\s+)?(seller|supplier|buyer|counterparty|vendor|them|him|her|user|that\s+user|this\s+user|counter\s+user)\b",
+        r"\b(send|write|drop|deliver|draft|compose|prepare)\s+(a\s+|an\s+|the\s+|this\s+|that\s+|my\s+)?(nagitiation|nagotiation|natotiation|natogiation|negotiation|bargain|counter|offer|proposal|deal|discount)?\s*(message|msg|text|note|email|mail)?\s*(to|for)\s+(the\s+|this\s+|that\s+|our\s+|my\s+)?(seller|supplier|buyer|counterparty|vendor|them|him|her|user|that\s+user|this\s+user|counter\s+user)s?\b",
+        # "send the message to this buyer", "write a short note for the supplier"
+        r"\b(send|write|draft|compose|prepare|drop)\b[^.?!\n]{0,40}\b(message|msg|mail|email|note|reply)\b[^.?!\n]{0,30}\b(to|for)\s+(the\s+|this\s+|that\s+|our\s+|my\s+)?(seller|supplier|buyer|counterparty|vendor)s?\b",
         r"\b(draft|compose|prepare|write)\s+(a\s+)?(message|msg|proposal|counter-offer|offer|negotiation|natotiation)\s+(for|to)\s+(the\s+)?(seller|supplier|buyer|counterparty|vendor|them|user|counter\s+user)\b",
-        r"\b(message|contact|reach\s+out\s+to|notify|ping|chat\s+with)\s+(the\s+)?(seller|supplier|buyer|counterparty|vendor|them|user|that\s+user|this\s+user|counter\s+user)\b",
+        r"\b(message|contact|reach\s+out\s+to|notify|ping|chat\s+with|reply\s+to|write\s+to)\s+(the\s+|this\s+|that\s+|my\s+)?(seller|supplier|buyer|counterparty|vendor|them|user|that\s+user|this\s+user|counter\s+user)s?\b",
         r"\b(ask|tell|request|inquire|inform)\s+(the\s+)?(seller|supplier|buyer|counterparty|vendor|them|user|that\s+user|this\s+user|counter\s+user)\b",
-        r"\b(negotiate|nagitiate|nagotiate|natotiate|natogiate|negociate|bargain|deal)\s+(with\s+)?(the\s+)?(seller|supplier|buyer|counterparty|vendor|them|user|that\s+user|this\s+user|counter\s+user)?\b",
+        # "negotiate with the vendor", "help me close the deal with the supplier"
+        rf"\b(negotiate|nagitiate|nagotiate|natotiate|natogiate|negociate|bargain)\s+(with\s+)?(the\s+|this\s+|that\s+|my\s+|our\s+)?{_CP_TARGET}\b",
+        rf"\bdeal\s+with\s+(the\s+|this\s+|that\s+|my\s+|our\s+)?{_CP_TARGET}\b",
         r"\b(can\s+we|can\s+you)\s+deal\s+(it\s+)?(in|at|for)\b",
         r"\b(can\s+you\s+)?(reduce|decrease|lower|discount)\s+(the\s+)?price\b.*\b(to|by|in|for)\b",
         r"\b(send|say|write|draft)\s+to\s+(the\s+)?(seller|supplier|buyer|user|that\s+user|counter\s+user)\b",
         r"\b(behaviour|behavior|tone)\s+should\s+be\s+(like\s+)?polite\b",
         # Follow-up amendments and additions (e.g., "also mention that...", "aslo mantion that...")
-        r"\b(also|aslo|and|please)?\s*(mention|mantion|state|note|clarify|specify|include|highlight)\s+(that|the|to|about|it|is|location|price|qty|delivery|address)?\b",
+        r"\b(also|aslo|and|please)?\s*(mention|mantion|clarify|state|note|highlight|stress)\s+(that|to\s+them)\b",
+        r"\b(also|aslo)\s+(mention|mantion|clarify|note|highlight|say|write|include|specify)\b",
         r"\b(also|aslo|and|please)?\s*(tell|ask|inform|let)\s+(them|him|her|the\s+seller|the\s+supplier|the\s+buyer|the\s+user|that\s+user|counter\s+user)\b",
         r"\b(also|aslo|and)?\s*(say|write)\s+that\b",
         r"\b(also|aslo|and)?\s*(add|put)\s+(that|in\s+the\s+message|to\s+the\s+message)\b",
-        r"\b(update|amend|revise|edit|change)\s+(the\s+)?(message|msg|note|text|draft)\b",
+        r"\b(update|amend|revise|edit|change)\s+(the\s+)?(message|msg|note|text|draft\s+message|letter)\b",
         r"\b(send|dispatch)\s+(an?\s+)?(updated|new|another|follow-up|followup)\s+(message|msg)\b",
         # Counterparty location / terms corrections
         r"\b(location|address|delivery\s+place)\s+is\s+not\b",
         r"\bnot\s+[a-zA-Z]+(\s+[a-zA-Z]+)?\s+(its?|it\s+is)?\s*\d+\s*(km|kg|kilometer|kilometers|miles)\s+away\b",
+        # Hinglish: "supplier ko 10% discount ke liye message kar do", "seller ko bolo"
+        r"\b(seller|supplier|buyer|vendor|dealer|party)\s+ko\b[^.?!\n]{0,60}\b(message|msg|mail|bol|bolo|bolna|likh|likho|likhna|puch|pucho|poochho|batao|bata\s+do|kaho|keh\s+do)\b",
+        r"\b(unko|usko|unhe|inko|isko)\b[^.?!\n]{0,60}\b(message|msg|mail|bol|bolo|bolna|likh|likho|puch|pucho|batao|kaho)\b",
+        r"\b(message|msg|mail)\s+(kar|karo|kardo|kar\s+do|bhej|bhejo|bhej\s+do|likh\s+do|bana\s+do)\b",
     ]
 ]
+
+# Inside an active thread, a message counts as an amendment only when it
+# addresses the counterparty or the drafted message.
+_THREAD_ADDRESS_RE = re.compile(
+    r"\b(them|they|him|her|seller|supplier|vendor|buyer|counterparty|message|msg|letter|note|reply|draft\s+message)\b",
+    re.IGNORECASE,
+)
+_THREAD_AMEND_START_RE = re.compile(
+    r"^\s*(also|aslo|tell|ask|say|mention|mantion|clarify|inform|let\s+them|and\s+(say|mention|tell|add))\b",
+    re.IGNORECASE,
+)
+_THREAD_CORRECTION_RE = re.compile(r"\b(away\s+from|instead\s+of|rather\s+than)\b", re.IGNORECASE)
 
 
 def check_counterparty_message_intent(
@@ -755,7 +865,9 @@ def check_counterparty_message_intent(
     """Check if the user message expresses intent to message/negotiate with a seller or counterparty.
 
     Supports initial outreach, price negotiation, follow-up additions (e.g. 'also mention that...'),
-    and contextual follow-ups when an active counterparty thread exists.
+    and contextual follow-ups when an active counterparty thread exists. Draft edits
+    such as "please include delivery to Pune" are not messages unless a thread is
+    active and the text addresses the counterparty.
     """
     if not user_message:
         return False
@@ -763,14 +875,15 @@ def check_counterparty_message_intent(
     if any(rx.search(text) for rx in COUNTERPARTY_MESSAGE_INTENT_REGEXES):
         return True
 
-    # If in an active counterparty thread or follow-up turn, match conversational amendments
-    if has_active_connection or has_previous_counterparty_msg:
-        followup_cues = [
-            r"^\s*(also|aslo|and|please|just|tell|ask|say|mention|mantion|add|note|clarify|inform|let|update|send)\b",
-            r"\b(away\s+from|instead\s+of|rather\s+than|not\s+in)\b",
-            r"\b(them|seller|supplier|vendor|counterparty)\b",
-        ]
-        if any(re.search(cue, text, re.IGNORECASE) for cue in followup_cues):
+    # If in an active counterparty thread or follow-up turn, match conversational amendments.
+    # "update the rfq from buyer to seller" edits the user's own listing, not the thread.
+    edits_own_listing = bool(re.search(r"\b(rfq|draft|listing|role)\b", text, re.IGNORECASE)) and not re.search(
+        r"\b(message|msg|mention|mantion|tell|ask|inform)\b", text, re.IGNORECASE
+    )
+    if (has_active_connection or has_previous_counterparty_msg) and not edits_own_listing:
+        if _THREAD_AMEND_START_RE.search(text) or _THREAD_CORRECTION_RE.search(text):
+            return True
+        if _THREAD_ADDRESS_RE.search(text) and not is_question(text):
             return True
 
     return False

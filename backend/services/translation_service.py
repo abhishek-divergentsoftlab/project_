@@ -124,6 +124,32 @@ B2B_PHRASE_DICTIONARY: dict[str, dict[str, str]] = {
         "pt": "As amostras estão prontas para envio",
         "it": "I campioni sono pronti per la spedizione",
         "en": "Samples are ready for dispatch"
+    },
+    "we need 500 units for next week": {
+        "es": "Necesitamos 500 unidades para la próxima semana",
+        "en": "We need 500 units for next week",
+        "zh": "我们下周需要500件",
+        "hi": "हमें अगले सप्ताह के लिए 500 इकाइयों की आवश्यकता है",
+        "de": "Wir benötigen 500 Einheiten für nächste Woche",
+        "fr": "Nous avons besoin de 500 unités pour la semaine prochaine",
+        "ar": "نحتاج 500 وحدة للأسبوع القادم",
+        "ja": "来週までに500個必要です",
+        "ru": "Нам нужно 500 единиц на следующую неделю",
+        "pt": "Precisamos de 500 unidades para a próxima semana",
+        "it": "Abbiamo bisogno di 500 unità per la prossima settimana",
+    },
+    "necesitamos 500 unidades para la próxima semana": {
+        "es": "Necesitamos 500 unidades para la próxima semana",
+        "en": "We need 500 units for next week",
+        "zh": "我们下周需要500件",
+        "hi": "हमें अगले सप्ताह के लिए 500 इकाइयों की आवश्यकता है",
+        "de": "Wir benötigen 500 Einheiten für nächste Woche",
+        "fr": "Nous avons besoin de 500 unités pour la semaine prochaine",
+        "ar": "نحتاج 500 وحدة للأسبوع القادم",
+        "ja": "来週までに500個必要です",
+        "ru": "Нам нужно 500 единиц на следующую неделю",
+        "pt": "Precisamos de 500 unidades para a próxima semana",
+        "it": "Abbiamo bisogno di 500 unità per la próxima semana",
     }
 }
 
@@ -256,13 +282,26 @@ def detect_language(text: str) -> str:
     return "en"
 
 
+def normalize_supported_language(code: Optional[str]) -> Optional[str]:
+    """``'es-ES'`` / ``'zh_CN'`` / ``'ES'`` -> supported base code, or None."""
+    if not code:
+        return None
+    cleaned = code.strip().lower().replace("_", "-").split("-")[0]
+    return cleaned if cleaned in LANGUAGE_MAP else None
+
+
 def _normalize_lang_code(code: str) -> str:
-    cleaned = code.strip().lower()
-    if "-" in cleaned:
-        cleaned = cleaned.split("-")[0]
-    if "_" in cleaned:
-        cleaned = cleaned.split("_")[0]
-    return cleaned if cleaned in LANGUAGE_MAP else "en"
+    return normalize_supported_language(code) or "en"
+
+
+def external_fallback_enabled() -> bool:
+    """Whether text may leave this server for the public Google endpoint.
+
+    Deal-room messages are private commercial text. They are only sent to the
+    unofficial translate.googleapis.com endpoint when an operator explicitly
+    sets ``TRANSLATION_EXTERNAL_FALLBACK=True``.
+    """
+    return bool(getattr(settings, "TRANSLATION_EXTERNAL_FALLBACK", False))
 
 
 def get_cached_translation(text: str, source_lang: str, target_lang: str) -> Optional[str]:
@@ -322,7 +361,7 @@ async def translate_via_ollama(text: str, source_lang: str, target_lang: str) ->
                 if content:
                     return content
     except Exception as exc:  # noqa: BLE001
-        logger.debug("Ollama translation unavailable (%s), trying online fallback", exc)
+        logger.debug("Ollama translation unavailable (%s)", exc)
 
     return None
 
@@ -335,7 +374,11 @@ async def translate_via_service(
     """Instant, highly accurate translation via public translation service with language detection.
     
     Returns tuple of (translated_text, detected_source_lang) on success, or None on failure.
+    Disabled (returns None without any network call) unless
+    ``TRANSLATION_EXTERNAL_FALLBACK`` is enabled.
     """
+    if not external_fallback_enabled():
+        return None
     sl = source_lang if (source_lang and source_lang != "auto") else "auto"
     tl = target_lang
     url = "https://translate.googleapis.com/translate_a/single"
@@ -386,6 +429,13 @@ def translate_fallback(text: str, source_lang: str, target_lang: str) -> str:
                 return f"{dict_trans}?"
             return dict_trans
 
+    # Bidirectional check across phrase dictionary values
+    for phrase_map in B2B_PHRASE_DICTIONARY.values():
+        for l_code, phrase_val in phrase_map.items():
+            if phrase_val.strip().lower() in (norm_text, clean_norm):
+                if target_lang in phrase_map:
+                    return phrase_map[target_lang]
+
     # Offline marker (DO NOT CACHE THIS)
     target_info = LANGUAGE_MAP.get(target_lang) or LANGUAGE_MAP["en"]
     if target_lang == "es":
@@ -413,7 +463,7 @@ async def translate_text(
     1. Check LRU Cache
     2. Check B2B phrase dictionary (instant zero-latency)
     3. Try local Ollama LLM translation
-    4. Try real-time Google Translation service
+    4. Only if TRANSLATION_EXTERNAL_FALLBACK is enabled: public Google endpoint
     5. Fallback to dictionary or indicator
     """
     clean_text = text.strip()
@@ -462,6 +512,15 @@ async def translate_text(
     elif clean_norm in B2B_PHRASE_DICTIONARY and target_lang in B2B_PHRASE_DICTIONARY[clean_norm]:
         dict_trans = B2B_PHRASE_DICTIONARY[clean_norm][target_lang]
         translated = f"{dict_trans}?" if clean_text.endswith("?") and not dict_trans.endswith("?") else dict_trans
+    else:
+        for phrase_map in B2B_PHRASE_DICTIONARY.values():
+            for l_code, phrase_val in phrase_map.items():
+                if phrase_val.strip().lower() in (norm_text, clean_norm):
+                    if target_lang in phrase_map:
+                        translated = phrase_map[target_lang]
+                        break
+            if translated:
+                break
 
     if translated:
         set_cached_translation(clean_text, source_lang, target_lang, translated)
@@ -476,7 +535,8 @@ async def translate_text(
     # 3. Try Ollama LLM Translation
     translated = await translate_via_ollama(clean_text, source_lang, target_lang)
 
-    # 4. If Ollama was unavailable or timed out, try translation service
+    # 4. If Ollama was unavailable or timed out, the external service -- only
+    #    when an operator opted in (translate_via_service checks the setting).
     if not translated:
         service_res = await translate_via_service(clean_text, target_lang, source_lang)
         if service_res:

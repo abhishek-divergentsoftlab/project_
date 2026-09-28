@@ -34,7 +34,7 @@ import {
 } from "@/components/icons";
 
 import { useSidebarData } from "@/context/SidebarDataContext";
-import { ShipmentRouteMap } from "@/components/map/ShipmentRouteMap";
+import { ShipmentRouteMap } from "@/components/map/lazy";
 import { useFeedback } from "@/context/useFeedback";
 import { useEscapeKey } from "@/hooks/useEscapeKey";
 import type {
@@ -74,6 +74,12 @@ function money(currency: string, amount: number | string): string {
 }
 
 const POLL_FALLBACK_MS = 15000;
+const WS_RECONNECT_BASE_MS = 1000;
+const WS_RECONNECT_MAX_MS = 30000;
+// Auto-translate: parallel requests per open deal room, and attempts per
+// message+language before giving up (the manual Translate button still works).
+const MAX_CONCURRENT_AUTO_TRANSLATIONS = 3;
+const MAX_AUTO_TRANSLATE_ATTEMPTS = 2;
 const INCOTERMS_OPTIONS: Incoterm[] = ["EXW", "FOB", "CIF", "CFR", "DDP", "CIP"];
 
 function describe(connection: Connection): string {
@@ -336,6 +342,8 @@ function ChatAndDealMain({
 
   const endRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  // "<messageId>:<lang>" -> failed auto-translate attempts.
+  const autoTranslateFailuresRef = useRef<Map<string, number>>(new Map());
   const typingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const connectionId = connection.id;
@@ -431,6 +439,8 @@ function ChatAndDealMain({
   useEffect(() => {
     if (!autoTranslate || !open) return;
 
+    const failures = autoTranslateFailuresRef.current;
+    const failureKey = (id: string) => `${id}:${targetLang}`;
     const untranslated = messages.filter(
       (m) =>
         m.sender_id !== myId &&
@@ -439,12 +449,18 @@ function ChatAndDealMain({
         !m.content.startsWith("⚠️ [DEAL ISSUE") &&
         !m.content.startsWith("✓ [DEAL ISSUE") &&
         !translations[m.id] &&
-        !translatingIds.has(m.id)
+        !translatingIds.has(m.id) &&
+        // A message that keeps failing (service down, unsupported text) used
+        // to be re-requested on every render, forever.
+        (failures.get(failureKey(m.id)) ?? 0) < MAX_AUTO_TRANSLATE_ATTEMPTS
     );
 
-    if (untranslated.length === 0) return;
+    // Bounded fan-out: the rest are picked up as in-flight requests finish
+    // (each completion changes translatingIds, which re-runs this effect).
+    const slots = MAX_CONCURRENT_AUTO_TRANSLATIONS - translatingIds.size;
+    if (untranslated.length === 0 || slots <= 0) return;
 
-    untranslated.forEach((msg) => {
+    untranslated.slice(0, slots).forEach((msg) => {
       setTranslatingIds((prev) => new Set(prev).add(msg.id));
       translationApi
         .translateConnectionMessage(connectionId, msg.content, targetLang)
@@ -459,6 +475,8 @@ function ChatAndDealMain({
           }));
         })
         .catch((err) => {
+          const key = failureKey(msg.id);
+          failures.set(key, (failures.get(key) ?? 0) + 1);
           console.error("Auto-translate error for message", msg.id, err);
         })
         .finally(() => {
@@ -625,17 +643,23 @@ function ChatAndDealMain({
   useEffect(() => {
     if (!open) return;
 
-    const token = tokenStore.access();
-    if (!token) return;
+    if (!tokenStore.access()) return;
 
     const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
     const host = window.location.host;
-    const wsUrl = `${proto}//${host}/api/v1/ws/connections/${connectionId}?token=${encodeURIComponent(token)}`;
 
-    const socket = new WebSocket(wsUrl);
-    wsRef.current = socket;
+    // Reconnect with capped exponential backoff instead of silently degrading
+    // to 15 s polling for the rest of the session after one dropped socket.
+    let socket: WebSocket | null = null;
+    let disposed = false;
+    let attempt = 0;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    // Token the last socket was opened with; a policy close (1008 = bad or
+    // expired token / not a participant) is retried only once it changes.
+    let lastToken: string | null = null;
+    let authRejected = false;
 
-    socket.onmessage = (event) => {
+    const handleSocketMessage = (event: MessageEvent) => {
       try {
         const payload = JSON.parse(event.data) as { type: string; data?: unknown };
         if (payload.type === "chat_message" && payload.data) {
@@ -702,16 +726,63 @@ function ChatAndDealMain({
       }
     };
 
+    const scheduleReconnect = () => {
+      if (disposed || retryTimer) return;
+      const delay = Math.min(WS_RECONNECT_MAX_MS, WS_RECONNECT_BASE_MS * 2 ** attempt);
+      attempt += 1;
+      // Jitter so every open tab does not reconnect in lockstep after a restart.
+      retryTimer = setTimeout(() => {
+        retryTimer = null;
+        connect();
+      }, delay * (0.75 + Math.random() * 0.5));
+    };
+
+    const connect = () => {
+      if (disposed) return;
+      const token = tokenStore.access();
+      if (!token) return;
+      lastToken = token;
+      authRejected = false;
+      const wsUrl = `${proto}//${host}/api/v1/ws/connections/${connectionId}?token=${encodeURIComponent(token)}`;
+      const ws = new WebSocket(wsUrl);
+      socket = ws;
+      wsRef.current = ws;
+      ws.onmessage = handleSocketMessage;
+      ws.onopen = () => {
+        // Anything sent while we were disconnected only arrives via a reload.
+        if (attempt > 0) void reloadData();
+        attempt = 0;
+      };
+      ws.onclose = (event) => {
+        if (disposed || socket !== ws) return;
+        wsRef.current = null;
+        if (event.code === 1008) {
+          authRejected = true;
+          // The polling fallback refreshes the access token through the API
+          // client; try again as soon as a different token is available.
+          if (tokenStore.access() === lastToken) return;
+        }
+        scheduleReconnect();
+      };
+    };
+
+    connect();
+
     const fallbackTimer = setInterval(() => {
-      if (socket.readyState !== WebSocket.OPEN) {
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
         void reloadData();
+        if (authRejected && !retryTimer && tokenStore.access() !== lastToken) {
+          scheduleReconnect();
+        }
       }
     }, POLL_FALLBACK_MS);
 
     return () => {
+      disposed = true;
       clearInterval(fallbackTimer);
+      if (retryTimer) clearTimeout(retryTimer);
       if (typingTimerRef.current) clearTimeout(typingTimerRef.current);
-      socket.close();
+      socket?.close();
       wsRef.current = null;
     };
   }, [connectionId, open, reloadData, loadIssues]);

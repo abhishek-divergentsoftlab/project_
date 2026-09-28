@@ -31,9 +31,15 @@ class MatchScore(BaseModel):
     total: float = Field(ge=0, le=1)
     relevance: Optional[float] = Field(
         default=None,
-        description="Textual similarity. Term overlap today; vector similarity once Qdrant lands.",
+        description=(
+            "Product similarity: cosine similarity from the vector index when it "
+            "answered, otherwise symmetric term overlap (Ochiai)."
+        ),
     )
-    category: Optional[float] = None
+    category: Optional[float] = Field(
+        default=None,
+        description="1 same canonical category, 0 different, null when either is unknown.",
+    )
     attributes: Optional[float] = Field(
         default=None, description="How well the candidate matches the attributes you named."
     )
@@ -52,6 +58,9 @@ class Counterparty(BaseModel):
     * ``pending``   -- sent, awaiting their answer
     * ``accepted``  -- they agreed; ``email``/``phone``/``contact_name`` are filled
     * ``rejected``  -- they declined; contact stays hidden
+
+    ``email`` is contact detail like ``phone``: null for every status except
+    ``accepted``.
     """
 
     company_name: Optional[str] = None

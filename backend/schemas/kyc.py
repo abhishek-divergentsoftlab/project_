@@ -18,6 +18,9 @@ class KYCVerificationPayload(BaseModel):
     website: Optional[str] = Field(default=None, max_length=255)
     pan_number: Optional[str] = Field(default=None, max_length=20)
     signatory_name: Optional[str] = Field(default=None, max_length=120)
+    # Country of registration. Defaults to the profile's country. A non-GSTIN
+    # (foreign VAT / tax) id is only considered for a clearly non-Indian country.
+    country: Optional[str] = Field(default=None, max_length=120)
 
 
 class KYCStatusOut(BaseModel):

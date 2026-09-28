@@ -20,8 +20,9 @@ async def test_certificates_lifecycle(make_actor):
             "issuing_body": "SGS International",
             "certificate_number": "IN-2026-9001-X",
             "issue_date": "2024-01-15T00:00:00Z",
-            "expiry_date": "2027-01-15T00:00:00Z",
-            "document_url": "https://certificates.example.com/iso9001.pdf",
+            "expiry_date": "2099-01-15T00:00:00Z",
+            # External links are no longer accepted as proof documents; only
+            # files uploaded through /certifications/upload by this account.
         },
     )
     assert create_resp.status_code == 201

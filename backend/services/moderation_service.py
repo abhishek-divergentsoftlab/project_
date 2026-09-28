@@ -42,7 +42,38 @@ INDUSTRIAL_GUN_EXEMPTIONS = {
     "thermometer gun",
     "stud gun",
     "tufting gun",
+    "soldering gun",
+    "hot air gun",
+    "tattoo gun",
+    "label gun",
+    "foam gun",
+    "sealant gun",
 }
+
+# Legitimate goods whose names contain a weapon word. Matched on word
+# boundaries and removed before the prohibited patterns run, so "gun metal
+# grey coating" passes while "gun metal grey rifles" is still caught by
+# "rifles". Keep every entry specific: a broad exemption is an evasion route.
+INDUSTRIAL_EXEMPTION_PATTERNS: list[re.Pattern] = [
+    re.compile(
+        r"\b(?:"
+        + "|".join(sorted((re.escape(p).replace(r"\ ", r"\s+") for p in INDUSTRIAL_GUN_EXEMPTIONS), key=len, reverse=True))
+        + r")s?\b"
+    ),
+    re.compile(r"\bgun[\s\-]*metal(?:[\s\-]+(?:grey|gray|finish|colou?r|black|powder|paint|coating|shade))?\b"),
+    re.compile(r"\bshotgun[\s\-]+(?:mics?|microphones?)\b"),
+    re.compile(r"\bbomb[\s\-]+calorimet(?:er|ers|ry)\b"),
+    re.compile(r"\bbath[\s\-]+bombs?\b"),
+]
+
+# Longer inputs are truncated before matching. The request schema already caps
+# title + description + category at ~5.6k characters; this bounds the work for
+# any other caller.
+MAX_MODERATION_CHARS = 12_000
+
+# Bounded repetition for filler words ("buy a young fresh ..."). An unbounded
+# `(?:word\s+)*` next to another one backtracks quadratically on "a a a a ...".
+_FILLER_MAX = "{0,4}"
 
 # Negative lookahead for legitimate juvenile & adult apparel, toys, and commercial merchandise
 PRODUCT_SUFFIX = (
@@ -79,7 +110,9 @@ PROHIBITED_CATEGORIES: dict[str, list[re.Pattern]] = {
         # Commercial exchange targeting minors or youth (e.g., 'order under 18 yo girl', 'buy 15 yo girl', 'hire escort girl')
         re.compile(
             r"\b(?:buy|sell|rent|hire|auction|deliver|trade|order|provide|export|import|purchase|book|supply)\s+"
-            r"(?:(?:a|an|the|some|any|young|fresh|virgin|local|foreign|asian|russian|indian|cheap|underage|minor|sub)\s+)*"
+            r"(?:(?:a|an|the|some|any|young|fresh|virgin|local|foreign|asian|russian|indian|cheap|underage|minor|sub)\s+)"
+            + _FILLER_MAX
+            + r""
             r"(?:(?:under|below|<)[\s\-_]*(?:1[0-8]|[1-9])[\s\-_]*)?"
             r"(?:(?:\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen)"
             r"[\s\-_]*(?:years?[\s\-_]*old|yrs?[\s\-_]*old|yo|years?|yrs?|yr)[\s\-_]*)?"
@@ -99,7 +132,11 @@ PROHIBITED_CATEGORIES: dict[str, list[re.Pattern]] = {
         ),
     ],
     "firearms_and_weapons": [
-        re.compile(r"\b(gun|guns|pistol|pistols|revolver|revolvers|rifle|rifles|shotgun|shotguns|firearm|firearms)\b", re.I),
+        re.compile(
+            r"\b(gun|guns|handgun|handguns|pistol|pistols|revolver|revolvers|rifle|rifles|"
+            r"shotgun|shotguns|firearm|firearms|carbine|carbines|uzi|uzis)\b",
+            re.I,
+        ),
         re.compile(r"\b(glock|ak-?47|ar-?15|m16|m4a1|kalashnikov|submachine\s+gun|assault\s+rifle|sniper\s+rifle)\b", re.I),
         re.compile(r"\b(ammo|ammunition|bullets|silencer|suppressor|grenade|grenades|rpg|bazooka|rocket\s+launcher)\b", re.I),
         re.compile(r"\b(landmine|military\s+explosive|c4\s+explosive|dynamite|bomb|bombs|pipe\s+bomb|buckshot|birdshot)\b", re.I),
@@ -111,7 +148,9 @@ PROHIBITED_CATEGORIES: dict[str, list[re.Pattern]] = {
         ),
         re.compile(r"\b((?:upper|lower)\s+receivers?|80%\s+lower|glock\s+switch|auto\s+sear|bump\s+stock|firing\s+pin)\b", re.I),
         re.compile(
-            r"\b(9mm(?:\s*(?:ammo|luger|parabellum|rounds?|bullets?))?|"
+            # "9mm" alone or with a firearm word; "9mm plywood" / "9 mm rebar" are goods.
+            r"\b(9\s?mm(?=\s*(?:\Z|ammo|ammunition|luger|parabellum|rounds?\b|bullets?|pistols?|handguns?|"
+            r"guns?\b|cartridges?|caliber|calibre|glock))(?:\s*(?:ammo|luger|parabellum|rounds?|bullets?))?|"
             r"5\.56(?:\s*mm)?(?:\s*(?:ammo|nato|rounds?|bullets?|x\s*45|caliber|cal))?|"
             r"7\.62(?:\s*mm)?(?:\s*(?:ammo|nato|rounds?|bullets?|x\s*39|x\s*51|caliber|cal))?|"
             r"\.?223(?:\s*(?:rem|remington|ammo|rounds?|bullets?))|"
@@ -134,9 +173,13 @@ PROHIBITED_CATEGORIES: dict[str, list[re.Pattern]] = {
             r"deliver|delivering|trade|trading|order|orders|ordering|provide|provides|providing|export|exporting|"
             r"import|importing|purchase|purchasing|book|booking|supply|supplies|supplying|suppy|suplly|need|needs|"
             r"want|wants|looking\s+for)\s+"
-            r"(?:(?:a|an|the|some|any|young|old|fresh|virgin|local|foreign|asian|russian|indian|cheap|domestic|house|beautiful|single|mature|elderly)\s+)*"
+            r"(?:(?:a|an|the|some|any|young|old|fresh|virgin|local|foreign|asian|russian|indian|cheap|domestic|house|beautiful|single|mature|elderly)\s+)"
+            + _FILLER_MAX
+            + r""
             r"(?:(?:\d{1,3})\s*(?:years?[\s\-_]*old|yrs?[\s\-_]*old|yo|years?|yrs?|yr)[\s\-_]*)?"
-            r"(?:(?:a|an|the|some|any|young|old|fresh|virgin|local|foreign|asian|russian|indian|cheap|domestic|house|beautiful|single|mature|elderly)\s+)*"
+            r"(?:(?:a|an|the|some|any|young|old|fresh|virgin|local|foreign|asian|russian|indian|cheap|domestic|house|beautiful|single|mature|elderly)\s+)"
+            + _FILLER_MAX
+            + r""
             r"(?:wom[ae]n|lad(?:y|ies)|ledd?y|females?|m[ae]n|males?|girls?|boys?|humans?|persons?|people|maids?|escorts?|wives|wife|brides?|slaves?|concubines?)"
             r"(?!"
             + PRODUCT_SUFFIX
@@ -226,15 +269,14 @@ class AIContentModerator:
     @classmethod
     def check_text(cls, text: str) -> ModerationCheckResult:
         """Analyzes text for prohibited items with normalization and industrial exemptions."""
-        variants = cls._normalize_text(text)
+        variants = cls._normalize_text((text or "")[:MAX_MODERATION_CHARS])
 
         # Remove exempt industrial phrases from all variants
         filtered_variants: list[str] = []
         for variant in variants:
             v_clean = variant
-            for industrial in INDUSTRIAL_GUN_EXEMPTIONS:
-                if industrial in v_clean:
-                    v_clean = v_clean.replace(industrial, " ")
+            for exemption in INDUSTRIAL_EXEMPTION_PATTERNS:
+                v_clean = exemption.sub(" ", v_clean)
             filtered_variants.append(v_clean)
 
         flagged_categories: list[str] = []

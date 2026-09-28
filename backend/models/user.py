@@ -44,7 +44,7 @@ class User(Base, UUIDPrimaryKeyMixin, TimestampMixin):
             values_callable=lambda e: [m.value for m in e],
         ),
         nullable=False,
-        default=UserStatus.ACTIVE,
+        default=UserStatus.PENDING_VERIFICATION,
     )
 
     email_verified_at: Mapped[Optional[datetime]] = mapped_column(
@@ -66,7 +66,7 @@ class User(Base, UUIDPrimaryKeyMixin, TimestampMixin):
 
     @property
     def is_active(self) -> bool:
-        return self.status is UserStatus.ACTIVE
+        return self.status in (UserStatus.ACTIVE, UserStatus.PENDING_VERIFICATION)
 
     def can_post_as(self, rfq_role: "object") -> bool:
         """A ``BOTH`` account may post on either side; others only their own."""

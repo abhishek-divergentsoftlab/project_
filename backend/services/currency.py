@@ -1,7 +1,9 @@
-"""Currency conversion for price comparison with resilient caching and live rate tracking.
+"""Currency conversion: the single FX table used across the platform.
 
-The rates below provide an audited baseline. In production, live FX feeds
-update the internal cache while retaining this table as a guaranteed fallback.
+The rates below are a static baseline table; there is no live FX feed wired in
+yet. ``get_rates_info`` says so honestly: ``source`` is ``"static"`` and
+``as_of`` is the date the baseline was compiled, until something calls
+``update_rates`` (which records its own timestamp and source).
 Conversion is deliberately explicit: an unknown currency returns None rather
 than being assumed to be the base.
 """
@@ -44,9 +46,15 @@ DEFAULT_RATES: dict[str, Decimal] = {
     "DKK": Decimal("6.9"),
 }
 
+# When the static DEFAULT_RATES baseline was compiled (approximate). Reported
+# as ``as_of`` with ``source="static"`` until rates are updated at runtime.
+STATIC_RATES_AS_OF: datetime = datetime(2024, 6, 1, tzinfo=UTC)
+STATIC_SOURCE = "static"
+
 # Active working rates table
 RATES: dict[str, Decimal] = dict(DEFAULT_RATES)
-_AS_OF: datetime = datetime.now(UTC)
+_AS_OF: datetime = STATIC_RATES_AS_OF
+_SOURCE: str = STATIC_SOURCE
 
 # Canonical currency display names
 CURRENCY_NAMES: dict[str, str] = {
@@ -184,34 +192,30 @@ def normalize_currency(raw: Optional[str]) -> Optional[str]:
     if upper_candidate in RATES:
         return upper_candidate
 
-    # 3. Fuzzy regex pattern matching
-    # Indian Rupee variations (e.g. "india ruppes", "inr rupees", "ruppees")
-    if re.search(r"\b(?:india[n]?\s+)?rup+[e|p]*s*\b", cleaned):
-        return "INR"
-    # US Dollar variations (e.g. "us dollar", "united states dollars", "bucks")
-    if re.search(r"\b(?:u\.?s\.?\s+)?(?:dollars?|bucks?)\b", cleaned):
-        return "USD"
-    # Scandinavian Krona variations (e.g. "kr", "krona", "kroner")
-    if re.search(r"\b(?:kr|krona|kronor|kroner|krone)\b", cleaned):
-        if "norwegian" in cleaned:
-            return "NOK"
-        if "danish" in cleaned:
-            return "DKK"
-        return "SEK"
-    # British Pound variations
-    if re.search(r"\b(?:british|uk)?\s*pounds?\b", cleaned):
-        return "GBP"
-    # Euro variations
-    if re.search(r"\beuros?\b", cleaned):
-        return "EUR"
-    # Yen variations
-    if re.search(r"\b(?:japanese\s+)?yen\b", cleaned):
-        return "JPY"
-    # Yuan / RMB variations
-    if re.search(r"\b(?:chinese\s+)?(?:yuan|renminbi|rmb)\b", cleaned):
-        return "CNY"
+    # 3. Fuzzy spelling variants. These must match the WHOLE input: a
+    #    currency token such as "ruppees" or "us dollars", never a phrase that
+    #    merely contains one ("500 pounds of steel" is a weight, not GBP).
+    for pattern, code in _FUZZY_PATTERNS:
+        if pattern.fullmatch(cleaned):
+            if code == "SEK":
+                if "norwegian" in cleaned:
+                    return "NOK"
+                if "danish" in cleaned:
+                    return "DKK"
+            return code
 
     return None
+
+
+_FUZZY_PATTERNS: tuple[tuple["re.Pattern[str]", str], ...] = (
+    (re.compile(r"(?:india[n]?\s+|inr\s+)?rup+[ep]*s*"), "INR"),
+    (re.compile(r"(?:u\.?s\.?\s+|american\s+)?(?:dollars?|bucks?)"), "USD"),
+    (re.compile(r"(?:(?:swedish|norwegian|danish)\s+)?(?:kr|krona|kronor|kroner|krone)"), "SEK"),
+    (re.compile(r"(?:british\s+|uk\s+)?pounds?(?:\s+sterling)?"), "GBP"),
+    (re.compile(r"euros?"), "EUR"),
+    (re.compile(r"(?:japanese\s+)?yen"), "JPY"),
+    (re.compile(r"(?:chinese\s+)?(?:yuan|renminbi|rmb)"), "CNY"),
+)
 
 
 def get_rates_info() -> dict:
@@ -219,23 +223,50 @@ def get_rates_info() -> dict:
     return {
         "base": BASE,
         "as_of": _AS_OF.isoformat(),
+        "source": _SOURCE,
         "currencies": list(RATES.keys()),
         "rates": {k: float(v) for k, v in RATES.items()},
         "names": CURRENCY_NAMES,
     }
 
 
-def update_rates(new_rates: dict[str, Decimal | float | str]) -> None:
-    """Update working rates safely."""
-    global _AS_OF
+def update_rates(
+    new_rates: dict[str, Decimal | float | str],
+    *,
+    source: str = "manual",
+    as_of: Optional[datetime] = None,
+) -> None:
+    """Update working rates safely and record when and where they came from."""
+    global _AS_OF, _SOURCE
+    changed = False
     for code, rate in new_rates.items():
         try:
             val = Decimal(str(rate))
-            if val > 0:
+            if val > 0 and val.is_finite():
                 RATES[code.upper()] = val
+                changed = True
         except Exception:
             continue
-    _AS_OF = datetime.now(UTC)
+    if changed:
+        _AS_OF = as_of or datetime.now(UTC)
+        _SOURCE = source
+
+
+def reset_rates() -> None:
+    """Restore the static baseline table (and its static provenance)."""
+    global _AS_OF, _SOURCE
+    RATES.clear()
+    RATES.update(DEFAULT_RATES)
+    _AS_OF = STATIC_RATES_AS_OF
+    _SOURCE = STATIC_SOURCE
+
+
+def usd_rate(code: Optional[str]) -> Optional[Decimal]:
+    """Units of ``code`` per 1 USD, or None for an unsupported currency."""
+    norm = normalize_currency(code) if code else None
+    if not norm:
+        return None
+    return RATES.get(norm)
 
 
 def supported(code: Optional[str]) -> bool:

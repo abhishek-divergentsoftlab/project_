@@ -9,6 +9,8 @@ Adversarial testing covering:
 6. Malformed/adversarial inputs (special characters, numbers only, casing, huge strings).
 """
 
+import json
+
 import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -219,3 +221,127 @@ def test_qa_adversarial_input_does_not_crash_parser(malformed_input):
     assert agent is not None
     assert isinstance(tools, list)
     assert isinstance(meta, dict)
+
+
+# =============================================================================
+# 7. Seller price discovery and "buyer details" follow-up
+# =============================================================================
+
+SUPPLY_RICE_QUERY = (
+    "i want to supply rice but i am confused what price i should decide and how many "
+    "sellers are there can you analyze the market and tell me suitable price"
+)
+BUYER_FOLLOWUP_QUERY = "give me the buyer details aslo"
+
+
+async def _seed_rice_market(make_actor) -> None:
+    seller = await make_actor("seller")
+    buyer = await make_actor("buyer")
+    listings = [
+        (seller, "seller", "Supplying 3,490 tonne of basmati rice", (64353, "INR", "tonne")),
+        (seller, "seller", "Supplying 100 metric tons of 1121 steam basmati rice", (92000, "INR", "tons")),
+        (seller, "seller", "Supplying sona masoori rice", (70, "INR", "kg")),
+        (buyer, "buyer", "Need 25 metric tons of 1121 steam basmati rice", (95000, "INR", "tons")),
+    ]
+    for actor, role, title, price in listings:
+        response = await actor.post(
+            "/rfqs",
+            json=rfq_body(
+                role=role,
+                category="Agriculture",
+                title=title,
+                product="basmati rice",
+                quantity=(25, "tonne"),
+                price=price,
+                status="active",
+            ),
+        )
+        assert response.status_code == 201, response.text
+
+
+@pytest.mark.asyncio
+async def test_qa_rice_benchmark_normalises_units_and_splits_market_sides(db: AsyncSession, make_actor):
+    """"tons" and "kg" listings must not drop out of a "tonne" benchmark, and a buyer's
+    target price must be reported separately from sellers' asking prices."""
+    await _seed_rice_market(make_actor)
+
+    aggs = await _fetch_live_marketplace_aggregates(
+        db=db, query_text=SUPPLY_RICE_QUERY, category="Agriculture", product_name="rice"
+    )
+
+    assert aggs["seller_count"] == 3
+    assert aggs["buyer_count"] == 1
+    assert aggs["price_unit"] == "tonne"
+    assert aggs["excluded_price_count"] == 0
+    assert aggs["seller_prices"] == {"count": 3, "min": 64353.0, "max": 92000.0, "avg": pytest.approx(75451.0)}
+    assert aggs["buyer_prices"]["min"] == 95000.0
+
+    prompt = format_marketplace_aggregates_prompt(aggs)
+    assert "Buyers' Target Prices: ₹95,000.00 per tonne" in prompt
+    assert "There ARE 1 active buyer RFQ(s) for 'rice'" in prompt
+
+
+@pytest.mark.asyncio
+async def test_qa_aggregates_skip_messages_without_a_product(db: AsyncSession):
+    """A follow-up with no product must not be benchmarked as "0 listings for '<sentence>'"."""
+    aggs = await _fetch_live_marketplace_aggregates(db=db, query_text=BUYER_FOLLOWUP_QUERY)
+    assert aggs == {}
+    assert format_marketplace_aggregates_prompt(aggs) == ""
+
+
+def test_qa_buyer_details_followup_is_not_a_product():
+    assert extract(BUYER_FOLLOWUP_QUERY).product is None
+
+
+def test_qa_llm_product_must_come_from_the_user_message():
+    from services.ai_chat_service import _grounded_ai_product
+
+    assert _grounded_ai_product("basmati rice", SUPPLY_RICE_QUERY) is None
+    assert _grounded_ai_product("details aslo", BUYER_FOLLOWUP_QUERY) is None
+    assert _grounded_ai_product("bananas", "i want to supply banana") == "bananas"
+
+
+def test_qa_buyer_followup_keeps_product_and_seller_role():
+    from services.ai_chat_service import _resolve_market_focus
+
+    first = _resolve_market_focus(
+        SUPPLY_RICE_QUERY,
+        ai_extraction={"product": "basmati rice", "category": "Agriculture", "role": "seller"},
+    )
+    assert (first["product"], first["role"]) == ("rice", "seller")
+
+    followup = _resolve_market_focus(
+        BUYER_FOLLOWUP_QUERY,
+        previous_focus={k: first[k] for k in ("product", "category", "role")},
+        ai_extraction={"product": "details aslo", "role": "buyer"},
+    )
+    assert followup["product"] == "rice"
+    assert followup["role"] == "seller"
+    assert followup["listing_role"] == "buyer"
+
+
+@pytest.mark.asyncio
+async def test_qa_buyer_candidates_are_real_rice_buyers_only(db: AsyncSession, make_actor):
+    """No unrelated "newest" listings and no fabricated 95/90/85% match scores."""
+    from sqlalchemy import select
+    from sqlalchemy.orm import selectinload
+
+    from models.user import User
+    from services.ai_chat_service import _fetch_catalog_candidates_for_query
+
+    await _seed_rice_market(make_actor)
+    other = await make_actor("seller")
+    await other.post("/rfqs", json=rfq_body(role="buyer", title="Need 15,000 pcs USB Type-C cable", status="active"))
+    viewer_actor = await make_actor("seller")
+    viewer = (
+        await db.execute(select(User).options(selectinload(User.profile)).where(User.id == viewer_actor.id))
+    ).scalar_one()
+
+    focus = {"product": "rice", "category": "Agriculture", "role": "seller", "listing_role": "buyer"}
+    candidates = await _fetch_catalog_candidates_for_query(db, viewer, focus)
+    assert [c["title"] for c in candidates] == ["Need 25 metric tons of 1121 steam basmati rice"]
+    assert candidates[0]["score"] is None
+    json.dumps(candidates)  # persisted to the JSONB conversation state
+
+    assert await _fetch_catalog_candidates_for_query(db, viewer, {**focus, "product": "saffron"}) == []
+    assert await _fetch_catalog_candidates_for_query(db, viewer, {**focus, "product": None}) == []

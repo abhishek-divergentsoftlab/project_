@@ -2,11 +2,12 @@
 
 from datetime import UTC, datetime
 from decimal import Decimal
+import math
 import re
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence
 import uuid
 
-from sqlalchemy import and_, case, func, or_, select
+from sqlalchemy import Float, and_, case, cast, false, func, literal, not_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -24,7 +25,213 @@ from schemas.marketplace import (
     CategoryCountOut,
 )
 from services import locations
+from services.categories import category_variants, normalize_category
 from services.match_scoring import haversine_km
+
+
+BOILERPLATE_SEARCH_WORDS = {
+    "role", "category", "product", "quantity", "target", "price", "location",
+    "deadline", "attributes", "notes", "buyer", "seller", "units"
+}
+
+
+# A search box query is short. Every token becomes an AND-ed group of five
+# regex scans, so an unbounded query (2,000 words took 1.9 s) is a cheap DoS.
+MAX_QUERY_CHARS = 200
+MAX_QUERY_TOKENS = 10
+EARTH_RADIUS_KM = 6371.0
+KM_PER_DEGREE_LAT = 111.32
+
+
+def clean_text_param(value: Optional[str], max_chars: int = MAX_QUERY_CHARS) -> Optional[str]:
+    """Strip NUL bytes (Postgres rejects them -> 500) and bound the length."""
+    if value is None:
+        return None
+    cleaned = value.replace("\x00", "").strip()[:max_chars].strip()
+    return cleaned or None
+
+
+def escape_like(value: str) -> str:
+    """Escape LIKE/ILIKE wildcards so user input matches literally ('%' is not 'anything')."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _contains_ci(column: Any, value: str) -> Any:
+    """``column ILIKE '%value%'`` with the value's wildcards escaped (trigram-index friendly)."""
+    return column.ilike(f"%{escape_like(value)}%", escape="\\")
+
+
+def _finite_price(value: Optional[float]) -> Optional[Decimal]:
+    """Price bound as a Decimal, ignoring NaN/inf and negatives (the API already 422s them)."""
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number < 0:
+        return None
+    return Decimal(str(number))
+
+
+def _category_condition(category: str) -> Any:
+    """Match a category filter the way the facets group: normalized.
+
+    New rows are normalized on write; legacy rows are matched through the
+    known spellings of the canonical name, plus a literal substring match.
+    """
+    canonical = normalize_category(category)
+    variants = category_variants(canonical) | {category.lower()}
+    return or_(
+        func.lower(func.trim(RFQ.category)).in_(sorted(variants)),
+        _contains_ci(RFQ.category, category),
+        _contains_ci(RFQ.category, canonical),
+    )
+
+
+def _haversine_sql(lat_col: Any, lon_col: Any, ref_lat: float, ref_lon: float) -> Any:
+    """Great-circle distance in km as a SQL expression (same formula as haversine_km)."""
+    lat = cast(lat_col, Float)
+    lon = cast(lon_col, Float)
+    d_lat = func.radians(lat - ref_lat)
+    d_lon = func.radians(lon - ref_lon)
+    a = func.power(func.sin(d_lat / 2), 2) + (
+        math.cos(math.radians(ref_lat))
+        * func.cos(func.radians(lat))
+        * func.power(func.sin(d_lon / 2), 2)
+    )
+    # least(): float rounding can push a hair above 1 and asin() would raise.
+    return 2 * EARTH_RADIUS_KM * func.asin(func.sqrt(func.least(literal(1.0), a)))
+
+
+def _within_radius_sql(lat_col: Any, lon_col: Any, ref_lat: float, ref_lon: float, radius_km: float) -> Any:
+    """Bounding-box prefilter (index/planner friendly) AND the exact haversine."""
+    d_lat = radius_km / KM_PER_DEGREE_LAT
+    conds = [
+        lat_col.is_not(None),
+        lon_col.is_not(None),
+        lat_col >= ref_lat - d_lat,
+        lat_col <= ref_lat + d_lat,
+    ]
+    cos_lat = math.cos(math.radians(ref_lat))
+    if cos_lat > 1e-6:
+        d_lon = radius_km / (KM_PER_DEGREE_LAT * cos_lat)
+        # Skip the longitude box where it would wrap the antimeridian.
+        if d_lon < 180 and -180 <= ref_lon - d_lon and ref_lon + d_lon <= 180:
+            conds += [lon_col >= ref_lon - d_lon, lon_col <= ref_lon + d_lon]
+    conds.append(_haversine_sql(lat_col, lon_col, ref_lat, ref_lon) <= radius_km)
+    return and_(*conds)
+
+
+def _token_regex(keys: Sequence[str]) -> Optional[str]:
+    """POSIX regex matching any gazetteer key as a whole token (see _normalised_place)."""
+    parts = [re.escape(k.replace("-", " ")) for k in keys if k]
+    if not parts:
+        return None
+    return " (" + "|".join(sorted(parts, key=len, reverse=True)) + ") "
+
+
+def _normalised_place(column: Any) -> Any:
+    """SQL twin of locations.find_location's text cleanup: lower-case, every
+    run of non-alphanumerics becomes one space, padded with spaces."""
+    return (
+        literal(" ")
+        + func.regexp_replace(func.lower(func.coalesce(column, "")), "[^[:alnum:]]+", " ", "g")
+        + literal(" ")
+    )
+
+
+def radius_condition(ref_lat: float, ref_lon: float, radius_km: float) -> Any:
+    """``WHERE`` clause for "listing within radius_km of (ref_lat, ref_lon)".
+
+    Mirrors the coordinate fallback used to *display* a listing's position, so
+    the filter, the total and the pages agree (the filter used to run in Python
+    after LIMIT/OFFSET and COUNT):
+
+    1. the RFQ's own latitude/longitude;
+    2. else a gazetteer city/region named in ``location_city`` (then
+       ``location_state``) -- resolved here by pre-computing which gazetteer
+       entries fall inside the radius;
+    3. else the owner's profile coordinates.
+    """
+    has_coords = and_(RFQ.latitude.is_not(None), RFQ.longitude.is_not(None))
+    own = and_(has_coords, _within_radius_sql(RFQ.latitude, RFQ.longitude, ref_lat, ref_lon, radius_km))
+
+    gazetteer = locations._UNIFIED_LOCATIONS  # noqa: SLF001 - read-only lookup table
+    nearby_keys = [
+        key
+        for key, loc in gazetteer.items()
+        if haversine_km(ref_lat, ref_lon, loc.latitude, loc.longitude) <= radius_km
+    ]
+    all_regex = _token_regex(list(gazetteer))
+    nearby_regex = _token_regex(nearby_keys)
+
+    city_text = _normalised_place(RFQ.location_city)
+    state_text = _normalised_place(RFQ.location_state)
+    city_known = city_text.op("~")(all_regex) if all_regex else false()
+    state_known = state_text.op("~")(all_regex) if all_regex else false()
+
+    clauses = [own]
+    if nearby_regex:
+        clauses.append(and_(not_(has_coords), city_text.op("~")(nearby_regex)))
+        clauses.append(
+            and_(not_(has_coords), not_(city_known), state_text.op("~")(nearby_regex))
+        )
+    clauses.append(
+        and_(
+            not_(has_coords),
+            not_(city_known),
+            not_(state_known),
+            UserProfile.latitude != 0,
+            UserProfile.longitude != 0,
+            _within_radius_sql(UserProfile.latitude, UserProfile.longitude, ref_lat, ref_lon, radius_km),
+        )
+    )
+    return or_(*clauses)
+
+
+def build_search_conditions(q: str) -> list[Any]:
+    """Tokenize search phrase and produce word-boundary matching clauses.
+
+    Prevents false-positive matches (such as 'rice' matching the substring 'price'
+    in the standard 'Target price:' metadata block). The query is capped at
+    ``MAX_QUERY_CHARS`` characters and ``MAX_QUERY_TOKENS`` tokens.
+    """
+    q = clean_text_param(q) or ""
+    raw_terms = [
+        w.strip()
+        for w in re.split(r"[^\w\+\-\./]+", q.strip())
+        if w.strip()
+        and w.lower() not in ("in", "at", "from", "for", "the", "a", "an", "to", "with", "and", "or", "of", "on", "by", "is")
+        and (len(w.strip()) >= 2 or w.isalnum())
+    ]
+    if not raw_terms:
+        term = q.strip()
+        raw_terms = [term] if term else []
+    # Dedupe (case-insensitively) and cap the number of AND-ed token groups.
+    seen: set[str] = set()
+    unique_terms = []
+    for term in raw_terms:
+        if term.lower() not in seen:
+            seen.add(term.lower())
+            unique_terms.append(term)
+    raw_terms = unique_terms[:MAX_QUERY_TOKENS]
+
+    token_conditions = []
+    for t in raw_terms:
+        escaped = re.escape(t)
+        pattern = rf"\m{escaped}" if re.match(r"^\w", t) else escaped
+        clauses = [
+            RFQ.title.op("~*")(pattern),
+            RFQ.category.op("~*")(pattern),
+            RFQ.description.op("~*")(pattern),
+            RFQ.location_city.op("~*")(pattern),
+        ]
+        if t.lower() not in BOILERPLATE_SEARCH_WORDS:
+            clauses.append(RFQ.search_text.op("~*")(pattern))
+        token_conditions.append(or_(*clauses))
+
+    return token_conditions
 
 
 async def get_catalog(
@@ -65,65 +272,48 @@ async def get_catalog(
         saved_subquery = select(SavedRFQ.rfq_id).where(SavedRFQ.user_id == viewer.id)
         conditions.append(RFQ.id.in_(saved_subquery))
 
-    if category and category.strip():
-        cat_clean = category.strip()
-        conditions.append(
-            or_(
-                func.lower(func.trim(RFQ.category)) == cat_clean.lower(),
-                RFQ.category.ilike(f"%{cat_clean}%"),
-            )
-        )
+    category = clean_text_param(category, 120)
+    city = clean_text_param(city, 120)
+    country = clean_text_param(country, 120)
+    currency = clean_text_param(currency, 64)
 
-    if city and city.strip():
-        conditions.append(RFQ.location_city.ilike(f"%{city.strip()}%"))
+    if category:
+        conditions.append(_category_condition(category))
 
-    if country and country.strip():
-        conditions.append(RFQ.location_country.ilike(f"%{country.strip()}%"))
+    if city:
+        conditions.append(_contains_ci(RFQ.location_city, city))
 
-    if currency and currency.strip():
-        conditions.append(RFQ.price_currency == currency.strip().upper())
+    if country:
+        conditions.append(_contains_ci(RFQ.location_country, country))
 
-    if min_price is not None:
-        conditions.append(RFQ.price_amount >= Decimal(str(min_price)))
+    if currency:
+        conditions.append(RFQ.price_currency == currency.upper())
 
-    if max_price is not None:
-        conditions.append(RFQ.price_amount <= Decimal(str(max_price)))
+    min_bound = _finite_price(min_price)
+    if min_bound is not None:
+        conditions.append(RFQ.price_amount >= min_bound)
+
+    max_bound = _finite_price(max_price)
+    if max_bound is not None:
+        conditions.append(RFQ.price_amount <= max_bound)
 
     if q and q.strip():
-        # Tokenize search phrase so compound queries like 'office chair in mumbai'
-        # match across product title and location/category seamlessly.
-        raw_terms = [
-            w.strip()
-            for w in re.split(r"[^\w\+\-\./]+", q.strip())
-            if w.strip()
-            and w.lower() not in ("in", "at", "from", "for", "the", "a", "an", "to", "with", "and", "or", "of", "on", "by", "is")
-            and (len(w.strip()) >= 2 or w.isalnum())
-        ]
-        if raw_terms:
-            token_conditions = []
-            for t in raw_terms:
-                term = f"%{t}%"
-                token_conditions.append(
-                    or_(
-                        RFQ.title.ilike(term),
-                        RFQ.category.ilike(term),
-                        RFQ.description.ilike(term),
-                        RFQ.search_text.ilike(term),
-                        RFQ.location_city.ilike(term),
-                    )
-                )
-            conditions.append(and_(*token_conditions))
+        search_conds = build_search_conditions(q)
+        if search_conds:
+            conditions.append(and_(*search_conds))
+
+    # Viewer coordinates: the reference point for distance and radius.
+    viewer_lat = getattr(viewer.profile, "latitude", None) if viewer.profile else None
+    viewer_lon = getattr(viewer.profile, "longitude", None) if viewer.profile else None
+    ref_lat = lat if lat is not None else viewer_lat
+    ref_lon = lon if lon is not None else viewer_lon
+
+    if radius_km is not None:
+        # Applied in SQL so COUNT, LIMIT and OFFSET see the same rows.
+        if ref_lat is None or ref_lon is None:
+            conditions.append(false())
         else:
-            term = f"%{q.strip()}%"
-            conditions.append(
-                or_(
-                    RFQ.title.ilike(term),
-                    RFQ.category.ilike(term),
-                    RFQ.description.ilike(term),
-                    RFQ.search_text.ilike(term),
-                    RFQ.location_city.ilike(term),
-                )
-            )
+            conditions.append(radius_condition(float(ref_lat), float(ref_lon), float(radius_km)))
 
     # Base query
     base_query = (
@@ -202,10 +392,6 @@ async def get_catalog(
     )
     saved_rfq_ids = set((await db.scalars(saved_query)).all())
 
-    # Viewer coordinates for distance computation
-    viewer_lat = getattr(viewer.profile, "latitude", None) if viewer.profile else None
-    viewer_lon = getattr(viewer.profile, "longitude", None) if viewer.profile else None
-
     items: list[CatalogItemOut] = []
     for rfq in rfqs:
         owner_user = rfq.user
@@ -231,10 +417,6 @@ async def get_catalog(
             loc_lat = owner_profile.latitude
             loc_lon = owner_profile.longitude
 
-        # Reference coordinate for distance calculation (passed lat/lon or viewer's profile)
-        ref_lat = lat if lat is not None else viewer_lat
-        ref_lon = lon if lon is not None else viewer_lon
-
         # Distance calculation
         dist_km: Optional[float] = None
         if (
@@ -254,10 +436,7 @@ async def get_catalog(
             except Exception:
                 dist_km = None
 
-        # Filter by radius if requested
-        if radius_km is not None:
-            if dist_km is None or dist_km > radius_km:
-                continue
+        # radius_km is applied in SQL (radius_condition) so totals and pages agree.
 
         company_name = (
             (owner_profile.company_name or owner_profile.name)
@@ -279,21 +458,17 @@ async def get_catalog(
         )
 
         quantity = (
-            Quantity(value=float(rfq.quantity_value), unit=rfq.quantity_unit or "units")
+            Quantity.from_stored(rfq.quantity_value, rfq.quantity_unit)
             if rfq.quantity_value is not None
             else None
         )
         min_order = (
-            Quantity(value=float(rfq.min_order_value), unit=rfq.min_order_unit or "units")
+            Quantity.from_stored(rfq.min_order_value, rfq.min_order_unit)
             if rfq.min_order_value is not None
             else None
         )
         price_target = (
-            Money(
-                amount=float(rfq.price_amount),
-                currency=rfq.price_currency,
-                per_unit=rfq.price_per_unit,
-            )
+            Money.from_stored(rfq.price_amount, rfq.price_currency, rfq.price_per_unit)
             if rfq.price_amount is not None
             else None
         )
@@ -339,40 +514,110 @@ async def get_catalog(
     return CatalogListOut(items=items, total=total, limit=limit, offset=offset)
 
 
-async def get_categories_summary(db: AsyncSession) -> list[CategoryCountOut]:
-    """Return top categories with active listing counts across market sides."""
+async def get_categories_summary(
+    db: AsyncSession,
+    viewer: Optional[User] = None,
+    *,
+    q: Optional[str] = None,
+    city: Optional[str] = None,
+    country: Optional[str] = None,
+    min_price: Optional[float] = None,
+    max_price: Optional[float] = None,
+    currency: Optional[str] = None,
+    verified_only: bool = False,
+    saved_only: bool = False,
+) -> list[CategoryCountOut]:
+    """Return top categories with active listing counts matching catalog search filters."""
     now = datetime.now(UTC)
 
     # Normalize category casing and whitespace to eliminate duplicate entries
     norm_category = func.initcap(func.trim(RFQ.category))
 
+    conditions = [
+        RFQ.status == RFQStatus.ACTIVE,
+        or_(RFQ.expires_at.is_(None), RFQ.expires_at > now),
+        RFQ.category.is_not(None),
+        func.length(func.trim(RFQ.category)) > 0,
+    ]
+
+    if viewer:
+        conditions.append(RFQ.user_id != viewer.id)
+
+    if saved_only and viewer:
+        saved_subquery = select(SavedRFQ.rfq_id).where(SavedRFQ.user_id == viewer.id)
+        conditions.append(RFQ.id.in_(saved_subquery))
+
+    city = clean_text_param(city, 120)
+    country = clean_text_param(country, 120)
+    currency = clean_text_param(currency, 64)
+
+    if city:
+        conditions.append(_contains_ci(RFQ.location_city, city))
+
+    if country:
+        conditions.append(_contains_ci(RFQ.location_country, country))
+
+    if currency:
+        conditions.append(RFQ.price_currency == currency.upper())
+
+    min_bound = _finite_price(min_price)
+    if min_bound is not None:
+        conditions.append(RFQ.price_amount >= min_bound)
+
+    max_bound = _finite_price(max_price)
+    if max_bound is not None:
+        conditions.append(RFQ.price_amount <= max_bound)
+
+    if q and q.strip():
+        search_conds = build_search_conditions(q)
+        if search_conds:
+            conditions.append(and_(*search_conds))
+
+    query = select(
+        norm_category.label("category"),
+        func.count(RFQ.id).label("total_count"),
+        func.count(case((RFQ.role == RFQRole.SELLER, 1))).label("seller_count"),
+        func.count(case((RFQ.role == RFQRole.BUYER, 1))).label("buyer_count"),
+    )
+
+    if verified_only:
+        query = query.join(User, RFQ.user_id == User.id).outerjoin(
+            UserProfile, User.id == UserProfile.user_id
+        )
+        conditions.append(
+            or_(
+                UserProfile.kyc_status == KYCStatus.VERIFIED,
+                UserProfile.trust_score >= 60,
+            )
+        )
+
     query = (
-        select(
-            norm_category.label("category"),
-            func.count(RFQ.id).label("total_count"),
-            func.count(case((RFQ.role == RFQRole.SELLER, 1))).label("seller_count"),
-            func.count(case((RFQ.role == RFQRole.BUYER, 1))).label("buyer_count"),
-        )
-        .where(
-            RFQ.status == RFQStatus.ACTIVE,
-            or_(RFQ.expires_at.is_(None), RFQ.expires_at > now),
-            RFQ.category.is_not(None),
-            func.length(func.trim(RFQ.category)) > 0,
-        )
+        query.where(and_(*conditions))
         .group_by(norm_category)
         .order_by(func.count(RFQ.id).desc())
-        .limit(20)
     )
 
     rows = (await db.execute(query)).all()
+
+    # Merge spellings that normalize to one canonical category ("electronic",
+    # "Electronics") -- rows written before normalization-on-write existed.
+    merged: dict[str, list[int]] = {}
+    for row in rows:
+        name = normalize_category(row.category)
+        counts = merged.setdefault(name, [0, 0, 0])
+        counts[0] += row.total_count
+        counts[1] += row.seller_count
+        counts[2] += row.buyer_count
+
+    ordered = sorted(merged.items(), key=lambda item: (-item[1][0], item[0]))[:50]
     return [
         CategoryCountOut(
-            category=row.category,
-            total_count=row.total_count,
-            seller_count=row.seller_count,
-            buyer_count=row.buyer_count,
+            category=name,
+            total_count=counts[0],
+            seller_count=counts[1],
+            buyer_count=counts[2],
         )
-        for row in rows
+        for name, counts in ordered
     ]
 
 
@@ -381,7 +626,14 @@ async def get_catalog_item(
     viewer: User,
     rfq_id: uuid.UUID,
 ) -> Optional[CatalogItemOut]:
-    """Retrieve a single active or accessible RFQ listing with full counterparty trust data."""
+    """Retrieve a single RFQ listing with full counterparty trust data.
+
+    Only publicly listed RFQs (active and not past ``expires_at``) are served,
+    unless the viewer owns the RFQ or already has a connection about it (a deal
+    room must keep working after the listing is closed). Anything else --
+    another user's draft, a closed or an expired listing -- is ``None`` (404),
+    indistinguishable from an id that does not exist.
+    """
     query = (
         select(RFQ)
         .options(
@@ -393,13 +645,6 @@ async def get_catalog_item(
     if not rfq:
         return None
 
-    # Load owner's verified certs
-    certs_query = select(Certificate.name).where(
-        Certificate.user_id == rfq.user_id,
-        Certificate.verification_status == CertificationStatus.VERIFIED,
-    )
-    verified_certs = list((await db.scalars(certs_query)).all())
-
     # Check connection between viewer and this RFQ
     conn_query = select(Connection).where(
         Connection.rfq_id == rfq.id,
@@ -409,6 +654,22 @@ async def get_catalog_item(
         ),
     )
     conn = (await db.scalars(conn_query)).first()
+
+    now = datetime.now(UTC)
+    expires_at = rfq.expires_at
+    if expires_at is not None and expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
+    publicly_listed = rfq.status == RFQStatus.ACTIVE and (expires_at is None or expires_at > now)
+    if not publicly_listed and rfq.user_id != viewer.id and conn is None:
+        return None
+
+    # Load owner's verified certs
+    certs_query = select(Certificate.name).where(
+        Certificate.user_id == rfq.user_id,
+        Certificate.verification_status == CertificationStatus.VERIFIED,
+    )
+    verified_certs = list((await db.scalars(certs_query)).all())
+
     conn_id = conn.id if conn else None
     conn_status = conn.status.value if conn else None
     conn_direction = (
@@ -471,21 +732,17 @@ async def get_catalog_item(
     )
 
     quantity = (
-        Quantity(value=float(rfq.quantity_value), unit=rfq.quantity_unit or "units")
+        Quantity.from_stored(rfq.quantity_value, rfq.quantity_unit)
         if rfq.quantity_value is not None
         else None
     )
     min_order = (
-        Quantity(value=float(rfq.min_order_value), unit=rfq.min_order_unit or "units")
+        Quantity.from_stored(rfq.min_order_value, rfq.min_order_unit)
         if rfq.min_order_value is not None
         else None
     )
     price_target = (
-        Money(
-            amount=float(rfq.price_amount),
-            currency=rfq.price_currency,
-            per_unit=rfq.price_per_unit,
-        )
+        Money.from_stored(rfq.price_amount, rfq.price_currency, rfq.price_per_unit)
         if rfq.price_amount is not None
         else None
     )

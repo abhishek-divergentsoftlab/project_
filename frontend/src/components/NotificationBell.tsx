@@ -12,6 +12,8 @@ import {
   IconShield,
 } from "@/components/icons";
 
+const NOTIFICATION_POLL_MS = 25000;
+
 function NotificationIcon({ type }: { type: string }) {
   switch (type) {
     case "connection_request":
@@ -58,11 +60,33 @@ export function NotificationBell({ align = "end" }: { align?: "start" | "end" })
     }
   };
 
-  // Poll unread count on mount and interval
+  // Poll the unread count while the tab is visible. Hidden tabs used to keep
+  // polling every 25 s (over a third of all API traffic); now polling stops on
+  // visibilitychange -> hidden and resumes, with an immediate refresh, when the
+  // tab is shown again.
   useEffect(() => {
-    void fetchUnreadCount();
-    const interval = setInterval(fetchUnreadCount, 25000);
-    return () => clearInterval(interval);
+    let interval: ReturnType<typeof setInterval> | null = null;
+
+    const stop = () => {
+      if (interval) clearInterval(interval);
+      interval = null;
+    };
+    const start = () => {
+      if (interval) return;
+      void fetchUnreadCount();
+      interval = setInterval(() => void fetchUnreadCount(), NOTIFICATION_POLL_MS);
+    };
+    const onVisibilityChange = () => {
+      if (document.hidden) stop();
+      else start();
+    };
+
+    if (!document.hidden) start();
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      stop();
+    };
   }, []);
 
   // When dropdown opens, fetch latest notifications

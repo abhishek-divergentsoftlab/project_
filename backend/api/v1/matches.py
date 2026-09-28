@@ -1,6 +1,7 @@
 """Matching endpoints."""
 
 import uuid
+from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query, status
@@ -35,6 +36,18 @@ async def match_rfq(
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             "publish this RFQ before searching for counterparties",
+        )
+    # A closed or lapsed listing is off the market; matching it would record
+    # searches and surface counterparties for a deal nobody can make.
+    expires_at = rfq.expires_at
+    if expires_at is not None and expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
+    if rfq.status in (RFQStatus.CLOSED, RFQStatus.EXPIRED) or (
+        expires_at is not None and expires_at <= datetime.now(UTC)
+    ):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "this RFQ is closed or expired; reopen or repost it to search for counterparties",
         )
 
     return await match_service.match_for_rfq(

@@ -2,6 +2,15 @@
 
 import pytest
 
+from core.config import settings
+
+
+@pytest.fixture(autouse=True)
+def isolated_uploads(tmp_path, monkeypatch):
+    """Write uploads to a throwaway directory, never the real backend/uploads."""
+    monkeypatch.setattr(settings, "UPLOAD_DIR", str(tmp_path / "uploads"))
+    return tmp_path / "uploads"
+
 
 @pytest.mark.asyncio
 async def test_certificate_upload_and_serving(make_actor):
@@ -17,7 +26,8 @@ async def test_certificate_upload_and_serving(make_actor):
     data = upload_resp.json()
     assert "document_url" in data
     assert data["filename"] == "iso_certificate.pdf"
-    assert data["document_url"].startswith("/api/v1/media/certificates/cert_")
+    # The filename embeds the uploader so the URL can be tied to its owner.
+    assert data["document_url"].startswith(f"/api/v1/media/certificates/cert_{seller.id.replace('-', '')}_")
     doc_url = data["document_url"]
 
     # 2. Fetch media file and verify content-type and security headers

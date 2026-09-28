@@ -4,7 +4,7 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import { errorMessage } from "@/api/client";
 import { moderation as moderationApi, rfqs as rfqApi } from "@/api/endpoints";
 import { IconAlert, IconChevronLeft, IconClose, IconMapPin, IconPlus } from "@/components/icons";
-import { LocationMapPicker } from "@/components/map/LocationMapPicker";
+import { LocationMapPicker } from "@/components/map/lazy";
 import { useAuth } from "@/context/useAuth";
 import { useFeedback } from "@/context/useFeedback";
 import type { ProductDetails, RFQ, RFQCreatePayload, RFQRole } from "@/types";

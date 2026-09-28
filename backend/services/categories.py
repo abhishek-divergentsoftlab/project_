@@ -20,6 +20,7 @@ CANONICAL_CATEGORIES: tuple[str, ...] = (
     "Chemicals",
     "Construction",
     "Stationery",
+    "Learning",
 )
 
 # Common aliases, singular forms, colloquial terms and misspellings -> Canonical Category
@@ -123,7 +124,17 @@ CATEGORY_ALIASES: dict[str, str] = {
 _CANONICAL_LOWER_MAP: dict[str, str] = {
     c.lower(): c for c in CANONICAL_CATEGORIES
 }
-_CANONICAL_LOWER_MAP["learning"] = "Learning"
+
+
+def category_variants(canonical: str) -> set[str]:
+    """Lower-cased spellings that normalize to ``canonical``.
+
+    Used to match rows stored before normalization was applied on write, so a
+    filter for "Electronics" also finds a legacy "electronic" row in SQL.
+    """
+    variants = {canonical.lower()}
+    variants.update(alias for alias, target in CATEGORY_ALIASES.items() if target == canonical)
+    return variants
 
 
 def normalize_category(category: Optional[str]) -> str:

@@ -5,7 +5,7 @@ import { errorMessage } from "@/api/client";
 import { connections, matching, rfqs as rfqApi } from "@/api/endpoints";
 import { IconChevronLeft, IconSparkles } from "@/components/icons";
 import { MatchCard } from "@/components/MatchCard";
-import { MatchRouteModal } from "@/components/map/MatchRouteModal";
+import { MatchRouteModal } from "@/components/map/lazy";
 import { useFeedback } from "@/context/useFeedback";
 import type { Connection, MatchCandidate, RFQ } from "@/types";
 

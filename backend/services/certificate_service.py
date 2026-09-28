@@ -1,6 +1,15 @@
-"""Certificate service for managing seller compliance and quality certificates."""
+"""Certificate service for managing seller compliance and quality certificates.
 
+Certificates are self-declared: nobody reviews them yet. ``verification_status``
+keeps the existing enum value, but the trust-score effect is bounded and
+derived from facts: ``kyc_service.recompute_trust_score`` counts the user's
+currently valid (unexpired) certificates at +5 each, capped at +15, so deleting
+or expiring one removes its bonus and certificates cannot farm the score.
+"""
+
+import re
 import uuid
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -12,20 +21,90 @@ from models.certificate import Certificate
 from models.enums import CertificationStatus
 from models.user import UserProfile
 from schemas.certificate import CertificateCreate
+from services import kyc_service
 
 MAX_CERTIFICATE_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
 ALLOWED_CERTIFICATE_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".webp"}
+CERTIFICATE_MEDIA_PREFIX = "/api/v1/media/certificates/"
+
+# Uploads are named cert_<owner uuid hex>_<random hex>.<ext> so a document URL
+# can be tied back to the account that uploaded it. Files from before this
+# scheme (cert_<random hex>.<ext>) are still served, but cannot be attached to
+# a new certificate because their owner is unknown.
+_OWNED_UPLOAD_RE = re.compile(
+    r"^cert_(?P<owner>[0-9a-f]{32})_[0-9a-f]{32}\.(?:pdf|png|jpg|jpeg|webp)$"
+)
 
 
 class CertificateError(Exception):
-    """Domain-level certificate error."""
+    """Domain-level certificate error. ``status_code`` maps it onto HTTP."""
+
+    def __init__(self, message: str, status_code: int = 400) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _aware(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+def validate_document_url(document_url: Optional[str], user_id: uuid.UUID) -> Optional[str]:
+    """Allow only empty or a certificate file this user uploaded through us.
+
+    Rejects ``javascript:`` / ``data:`` URLs, external links, other users'
+    uploads, path tricks, and files that do not exist.
+    """
+    if document_url is None:
+        return None
+    url = document_url.strip()
+    if not url:
+        return None
+
+    if not url.startswith(CERTIFICATE_MEDIA_PREFIX):
+        raise CertificateError(
+            "document_url must be a file uploaded via /certifications/upload", status_code=422
+        )
+    filename = url[len(CERTIFICATE_MEDIA_PREFIX):]
+    match = _OWNED_UPLOAD_RE.match(filename)
+    if match is None:
+        raise CertificateError(
+            "document_url must be a file uploaded via /certifications/upload", status_code=422
+        )
+    if match.group("owner") != user_id.hex:
+        raise CertificateError(
+            "document_url refers to a file uploaded by another account", status_code=403
+        )
+    if not (Path(settings.UPLOAD_DIR).resolve() / "certificates" / filename).is_file():
+        raise CertificateError("document_url refers to a file that does not exist", status_code=422)
+    return url
+
+
+async def _refresh_trust(db: AsyncSession, user_id: uuid.UUID) -> None:
+    profile = (
+        await db.execute(select(UserProfile).where(UserProfile.user_id == user_id))
+    ).scalar_one_or_none()
+    if profile is not None:
+        await kyc_service.recompute_trust_score(db, profile)
 
 
 async def create_certificate(
     db: AsyncSession, user_id: uuid.UUID, payload: CertificateCreate
 ) -> Certificate:
-    if payload.expiry_date and payload.expiry_date <= payload.issue_date:
-        raise CertificateError("Certificate expiry date must be after the issue date")
+    now = datetime.now(UTC)
+    issue_date = _aware(payload.issue_date)
+    expiry_date = _aware(payload.expiry_date) if payload.expiry_date else None
+
+    if issue_date > now + timedelta(days=1):
+        raise CertificateError("Certificate issue date cannot be in the future", status_code=422)
+    if expiry_date and expiry_date <= issue_date:
+        raise CertificateError("Certificate expiry date must be after the issue date", status_code=422)
+    if expiry_date and expiry_date <= now:
+        raise CertificateError(
+            "Certificate has already expired; only currently valid certificates can be added",
+            status_code=422,
+        )
+
+    document_url = validate_document_url(payload.document_url, user_id)
 
     certificate = Certificate(
         user_id=user_id,
@@ -34,16 +113,14 @@ async def create_certificate(
         certificate_number=payload.certificate_number.strip(),
         issue_date=payload.issue_date,
         expiry_date=payload.expiry_date,
-        document_url=payload.document_url,
+        document_url=document_url,
         verification_status=CertificationStatus.VERIFIED,
     )
     db.add(certificate)
+    await db.flush()
 
-    # Boost trust score by 10 for having a verified industry certificate
-    profile_query = select(UserProfile).where(UserProfile.user_id == user_id)
-    profile = (await db.execute(profile_query)).scalar_one_or_none()
-    if profile:
-        profile.trust_score = min(100, profile.trust_score + 10)
+    # Recomputed from the user's valid certificates (capped), never incremented.
+    await _refresh_trust(db, user_id)
 
     await db.commit()
     await db.refresh(certificate)
@@ -90,6 +167,8 @@ async def delete_certificate(
         raise CertificateError("Certificate not found or not owned by you")
 
     await db.delete(cert)
+    await db.flush()
+    await _refresh_trust(db, user_id)
     await db.commit()
     return True
 
@@ -111,6 +190,8 @@ def validate_and_save_certificate_file(
     file_bytes: bytes,
     original_filename: str,
     content_type: Optional[str] = None,
+    *,
+    owner_id: uuid.UUID,
 ) -> tuple[str, str, int]:
     """Validate certificate file integrity, extension, size, and store it outside web root.
 
@@ -145,7 +226,7 @@ def validate_and_save_certificate_file(
     upload_dir = Path(settings.UPLOAD_DIR).resolve() / "certificates"
     upload_dir.mkdir(parents=True, exist_ok=True)
 
-    random_filename = f"cert_{uuid.uuid4().hex}{ext}"
+    random_filename = f"cert_{owner_id.hex}_{uuid.uuid4().hex}{ext}"
     dest_path = (upload_dir / random_filename).resolve()
 
     # Verify path confinement inside upload_dir
@@ -182,6 +263,7 @@ async def upload_certificate_document(
         file_bytes=file_bytes,
         original_filename=original_filename,
         content_type=content_type,
+        owner_id=user_id,
     )
 
     cert.document_url = document_url

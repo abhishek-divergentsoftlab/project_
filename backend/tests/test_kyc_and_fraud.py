@@ -7,7 +7,9 @@ import pytest
 async def test_kyc_gst_verification_and_anti_fraud(make_actor):
     seller1 = await make_actor("seller", name="Enterprise Supplier 1", company_name="Apex Solutions")
 
-    valid_gst = "27AABCU9603R1ZM"  # Valid Maharashtra GSTIN format
+    # Maharashtra GSTIN with a correct check character. (The widely quoted
+    # example 27AABCU9603R1ZM fails the GSTN checksum and is now rejected.)
+    valid_gst = "27AABCU9603R1ZN"
 
     # 1. Invalid GST format rejected
     invalid_resp = await seller1.post(
@@ -18,7 +20,7 @@ async def test_kyc_gst_verification_and_anti_fraud(make_actor):
             "business_type": "Private Limited",
         },
     )
-    assert invalid_resp.status_code == 400
+    assert invalid_resp.status_code == 422
     assert "format" in invalid_resp.json()["detail"].lower()
 
     # 2. Valid GST submitted and verified
@@ -37,7 +39,10 @@ async def test_kyc_gst_verification_and_anti_fraud(make_actor):
     )
     assert valid_resp.status_code == 200
     data = valid_resp.json()
+    # Format-level verification (structure + checksum + PAN-in-GSTIN), and the
+    # message says so rather than implying a registry lookup.
     assert data["kyc_status"] == "verified"
+    assert "checksum" in data["message"].lower()
     assert data["gst_number"] == valid_gst
     assert data["trust_score"] >= 50
 
@@ -59,5 +64,5 @@ async def test_kyc_gst_verification_and_anti_fraud(make_actor):
             "business_type": "Proprietorship",
         },
     )
-    assert dup_resp.status_code == 400
+    assert dup_resp.status_code == 409
     assert "anti-fraud" in dup_resp.json()["detail"].lower()

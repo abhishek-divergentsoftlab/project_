@@ -42,7 +42,7 @@ async def signup(db: AsyncSession, payload: SignupRequest) -> User:
         email=payload.email,
         password_hash=hash_password(payload.password),
         role=payload.role,
-        status=UserStatus.ACTIVE,
+        status=UserStatus.PENDING_VERIFICATION,
     )
     user.profile = UserProfile(
         name=payload.name,

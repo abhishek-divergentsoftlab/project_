@@ -20,7 +20,8 @@ if TYPE_CHECKING:
 class EscrowAccount(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     __tablename__ = "escrow_accounts"
     __table_args__ = (
-        Index("ix_escrow_accounts_connection_id", "connection_id"),
+        # One vault per deal room (unique since migration 33f0b331948b).
+        Index("ix_escrow_accounts_connection_id", "connection_id", unique=True),
         Index("ix_escrow_accounts_quotation_id", "quotation_id"),
         Index("ix_escrow_accounts_buyer_id", "buyer_id"),
         Index("ix_escrow_accounts_seller_id", "seller_id"),

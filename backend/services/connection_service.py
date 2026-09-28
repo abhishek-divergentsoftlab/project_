@@ -326,6 +326,16 @@ async def send_live_capture_message(
             f"Invalid image format '{content_type}'. Must be JPEG, PNG, or WebP.",
         )
 
+    # Validate magic bytes / header
+    is_png = file_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+    is_jpeg = file_bytes.startswith(b"\xff\xd8\xff")
+    is_webp = file_bytes.startswith(b"RIFF") and b"WEBP" in file_bytes[:16]
+    if not (is_png or is_jpeg or is_webp):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Invalid file content: file does not match valid image signature.",
+        )
+
     # Validate file size (max 10MB)
     if len(file_bytes) > 10 * 1024 * 1024:
         raise HTTPException(

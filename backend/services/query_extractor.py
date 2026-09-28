@@ -19,7 +19,7 @@ from typing import Any, Optional
 from pydantic import BaseModel, Field
 
 from models.enums import RFQRole
-from services import currency as currency_service, unit_converter
+from services import currency as currency_service, product_synonyms, unit_converter
 from services.locations import City, Location, find_city, find_location
 from services.match_scoring import singularise
 
@@ -47,7 +47,9 @@ _CURRENCIES: dict[str, str] = {
 
 _UNITS = (
     "pcs", "pieces", "piece", "units", "unit", "nos", "no",
-    "kg", "kgs", "kilogram", "kilograms", "tonne", "tonnes", "ton", "tons", "mt",
+    "metric tonnes", "metric tonne", "metric tons", "metric ton",
+    "kg", "kgs", "kilogram", "kilograms", "kilo", "kilos",
+    "tonne", "tonnes", "ton", "tons", "mt",
     "quintal", "quintals", "qtl",
     "meter", "meters", "metre", "metres", "m",
     "box", "boxes", "carton", "cartons", "roll", "rolls", "set", "sets",
@@ -61,13 +63,22 @@ _UNITS = (
     "lb", "lbs", "pound", "pounds",
 )
 
+# Spellings reported under one canonical unit, so "20 metric tons" is 20 tonne
+# and "500 kilo" is 500 kg. Other units are returned as typed.
+_UNIT_CANONICAL: dict[str, str] = {
+    "metric tonnes": "tonne", "metric tonne": "tonne",
+    "metric tons": "tonne", "metric ton": "tonne",
+    "kilo": "kg", "kilos": "kg",
+}
+
 # Units that only ever count things. A leftover "pcs"/"pcses"/"kg" is noise in a
 # product name, whereas "box", "carton" and "roll" are products in their own
 # right and must survive.
 _COUNT_UNITS = frozenset(
     """pc pcs piece pieces unit units no nos each kg kgs kilogram kilograms
     tonne tonnes ton tons mt m meter meters metre metres l litre litres liter
-    liters quintal quintals qtl lb lbs bora boras bori boris katta kattas""".split()
+    liters quintal quintals qtl lb lbs bora boras bori boris katta kattas
+    kilo kilos metric dozen dozens""".split()
 )
 
 _COLORS = (
@@ -113,6 +124,12 @@ _CATEGORY_HINTS: dict[str, tuple[str, ...]] = {
         "tomato", "tomatos", "tomatoes", "chili", "chilies", "spice", "spices", "crop",
         "crops", "produce", "corn", "maize", "pulses", "pulse", "beans", "lentils",
         "garlic", "ginger", "mango", "mangoes", "banana", "sugar", "tea", "coffee",
+        # Canonical forms of the local names in services/product_synonyms, so
+        # "pyaz", "haldi" or "mirchi" are recognised once translated.
+        "chilli", "chillies", "chilly", "turmeric", "cumin", "cardamom", "clove",
+        "pepper", "coriander", "groundnut", "peanut", "soybean", "mustard", "millet",
+        "jaggery", "cashew", "almond", "okra", "brinjal", "cauliflower", "cabbage",
+        "pea", "chickpea", "grape", "lemon", "sesame", "lentil", "flour", "apple",
     ),
     "Textiles": (
         "shirt", "shirts", "fabric", "fabrics", "denim", "cotton", "textile", "textiles",
@@ -161,7 +178,7 @@ _ORDINALS = frozenset(
 
 # Stripped from the residual product phrase.
 _FILLER = frozenset(
-    """i we want need looking for buy sell selling buying supply supplying show me
+    """metric i we want need looking for buy sell selling buying supply supplying show me
     find get me some any please pls of the a an at in on to from with and or for is
     are am was were been be will would can could should must my our your it its that this these those now next
     also plus per each price prices priced pricing cost costs costing rate rates
@@ -190,8 +207,15 @@ _FILLER = frozenset(
     confused decide deciding decision analyze analyse analysis analyzing
     suitable there many how what which where tell telling know market
     seller sellers buyer buyers supplier suppliers vendor vendors listing listings
+    detail details info information contact contacts aslo alos too
+    mail email emails id ids suit suits suited top two three four five compare comparison
+    role draft drafting create creating created raise rais raised suppy suply supplly suplly udpate fron frm
+    deliver delivered delivering delevered delivred dispatch dispatched shipped
+    delivery deliveries shipping transport logistics list lists
     plan plans planning planned wish wishing aim aiming ready
-    bhai mujhe chahiye karna krna hoga karo mera meri hum hume ka ki ke ko se me mein""".split()
+    bhai mujhe chahiye karna krna hoga karo mera meri hum hume ka ki ke ko se me mein
+    main mai bechna kharidna khareedna chahta chahti chahte hoon hu hun hai hain tha the thi
+    quiero comprar vender de para un una unos unas por con el la los las""".split()
     + list(_ORDINALS)
 )
 
@@ -657,12 +681,87 @@ def _extract_compound_packaging(
     return count, pack_unit, attrs, working
 
 
+def _unit_alternation() -> str:
+    return "|".join(
+        re.escape(u).replace(r"\ ", r"\s+") for u in sorted(_UNITS, key=len, reverse=True)
+    )
+
+
+def _canonical_unit(raw: str) -> str:
+    unit = " ".join(raw.lower().split())
+    return _UNIT_CANONICAL.get(unit, unit)
+
+
+# Indian and shorthand multipliers. "5 lakh" is 500,000 and "2 crore" is
+# 20,000,000; without this the number was read as 5 and "lakh" became part of
+# the product name.
+_MULTIPLIERS: dict[str, Decimal] = {
+    "lakh": Decimal(100000), "lakhs": Decimal(100000), "lac": Decimal(100000),
+    "lacs": Decimal(100000), "crore": Decimal(10000000), "crores": Decimal(10000000),
+    "cr": Decimal(10000000), "thousand": Decimal(1000), "million": Decimal(1000000),
+}
+_MULTIPLIER_RE = re.compile(
+    rf"(?P<n>{_NUMBER})\s*(?P<m>lakhs?|lacs?|crores?|cr|thousand|million)\b",
+    re.IGNORECASE,
+)
+_DOZEN_RE = re.compile(rf"(?P<n>{_NUMBER})\s*(?:dozens?|doz)\b", re.IGNORECASE)
+_CURRENCY_BEFORE_K = r"(?:₹|\$|€|£|rs\.?|inr|usd|eur|gbp)"
+
+
+def _plain(value: Decimal) -> str:
+    text = format(value.normalize(), "f")
+    return text
+
+
+def _expand_multipliers(text: str) -> str:
+    """Rewrite multiplier shorthand as plain numbers before anything is parsed.
+
+    "5 lakh pcs" -> "500000 pcs", "2 crore" -> "20000000", "1.5k pcs" ->
+    "1500 pcs", "₹2k" -> "₹2000", "2 dozen chairs" -> "24 pcs chairs".
+    A bare "k" is only expanded before a unit or after a currency, so "8k"
+    in "hdmi 8k cable" stays a resolution.
+    """
+    if not text:
+        return text
+
+    def mult(match: re.Match) -> str:
+        number = _to_decimal(match.group("n"))
+        factor = _MULTIPLIERS.get(match.group("m").lower())
+        if number is None or factor is None:
+            return match.group(0)
+        return _plain(number * factor)
+
+    def dozen(match: re.Match) -> str:
+        number = _to_decimal(match.group("n"))
+        if number is None:
+            return match.group(0)
+        return _plain(number * 12)
+
+    def thousands(match: re.Match) -> str:
+        number = _to_decimal(match.group("n"))
+        if number is None:
+            return match.group(0)
+        return f"{match.group('pre') or ''}{_plain(number * 1000)}"
+
+    out = _MULTIPLIER_RE.sub(mult, text)
+    out = _DOZEN_RE.sub(dozen, out)
+    out = re.sub(
+        rf"(?P<pre>)(?P<n>\d+(?:\.\d+)?)\s?k\b(?=\s*(?:{_unit_alternation()})\b)",
+        thousands, out, flags=re.IGNORECASE,
+    )
+    out = re.sub(
+        rf"(?P<pre>{_CURRENCY_BEFORE_K}\s*)(?P<n>\d+(?:\.\d+)?)\s?k\b",
+        thousands, out, flags=re.IGNORECASE,
+    )
+    return out
+
+
 def _extract_quantity(text: str) -> tuple[Optional[Decimal], Optional[str], str]:
-    unit_alt = "|".join(sorted(_UNITS, key=len, reverse=True))
+    unit_alt = _unit_alternation()
     match = re.search(rf"(?P<amt>{_NUMBER})\s*(?P<unit>{unit_alt})\b", text, flags=re.IGNORECASE)
     if match:
         value = _to_decimal(match.group("amt"))
-        unit = match.group("unit").lower()
+        unit = _canonical_unit(match.group("unit"))
         cleaned = text[: match.start()] + " " + text[match.end() :]
         return value, unit, cleaned
 
@@ -683,13 +782,32 @@ def _extract_quantity(text: str) -> tuple[Optional[Decimal], Optional[str], str]
     return None, None, text
 
 
+# "supply" as people actually type it in a chat box.
+_SUPPLY_VERB = r"(?:supply|suppy|suply|supplly|suplly|sypply|supplie)"
+
+
 def _extract_role(text: str) -> Optional[RFQRole]:
     lowered = f" {text.lower()} "
 
+    # 0. Explicit role switches: "update the rfq from buyer to seller".
+    switch = re.search(
+        r"\b(?:from|fron|frm)\s+(?:a\s+)?(buyer|seller|supplier)\s+to\s+(?:a\s+)?(buyer|seller|supplier)\b"
+        r"|\b(?:change|switch|convert|make|set|udpate|update)\b[^.?!\n]{0,30}\bto\s+(?:a\s+)?(buyer|seller|supplier|selling|buying)\b"
+        r"|\b(?:make|mark|set)\s+it\s+(?:an?\s+)?(buyer|seller|supplier|sell|buy)\w*\s+(?:rfq|listing|post)\b",
+        lowered,
+    )
+    if switch:
+        target = switch.group(2) or switch.group(3) or switch.group(4)
+        target = {"sell": "seller", "selling": "seller", "buy": "buyer", "buying": "buyer"}.get(target, target)
+        return RFQRole.BUYER if target == "buyer" else RFQRole.SELLER
+
     # 1. High-confidence compound phrases first (overrides standalone "i want" or "looking")
     compound_sell = [
-        r"\b(?:i\s+)?(?:want|looking|plan|planning|ready|wish|wishing|aim|aiming)\s+to\s+(?:supply|sell|offer|provide)\b",
-        r"\b(?:i\s+)?(?:can|could|will|would)\s+(?:supply|sell|offer|provide)\b",
+        # "buy the basmati rice from us" is a seller pitching to a buyer.
+        r"\bbuy\b[^.?!\n]{0,60}\bfrom\s+(?:us|me|our)\b",
+        rf"\b(?:for|to)\s+(?:the\s+)?{_SUPPLY_VERB}\b",
+        rf"\b(?:i\s+)?(?:want|looking|plan|planning|ready|wish|wishing|aim|aiming)\s+to\s+(?:{_SUPPLY_VERB}|sell|offer|provide)\b",
+        rf"\b(?:i\s+)?(?:can|could|will|would)\s+(?:{_SUPPLY_VERB}|sell|offer|provide)\b",
         r"\b(?:i\s+)?(?:am|'m|we\s+are|we're)\s+(?:selling|supplying|offering|providing)\b",
         r"\b(?:have|got)\s+(?:stock|inventory|supplies|availability)\b",
         r"\b(?:for\s+sale|to\s+sell|to\s+supply)\b",
@@ -870,7 +988,8 @@ def _extract_attributes(text: str) -> dict[str, Any]:
 
 
 def _infer_category(text: str) -> Optional[str]:
-    lowered = text.lower()
+    # Local names first: "pyaz" is an onion, "haldi" turmeric.
+    lowered = product_synonyms.canonicalise_text(text)
     lowered = re.sub(r"\bvagitable[s]?\b", "vegetable", lowered)
     lowered = re.sub(r"\bvegitable[s]?\b", "vegetable", lowered)
     lowered = re.sub(r"\btomatos\b", "tomatoes", lowered)
@@ -895,6 +1014,7 @@ def _extract_product(
     city: Optional[City] = None,
 ) -> Optional[str]:
     lowered = text.lower()
+    lowered = re.sub(r"\b(?:pan|all)[\s-]+india\b", " ", lowered)
 
     # 1. Strip secondary conversational/analytical/question clauses so doubt questions
     # do not pollute the core commodity noun phrase (e.g. "but i am confused what price...")
@@ -924,6 +1044,7 @@ def _extract_product(
     from services.locations import CITIES
     city_regex = r"\b(?:" + "|".join(re.escape(k) for k in CITIES.keys()) + r")\b"
     lowered = re.sub(city_regex, " ", lowered)
+    lowered = re.sub(r"\b(?:pan|all)[\s-]+india\b", " ", lowered, flags=re.IGNORECASE)
 
     # Strip common states, regions and country markers so they never become a product name
     _GEO_WORDS = (
@@ -933,6 +1054,16 @@ def _extract_product(
         r"india|china|germany"
     )
     lowered = re.sub(rf"\b(?:{_GEO_WORDS})\b", " ", lowered)
+
+    # Dynamic prepositional location expressions: e.g. "in Bhiwandi", "at Surat", "near Thane"
+    def _strip_prep_loc(m: re.Match) -> str:
+        word = m.group(1).lower()
+        if word in {"bulk", "stock", "boxes", "box", "bags", "bag", "pieces", "pcs", "roll", "rolls", "transit", "advance", "cash", "credit", "full", "part", "good", "new", "fresh", "sealed", "loose"}:
+            return m.group(0)
+        return " "
+
+    lowered = re.sub(r"\b(?:in|at|near|around)\s+([a-zA-Z]+)\b", _strip_prep_loc, lowered)
+    lowered = re.sub(r"\btype\s+c\b", "type-c", lowered)
 
     # Normalize apostrophe ordinals like 12'th -> 12th so they match _ORDINALS / _FILLER
     lowered = re.sub(r"(\d+)'(th|st|nd|rd)\b", r"\1\2", lowered)
@@ -1056,7 +1187,7 @@ def extract(message: str) -> Requirements:
     # 1. Negation detection: extract negated attributes and blank out negated clauses
     negated_attrs, positive_text = _detect_negations(message)
     requirements.negated_attributes = negated_attrs
-    working = positive_text
+    working = _expand_multipliers(positive_text)
 
     price, currency, per_unit, working = _extract_price(working)
     if price is None:
@@ -1106,6 +1237,29 @@ def extract(message: str) -> Requirements:
     requirements.product = _extract_product(working, requirements.attributes, location=loc)
 
     return requirements
+
+
+def detect_role(message: str) -> Optional[RFQRole]:
+    """The role the user actually stated in this message, or None.
+
+    ``extract(...).role`` falls back to BUYER for the direct search flow, so it
+    cannot tell "I am buying" from "no role mentioned". Chat code that updates a
+    draft must use this instead, or every message resets the draft to BUYER.
+    """
+    if not message or not message.strip():
+        return None
+    return _extract_role(message)
+
+
+def clean_product_phrase(phrase: Optional[str]) -> Optional[str]:
+    """Strip filler from a product phrase proposed elsewhere (e.g. by the LLM).
+
+    "buyer details" and "details aslo" reduce to nothing, so they are never
+    queried as a commodity.
+    """
+    if not phrase or not phrase.strip():
+        return None
+    return _extract_product(phrase.lower(), {})
 
 
 def parse_answer(field: str, message: str) -> Optional[Requirements]:

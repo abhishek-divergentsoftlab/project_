@@ -301,15 +301,15 @@ def test_unknown_values_fall_through_to_token_overlap():
 
 def test_a_window_that_covers_the_requirement_is_full_marks():
     now = datetime.now(UTC)
-    assert ms.deadline_score(now + timedelta(days=7), now + timedelta(days=30)) == 1.0
+    assert ms.deadline_score(now + timedelta(days=30), now + timedelta(days=7)) == 1.0
 
 
 def test_a_shorter_window_decays_over_a_fortnight():
     now = datetime.now(UTC)
     assert ms.deadline_score(
-        now + timedelta(days=21), now + timedelta(days=14)
+        now + timedelta(days=14), now + timedelta(days=21)
     ) == pytest.approx(0.5, abs=0.01)
-    assert ms.deadline_score(now + timedelta(days=60), now + timedelta(days=1)) == 0.0
+    assert ms.deadline_score(now + timedelta(days=1), now + timedelta(days=60)) == 0.0
 
 
 def test_deadline_is_unscored_when_either_side_left_it_open():

@@ -1,5 +1,6 @@
 """B2B Deal Room endpoints: formal quotations, counter-offers, and Purchase Orders."""
 
+import asyncio
 import uuid
 from typing import Optional
 
@@ -81,8 +82,10 @@ async def download_purchase_order_pdf(
     quote, buyer, seller, rfq = await quotation_service.get_quote_documents_context(
         db, connection_id, quote_id, current_user.id
     )
-    pdf_bytes = document_generator.generate_purchase_order_pdf(
-        quotation=quote, buyer=buyer, seller=seller, rfq=rfq
+    # ReportLab is CPU-bound; run it off the event loop.
+    pdf_bytes = await asyncio.to_thread(
+        document_generator.generate_purchase_order_pdf,
+        quotation=quote, buyer=buyer, seller=seller, rfq=rfq,
     )
     po_ref = quote.purchase_order_reference or f"PO-{str(quote.id)[:8].upper()}"
     filename = f"Purchase_Order_{po_ref}.pdf"
@@ -103,13 +106,19 @@ async def download_commercial_invoice_pdf(
 ):
     """Generate and download official B2B Commercial Tax Invoice PDF."""
     from fastapi import Response
-    from services import document_generator
+    from services import document_generator, escrow_service
 
     quote, buyer, seller, rfq = await quotation_service.get_quote_documents_context(
         db, connection_id, quote_id, current_user.id
     )
-    pdf_bytes = document_generator.generate_commercial_invoice_pdf(
-        quotation=quote, buyer=buyer, seller=seller, rfq=rfq
+    # The invoice states the escrow position; it must never claim a deposit
+    # that was not made.
+    escrow = await escrow_service.find_escrow_for_connection(db, connection_id)
+    if escrow is not None and escrow.quotation_id != quote.id:
+        escrow = None
+    pdf_bytes = await asyncio.to_thread(
+        document_generator.generate_commercial_invoice_pdf,
+        quotation=quote, buyer=buyer, seller=seller, rfq=rfq, escrow=escrow,
     )
     filename = f"Commercial_Invoice_{quote.quote_number}.pdf"
 

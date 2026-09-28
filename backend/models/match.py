@@ -88,6 +88,7 @@ class MatchResult(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     __table_args__ = (
         UniqueConstraint("search_id", "rfq_id", name="uq_match_results_search_rfq"),
         Index("ix_match_results_search_rank", "search_id", "rank"),
+        Index("ix_match_results_rfq_id", "rfq_id"),
     )
 
     search_id: Mapped[uuid.UUID] = mapped_column(

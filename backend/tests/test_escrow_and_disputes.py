@@ -54,7 +54,7 @@ async def test_escrow_full_lifecycle_and_security(accepted_pair, make_actor):
     # 6. Guard: Seller cannot deposit funds (Buyer-only operation)
     seller_fund = await seller.post(
         f"/connections/{conn_id}/escrow/fund",
-        json={"payment_method": "mock_instant"},
+        json={"payment_method": "bank_transfer", "payment_reference": "UTR12345678"},
     )
     assert seller_fund.status_code == 403
     assert "Only the registered Buyer" in seller_fund.json()["detail"]
@@ -62,7 +62,11 @@ async def test_escrow_full_lifecycle_and_security(accepted_pair, make_actor):
     # 7. Buyer funds the Escrow Vault
     buyer_fund = await buyer.post(
         f"/connections/{conn_id}/escrow/fund",
-        json={"payment_method": "mock_instant", "notes": "Approved for 100% escrow vault allocation."},
+        json={
+            "payment_method": "bank_transfer",
+            "payment_reference": "UTR12345678",
+            "notes": "Approved for 100% escrow vault allocation.",
+        },
     )
     assert buyer_fund.status_code == 200
     funded_escrow = buyer_fund.json()

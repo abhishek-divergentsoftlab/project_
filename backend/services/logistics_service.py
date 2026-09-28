@@ -9,6 +9,7 @@ import uuid
 
 from fastapi import HTTPException, status
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.connection import Connection
@@ -25,66 +26,129 @@ from schemas.logistics import (
     ShipmentOut,
     ShipmentStatusUpdatePayload,
 )
-from services.locations import CITIES, find_city
+from services import currency as currency_service
+from services import notification_service
+from services.deal_parties import resolve_buyer_seller
+from services.locations import CITIES, find_city, find_location
 from services.match_scoring import haversine_km
 from services.websocket_manager import ws_manager
 
 logger = logging.getLogger(__name__)
 
-# Currency conversion factors relative to USD for rough parity
-USD_CONVERSIONS: dict[str, float] = {
-    "USD": 1.0,
-    "INR": 86.5,
-    "EUR": 0.92,
-    "GBP": 0.78,
-    "AED": 3.67,
-    "SGD": 1.34,
-    "CNY": 7.23,
-    "CAD": 1.38,
-    "AUD": 1.54,
-}
+# Approximate geographic centroids, used when a city is not in the locations
+# table but its country is known. Keys are lower-case names and ISO-3166 codes.
+_COUNTRY_CENTROIDS: dict[str, tuple[float, float]] = {}
+for _names, _coords in (
+    (("india", "in", "ind", "bharat"), (20.5937, 78.9629)),
+    (("united states", "usa", "us", "united states of america", "america"), (37.0902, -95.7129)),
+    (("china", "cn", "chn", "prc"), (35.8617, 104.1954)),
+    (("germany", "de", "deu"), (51.1657, 10.4515)),
+    (("netherlands", "holland", "nl", "nld", "the netherlands"), (52.1326, 5.2913)),
+    (("united arab emirates", "uae", "ae", "are", "dubai"), (23.4241, 53.8478)),
+    (("united kingdom", "uk", "gb", "gbr", "great britain", "england", "britain"), (55.3781, -3.4360)),
+    (("singapore", "sg", "sgp"), (1.3521, 103.8198)),
+    (("japan", "jp", "jpn"), (36.2048, 138.2529)),
+    (("australia", "au", "aus"), (-25.2744, 133.7751)),
+    (("canada", "ca", "can"), (56.1304, -106.3468)),
+    (("brazil", "br", "bra"), (-14.2350, -51.9253)),
+    (("france", "fr", "fra"), (46.2276, 2.2137)),
+    (("italy", "it", "ita"), (41.8719, 12.5674)),
+    (("spain", "es", "esp"), (40.4637, -3.7492)),
+    (("portugal", "pt", "prt"), (39.3999, -8.2245)),
+    (("belgium", "be", "bel"), (50.5039, 4.4699)),
+    (("switzerland", "ch", "che"), (46.8182, 8.2275)),
+    (("austria", "at", "aut"), (47.5162, 14.5501)),
+    (("poland", "pl", "pol"), (51.9194, 19.1451)),
+    (("sweden", "se", "swe"), (60.1282, 18.6435)),
+    (("norway", "no", "nor"), (60.4720, 8.4689)),
+    (("denmark", "dk", "dnk"), (56.2639, 9.5018)),
+    (("finland", "fi", "fin"), (61.9241, 25.7482)),
+    (("ireland", "ie", "irl"), (53.4129, -8.2439)),
+    (("greece", "gr", "grc"), (39.0742, 21.8243)),
+    (("turkey", "tr", "tur", "turkiye"), (38.9637, 35.2433)),
+    (("russia", "ru", "rus", "russian federation"), (61.5240, 105.3188)),
+    (("ukraine", "ua", "ukr"), (48.3794, 31.1656)),
+    (("saudi arabia", "sa", "sau", "ksa"), (23.8859, 45.0792)),
+    (("qatar", "qa", "qat"), (25.3548, 51.1839)),
+    (("kuwait", "kw", "kwt"), (29.3117, 47.4818)),
+    (("oman", "om", "omn"), (21.5126, 55.9233)),
+    (("bahrain", "bh", "bhr"), (26.0667, 50.5577)),
+    (("israel", "il", "isr"), (31.0461, 34.8516)),
+    (("egypt", "eg", "egy"), (26.8206, 30.8025)),
+    (("south africa", "za", "zaf"), (-30.5595, 22.9375)),
+    (("nigeria", "ng", "nga"), (9.0820, 8.6753)),
+    (("kenya", "ke", "ken"), (-0.0236, 37.9062)),
+    (("ghana", "gh", "gha"), (7.9465, -1.0232)),
+    (("rwanda", "rw", "rwa"), (-1.9403, 29.8739)),
+    (("ethiopia", "et", "eth"), (9.1450, 40.4897)),
+    (("tanzania", "tz", "tza"), (-6.3690, 34.8888)),
+    (("uganda", "ug", "uga"), (1.3733, 32.2903)),
+    (("morocco", "ma", "mar"), (31.7917, -7.0926)),
+    (("algeria", "dz", "dza"), (28.0339, 1.6596)),
+    (("tunisia", "tn", "tun"), (33.8869, 9.5375)),
+    (("pakistan", "pk", "pak"), (30.3753, 69.3451)),
+    (("bangladesh", "bd", "bgd"), (23.6850, 90.3563)),
+    (("sri lanka", "lk", "lka"), (7.8731, 80.7718)),
+    (("nepal", "np", "npl"), (28.3949, 84.1240)),
+    (("indonesia", "id", "idn"), (-0.7893, 113.9213)),
+    (("malaysia", "my", "mys"), (4.2105, 101.9758)),
+    (("thailand", "th", "tha"), (15.8700, 100.9925)),
+    (("vietnam", "vn", "vnm", "viet nam"), (14.0583, 108.2772)),
+    (("philippines", "ph", "phl"), (12.8797, 121.7740)),
+    (("south korea", "kr", "kor", "korea", "republic of korea"), (35.9078, 127.7669)),
+    (("taiwan", "tw", "twn"), (23.6978, 120.9605)),
+    (("hong kong", "hk", "hkg"), (22.3193, 114.1694)),
+    (("new zealand", "nz", "nzl"), (-40.9006, 174.8860)),
+    (("mexico", "mx", "mex"), (23.6345, -102.5528)),
+    (("argentina", "ar", "arg"), (-38.4161, -63.6167)),
+    (("chile", "cl", "chl"), (-35.6751, -71.5430)),
+    (("peru", "pe", "per"), (-9.1900, -75.0152)),
+    (("colombia", "co", "col"), (4.5709, -74.2973)),
+    (("venezuela", "ve", "ven"), (6.4238, -66.5897)),
+    (("iran", "ir", "irn"), (32.4279, 53.6880)),
+    (("iraq", "iq", "irq"), (33.2232, 43.6793)),
+):
+    for _n in _names:
+        _COUNTRY_CENTROIDS[_n] = _coords
 
 
-def _get_city_coords(city_name: str, country_name: str = "") -> tuple[float, float]:
-    """Resolve coordinates for a city or country fallback."""
+class UnknownLocationError(ValueError):
+    """Neither the city nor the country could be placed on the map."""
+
+
+def _get_city_coords(city_name: Optional[str], country_name: Optional[str] = "") -> tuple[float, float]:
+    """Resolve coordinates for a city, falling back to the country's centroid.
+
+    Raises UnknownLocationError when neither is known -- a freight quote for a
+    place we cannot locate would be fiction (it used to silently price every
+    unknown place as central India).
+    """
     c_lower = (city_name or "").strip().lower()
     if c_lower in CITIES:
         c = CITIES[c_lower]
         return c.latitude, c.longitude
 
     if c_lower:
-        matched = find_city(city_name)
+        matched = find_city(city_name or "")
         if matched:
             return matched.latitude, matched.longitude
 
-    # Fallback coordinate heuristics
     country_lower = (country_name or "").strip().lower()
-    if country_lower in ("india", "in"):
-        return 20.5937, 78.9629
-    if country_lower in ("united states", "usa", "us"):
-        return 37.0902, -95.7129
-    if country_lower in ("china", "cn"):
-        return 35.8617, 104.1954
-    if country_lower in ("germany", "de"):
-        return 51.1657, 10.4515
-    if country_lower in ("netherlands", "holland", "nl"):
-        return 52.1326, 5.2913
-    if country_lower in ("uae", "dubai", "ae"):
-        return 25.2048, 55.2708
-    if country_lower in ("uk", "united kingdom", "gb"):
-        return 55.3781, -3.4360
-    if country_lower in ("singapore", "sg"):
-        return 1.3521, 103.8198
-    if country_lower in ("japan", "jp"):
-        return 36.2048, 138.2529
-    if country_lower in ("australia", "au"):
-        return -25.2744, 133.7751
-    if country_lower in ("canada", "ca"):
-        return 56.1304, -106.3468
-    if country_lower in ("brazil", "br"):
-        return -14.2350, -51.9253
+    if country_lower in _COUNTRY_CENTROIDS:
+        return _COUNTRY_CENTROIDS[country_lower]
 
-    return 22.0, 78.0
+    # A known state / region / country name typed into either field.
+    for text in (city_name, country_name):
+        if text and text.strip():
+            loc = find_location(text)
+            if loc is not None:
+                return loc.latitude, loc.longitude
+    if c_lower in _COUNTRY_CENTROIDS:
+        return _COUNTRY_CENTROIDS[c_lower]
+
+    raise UnknownLocationError(
+        f"Unknown location: '{(city_name or '').strip()}, {(country_name or '').strip()}'"
+    )
 
 
 def calculate_chargeable_weight(
@@ -111,9 +175,16 @@ def calculate_chargeable_weight(
 
 
 def estimate_freight_rates(request: FreightEstimateRequest) -> FreightEstimateResponse:
-    """Calculate multi-modal freight rates, transit ETAs, and Incoterms landed cost breakdown."""
-    lat1, lon1 = _get_city_coords(request.origin_city, request.origin_country)
-    lat2, lon2 = _get_city_coords(request.destination_city, request.destination_country)
+    """Calculate multi-modal freight rates, transit ETAs, and Incoterms landed cost breakdown.
+
+    Raises HTTP 422 for a location that cannot be placed or an unsupported
+    currency. FX comes from services.currency (the platform's one rate table).
+    """
+    try:
+        lat1, lon1 = _get_city_coords(request.origin_city, request.origin_country)
+        lat2, lon2 = _get_city_coords(request.destination_city, request.destination_country)
+    except UnknownLocationError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
 
     raw_distance = haversine_km(lat1, lon1, lat2, lon2)
     # Realistic road/sea route circuity factor (~1.25x straight-line distance)
@@ -131,7 +202,12 @@ def estimate_freight_rates(request: FreightEstimateRequest) -> FreightEstimateRe
     chargeable_wt = max(gross_wt, vol_wt)
 
     target_currency = request.currency.upper()
-    fx = USD_CONVERSIONS.get(target_currency, 1.0)
+    fx_rate = currency_service.usd_rate(target_currency)
+    if fx_rate is None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, f"Unsupported currency '{request.currency}'"
+        )
+    fx = float(fx_rate)
 
     rate_options: list[FreightRateOption] = []
 

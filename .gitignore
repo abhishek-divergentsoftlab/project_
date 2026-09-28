@@ -37,3 +37,11 @@ pnpm-debug.log*
 .DS_Store
 *.swp
 *.swo
+
+# --- Runtime state -----------------------------------------------------------
+# User uploads (certificates, KYC, live captures) are data, not source.
+# Already-tracked files stay tracked until: git rm -r --cached backend/uploads uploads
+backend/uploads/
+uploads/
+.pids/
+.logs/

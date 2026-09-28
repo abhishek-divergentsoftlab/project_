@@ -12,7 +12,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Optional, Sequence
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.enums import RFQStatus
@@ -21,6 +21,7 @@ from models.user import User
 from schemas.common import DeadlineOut, Location, Money, Quantity
 from schemas.rfq import RFQCreate, RFQOut, RFQUpdate
 from services import locations, qdrant_index
+from services.categories import normalize_category
 from services.embeddings import embed_one
 from services.moderation_service import AIContentModerator
 from services.rfq_indexing import build_match_text, refresh_index_fields
@@ -31,6 +32,40 @@ DEFAULT_TTL_DAYS = 30
 
 class RFQError(Exception):
     """Domain-level rejection, translated to a 4xx by the router."""
+
+
+class RFQStateError(RFQError):
+    """The RFQ's lifecycle state does not allow the operation (HTTP 409)."""
+
+
+# The only legal status changes. Everything else -- reopening a closed RFQ,
+# un-expiring, moving active back to draft -- is refused.
+ALLOWED_TRANSITIONS: dict[RFQStatus, frozenset[RFQStatus]] = {
+    RFQStatus.DRAFT: frozenset({RFQStatus.ACTIVE, RFQStatus.CLOSED}),
+    RFQStatus.ACTIVE: frozenset({RFQStatus.CLOSED, RFQStatus.EXPIRED}),
+    RFQStatus.EXPIRED: frozenset(),
+    RFQStatus.CLOSED: frozenset(),
+}
+
+# States whose content can no longer be edited.
+IMMUTABLE_STATUSES = frozenset({RFQStatus.CLOSED, RFQStatus.EXPIRED})
+
+
+def is_past_expiry(rfq: RFQ, now: Optional[datetime] = None) -> bool:
+    expires_at = rfq.expires_at
+    if expires_at is None:
+        return False
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
+    return expires_at <= (now or datetime.now(UTC))
+
+
+def effective_status(rfq: RFQ, now: Optional[datetime] = None) -> RFQStatus:
+    """The status a reader should see: an ACTIVE row past ``expires_at`` is
+    EXPIRED even if the periodic sweep has not flipped it yet."""
+    if rfq.status == RFQStatus.ACTIVE and is_past_expiry(rfq, now):
+        return RFQStatus.EXPIRED
+    return rfq.status
 
 
 async def index_rfq(db: AsyncSession, rfq: RFQ) -> bool:
@@ -163,7 +198,7 @@ async def create_rfq(db: AsyncSession, user: User, payload: RFQCreate) -> RFQ:
         user_id=user.id,
         role=payload.role,
         status=payload.status,
-        category=payload.category,
+        category=normalize_category(payload.category),
         title=payload.title,
         description=payload.description,
         product_details=payload.product_details or {},
@@ -188,13 +223,36 @@ async def create_rfq(db: AsyncSession, user: User, payload: RFQCreate) -> RFQ:
 
 
 async def update_rfq(db: AsyncSession, rfq: RFQ, payload: RFQUpdate) -> RFQ:
+    """Edit an RFQ's content.
+
+    Closed and expired RFQs are immutable (``RFQStateError``). A ``status`` on
+    the internal ``RFQUpdate`` is not applied directly: it is routed through
+    ``publish_rfq`` / ``close_rfq`` so the transition table always holds.
+    """
     # exclude_unset distinguishes "set this to null" from "do not touch".
     provided = payload.model_dump(exclude_unset=True)
+    target_status = provided.pop("status", None)
+    content_fields = {k for k in provided}
+
+    if target_status is not None and not content_fields:
+        if target_status == RFQStatus.CLOSED:
+            return await close_rfq(db, rfq)
+        if target_status == RFQStatus.ACTIVE:
+            return await publish_rfq(db, rfq)
+        if target_status == rfq.status:
+            return rfq
+        raise RFQStateError(
+            f"cannot move an RFQ from {rfq.status.value} to {RFQStatus(target_status).value}"
+        )
+    if target_status is not None:
+        raise RFQError("status cannot be changed together with other fields")
+
+    await expire_due_rfqs(db, rfq_ids=[rfq.id])
+    if rfq.status in IMMUTABLE_STATUSES:
+        raise RFQStateError(f"a {rfq.status.value} RFQ can no longer be edited")
 
     # AI Safety & Prohibited Items Moderation on update.
-    # Closing a listing takes it off the marketplace; closing must never be blocked by moderation.
-    is_closing = payload.status == RFQStatus.CLOSED
-    if not is_closing and any(k in provided for k in ("title", "description", "category", "product_details")):
+    if any(k in provided for k in ("title", "description", "category", "product_details")):
         new_title = provided.get("title", rfq.title)
         new_desc = provided.get("description", rfq.description)
         new_cat = provided.get("category", rfq.category)
@@ -209,15 +267,15 @@ async def update_rfq(db: AsyncSession, rfq: RFQ, payload: RFQUpdate) -> RFQ:
         if not mod_check.is_safe:
             raise RFQError(mod_check.reason or "Listing contains prohibited items")
 
-    for field in ("category", "title", "description"):
-        if field in provided:
-            setattr(rfq, field, provided[field])
+    if "title" in provided and provided["title"] is not None:
+        rfq.title = provided["title"]
+    if "category" in provided and provided["category"] is not None:
+        rfq.category = normalize_category(provided["category"])
+    if "description" in provided:
+        rfq.description = provided["description"]
 
     if "product_details" in provided and payload.product_details is not None:
         rfq.product_details = payload.product_details
-
-    if "status" in provided and payload.status is not None:
-        rfq.status = payload.status
 
     _apply_common_fields(rfq, payload)
 
@@ -231,10 +289,54 @@ async def update_rfq(db: AsyncSession, rfq: RFQ, payload: RFQUpdate) -> RFQ:
     await db.commit()
     await db.refresh(rfq)
 
+    await index_rfq(db, rfq)
+    return rfq
+
+
+async def publish_rfq(db: AsyncSession, rfq: RFQ) -> RFQ:
+    """draft -> active. Idempotent for an already-active, unexpired RFQ.
+
+    A draft may have been written long ago: its expiry is recomputed at
+    publish time (deadline, or a fresh default TTL), and a draft whose
+    deadline has already passed is refused rather than published dead.
+    """
+    await expire_due_rfqs(db, rfq_ids=[rfq.id])
+    if rfq.status == RFQStatus.ACTIVE:
+        return rfq
+    if RFQStatus.ACTIVE not in ALLOWED_TRANSITIONS[rfq.status]:
+        raise RFQStateError(f"only a draft can be published; this RFQ is {rfq.status.value}")
+
+    now = datetime.now(UTC)
+    deadline_at = rfq.deadline_at
+    if deadline_at is not None and deadline_at.tzinfo is None:
+        deadline_at = deadline_at.replace(tzinfo=UTC)
+    if deadline_at is not None and deadline_at <= now:
+        raise RFQStateError("the RFQ deadline has already passed; set a new deadline before publishing")
+
+    rfq.status = RFQStatus.ACTIVE
+    rfq.expires_at = deadline_at or now + timedelta(days=DEFAULT_TTL_DAYS)
+    refresh_index_fields(rfq)
+    await db.commit()
+    await db.refresh(rfq)
+    await index_rfq(db, rfq)
+    return rfq
+
+
+async def close_rfq(db: AsyncSession, rfq: RFQ) -> RFQ:
+    """draft/active -> closed (terminal). Idempotent for an already-closed RFQ.
+
+    Never blocked by moderation: closing only takes a listing off the market.
+    """
+    await expire_due_rfqs(db, rfq_ids=[rfq.id])
     if rfq.status == RFQStatus.CLOSED:
-        await qdrant_index.delete([rfq.id])
-    else:
-        await index_rfq(db, rfq)
+        return rfq
+    if RFQStatus.CLOSED not in ALLOWED_TRANSITIONS[rfq.status]:
+        raise RFQStateError(f"a {rfq.status.value} RFQ cannot be closed")
+
+    rfq.status = RFQStatus.CLOSED
+    await db.commit()
+    await db.refresh(rfq)
+    await qdrant_index.delete([rfq.id])
     return rfq
 
 
@@ -254,6 +356,10 @@ async def list_rfqs(
     limit: int = 20,
     offset: int = 0,
 ) -> tuple[Sequence[RFQ], int]:
+    # Lazily keep status honest for the owner's own rows, so "My RFQs" shows
+    # 'expired' without waiting for the periodic sweep.
+    await expire_due_rfqs(db, user_id=user_id)
+
     query = _owned_by(user_id)
     if status is not None:
         query = query.where(RFQ.status == status)
@@ -267,47 +373,68 @@ async def list_rfqs(
     return rows.all(), int(total or 0)
 
 
-async def expire_due_rfqs(db: AsyncSession) -> int:
-    """Flip past-due active RFQs to EXPIRED. Intended for a scheduled job.
+async def expire_due_rfqs(
+    db: AsyncSession,
+    *,
+    user_id: Optional[uuid.UUID] = None,
+    rfq_ids: Optional[Sequence[uuid.UUID]] = None,
+) -> int:
+    """Flip past-due active RFQs to EXPIRED. Returns how many were flipped.
 
-    Matching also filters on ``expires_at`` directly, so a delayed sweep can
-    never leak a stale RFQ into results -- this just keeps status honest.
+    Called by the periodic scheduler with no arguments (global sweep), and
+    lazily -- scoped to one owner or a few ids -- before RFQ reads and state
+    transitions. A single conditional UPDATE, so it is idempotent and safe to
+    run concurrently: a row already EXPIRED/CLOSED never matches again.
+
+    Matching and the catalog also filter on ``expires_at`` directly, so a
+    delayed sweep can never leak a stale RFQ into results.
     """
     now = datetime.now(UTC)
-    due = await db.scalars(
-        select(RFQ).where(
+    stmt = (
+        update(RFQ)
+        .where(
             RFQ.status == RFQStatus.ACTIVE,
             RFQ.expires_at.is_not(None),
             RFQ.expires_at <= now,
         )
+        .values(status=RFQStatus.EXPIRED)
+        .returning(RFQ.id)
+        .execution_options(synchronize_session="fetch")
     )
-    count = 0
-    for rfq in due:
-        rfq.status = RFQStatus.EXPIRED
-        count += 1
-    if count:
+    if user_id is not None:
+        stmt = stmt.where(RFQ.user_id == user_id)
+    if rfq_ids is not None:
+        ids = list(rfq_ids)
+        if not ids:
+            return 0
+        stmt = stmt.where(RFQ.id.in_(ids))
+    expired_ids = list((await db.execute(stmt)).scalars().all())
+    if expired_ids:
         await db.commit()
-    return count
+        # synchronize_session already set status on loaded rows; refresh the
+        # few explicitly targeted ones so server-side updated_at is current.
+        if rfq_ids is not None:
+            for rfq_id in expired_ids:
+                obj = await db.get(RFQ, rfq_id)
+                if obj is not None:
+                    await db.refresh(obj)
+    return len(expired_ids)
 
 
 def to_out(rfq: RFQ, pending_connections: int = 0, is_saved: bool = False) -> RFQOut:
     """Reassemble the nested wire format from the flat columns."""
     quantity = (
-        Quantity(value=rfq.quantity_value, unit=rfq.quantity_unit or "units")
+        Quantity.from_stored(rfq.quantity_value, rfq.quantity_unit)
         if rfq.quantity_value is not None
         else None
     )
     minimum_order = (
-        Quantity(value=rfq.min_order_value, unit=rfq.min_order_unit or "units")
+        Quantity.from_stored(rfq.min_order_value, rfq.min_order_unit)
         if rfq.min_order_value is not None
         else None
     )
     price = (
-        Money(
-            amount=rfq.price_amount,
-            currency=rfq.price_currency,
-            per_unit=rfq.price_per_unit,
-        )
+        Money.from_stored(rfq.price_amount, rfq.price_currency, rfq.price_per_unit)
         if rfq.price_amount is not None
         else None
     )
@@ -341,7 +468,7 @@ def to_out(rfq: RFQ, pending_connections: int = 0, is_saved: bool = False) -> RF
         id=rfq.id,
         user_id=rfq.user_id,
         role=rfq.role,
-        status=rfq.status,
+        status=effective_status(rfq),
         category=rfq.category,
         title=rfq.title,
         description=rfq.description,

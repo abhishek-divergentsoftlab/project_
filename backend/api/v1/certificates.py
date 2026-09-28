@@ -3,9 +3,10 @@
 import uuid
 from typing import Sequence
 
-from fastapi import APIRouter, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 
 from api.deps import CurrentUser, DbSession
+from core.rate_limit import RateLimit
 from schemas.certificate import (
     CertificateCreate,
     CertificateDocumentUploadOut,
@@ -15,6 +16,14 @@ from services import certificate_service
 from services.certificate_service import CertificateError
 
 router = APIRouter()
+
+_upload_limit = Depends(RateLimit("certificate-upload", "RATE_LIMIT_UPLOAD", per="user"))
+
+
+async def _read_bounded(file: UploadFile) -> bytes:
+    """Read at most one byte past the limit, so an oversized upload is refused
+    without first buffering all of it in memory."""
+    return await file.read(certificate_service.MAX_CERTIFICATE_FILE_SIZE + 1)
 
 
 @router.get(
@@ -46,7 +55,7 @@ async def create_certificate(
             db, user_id=current_user.id, payload=payload
         )
     except CertificateError as exc:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        raise HTTPException(exc.status_code, str(exc)) from exc
 
     return CertificateOut.model_validate(cert)
 
@@ -87,18 +96,20 @@ async def get_public_certificates(
     response_model=CertificateDocumentUploadOut,
     status_code=status.HTTP_201_CREATED,
     summary="Upload a certificate document file from local system",
+    dependencies=[_upload_limit],
 )
 async def upload_certificate_file(
     file: UploadFile = File(...),
     current_user: CurrentUser = None,
 ) -> CertificateDocumentUploadOut:
     """Accept and securely store an uploaded certificate document (PDF, PNG, JPG, WebP)."""
-    file_bytes = await file.read()
+    file_bytes = await _read_bounded(file)
     try:
         doc_url, filename, size = certificate_service.validate_and_save_certificate_file(
             file_bytes=file_bytes,
             original_filename=file.filename or "certificate.pdf",
             content_type=file.content_type,
+            owner_id=current_user.id,
         )
     except CertificateError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
@@ -114,6 +125,7 @@ async def upload_certificate_file(
     "/{certificate_id}/document",
     response_model=CertificateOut,
     summary="Attach or replace a certificate document file on an existing certificate",
+    dependencies=[_upload_limit],
 )
 async def attach_certificate_document(
     certificate_id: uuid.UUID,
@@ -122,7 +134,7 @@ async def attach_certificate_document(
     db: DbSession = None,
 ) -> CertificateOut:
     """Upload and attach a document to an existing certificate owned by the current user."""
-    file_bytes = await file.read()
+    file_bytes = await _read_bounded(file)
     try:
         cert = await certificate_service.upload_certificate_document(
             db=db,

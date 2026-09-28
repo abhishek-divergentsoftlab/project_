@@ -191,17 +191,27 @@ class Actor:
     def headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.tokens['access_token']}"}
 
+    def _merge_headers(self, kwargs: dict[str, Any]) -> dict[str, str]:
+        headers = dict(self.headers)
+        if "headers" in kwargs:
+            headers.update(kwargs.pop("headers") or {})
+        return headers
+
     async def post(self, url: str, **kwargs: Any):
-        return await self._client.post(url, headers=self.headers, **kwargs)
+        headers = self._merge_headers(kwargs)
+        return await self._client.post(url, headers=headers, **kwargs)
 
     async def get(self, url: str, **kwargs: Any):
-        return await self._client.get(url, headers=self.headers, **kwargs)
+        headers = self._merge_headers(kwargs)
+        return await self._client.get(url, headers=headers, **kwargs)
 
     async def patch(self, url: str, **kwargs: Any):
-        return await self._client.patch(url, headers=self.headers, **kwargs)
+        headers = self._merge_headers(kwargs)
+        return await self._client.patch(url, headers=headers, **kwargs)
 
     async def delete(self, url: str, **kwargs: Any):
-        return await self._client.delete(url, headers=self.headers, **kwargs)
+        headers = self._merge_headers(kwargs)
+        return await self._client.delete(url, headers=headers, **kwargs)
 
 
 @pytest.fixture

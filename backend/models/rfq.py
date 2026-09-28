@@ -60,6 +60,29 @@ class RFQ(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         # Worker queues: what still needs indexing, and what needs expiring.
         Index("ix_rfqs_embedding_status", "embedding_status"),
         Index("ix_rfqs_expires_at", "expires_at"),
+        # Catalog default page: newest active listings (migration 33f0b331948b).
+        Index(
+            "ix_rfqs_active_created",
+            text("created_at DESC"),
+            postgresql_where=text("status = 'active'"),
+        ),
+        # pg_trgm indexes so the catalog's ~* / ILIKE search can use an index.
+        *(
+            Index(
+                f"ix_rfqs_{column}_trgm",
+                column,
+                postgresql_using="gin",
+                postgresql_ops={column: "gin_trgm_ops"},
+            )
+            for column in (
+                "title",
+                "search_text",
+                "location_city",
+                "location_country",
+                "category",
+                "description",
+            )
+        ),
     )
 
     user_id: Mapped[uuid.UUID] = mapped_column(

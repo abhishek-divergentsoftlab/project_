@@ -1,7 +1,28 @@
 """Pydantic schemas for real-time Deal Room multilingual translation."""
 
-from typing import Optional
-from pydantic import BaseModel, Field
+from typing import Annotated, Optional
+
+from pydantic import BaseModel, Field, field_validator
+
+# Per-item cap, shared by the single and the batch endpoints: every item is a
+# separate LLM call, so an unbounded batch item is a cheap way to tie up the
+# translator.
+MAX_TRANSLATION_CHARS = 5000
+MAX_BATCH_ITEMS = 50
+
+
+def _validate_language(value: Optional[str], *, allow_auto: bool) -> Optional[str]:
+    if value is None:
+        return None
+    from services.translation_service import normalize_supported_language
+
+    cleaned = value.strip().lower()
+    if allow_auto and cleaned in ("", "auto"):
+        return None
+    code = normalize_supported_language(cleaned)
+    if code is None:
+        raise ValueError(f"Unsupported language '{value}'")
+    return code
 
 
 class LanguageInfo(BaseModel):
@@ -12,9 +33,19 @@ class LanguageInfo(BaseModel):
 
 
 class TranslationRequest(BaseModel):
-    text: str = Field(..., min_length=1, max_length=5000, description="Text to translate")
+    text: str = Field(..., min_length=1, max_length=MAX_TRANSLATION_CHARS, description="Text to translate")
     target_language: str = Field(..., min_length=2, max_length=10, description="Target language code, e.g. 'es', 'zh', 'hi'")
-    source_language: Optional[str] = Field(None, max_length=10, description="Optional source language code if known")
+    source_language: Optional[str] = Field(None, max_length=10, description="Optional source language code if known ('auto' to detect)")
+
+    @field_validator("target_language")
+    @classmethod
+    def _target_supported(cls, value: str) -> str:
+        return _validate_language(value, allow_auto=False)  # type: ignore[return-value]
+
+    @field_validator("source_language")
+    @classmethod
+    def _source_supported(cls, value: Optional[str]) -> Optional[str]:
+        return _validate_language(value, allow_auto=True)
 
 
 class TranslationResponse(BaseModel):
@@ -26,9 +57,21 @@ class TranslationResponse(BaseModel):
 
 
 class BatchTranslationRequest(BaseModel):
-    texts: list[str] = Field(..., min_length=1, max_length=50, description="Batch of texts to translate")
+    texts: list[Annotated[str, Field(max_length=MAX_TRANSLATION_CHARS)]] = Field(
+        ..., min_length=1, max_length=MAX_BATCH_ITEMS, description="Batch of texts to translate"
+    )
     target_language: str = Field(..., min_length=2, max_length=10)
     source_language: Optional[str] = Field(None, max_length=10)
+
+    @field_validator("target_language")
+    @classmethod
+    def _target_supported(cls, value: str) -> str:
+        return _validate_language(value, allow_auto=False)  # type: ignore[return-value]
+
+    @field_validator("source_language")
+    @classmethod
+    def _source_supported(cls, value: Optional[str]) -> Optional[str]:
+        return _validate_language(value, allow_auto=True)
 
 
 class BatchTranslationResponse(BaseModel):

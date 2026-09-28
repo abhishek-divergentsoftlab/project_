@@ -1,3 +1,4 @@
+import re
 from functools import lru_cache
 from typing import Annotated
 
@@ -13,7 +14,7 @@ class Settings(BaseSettings):
     PROJECT_NAME: str = "B2B Marketplace API"
     ENVIRONMENT: str = "development"
 
-    SECRET_KEY: str = "dev-only-insecure-key-change-me"
+    SECRET_KEY: str = "dev-only-insecure-key-change-me"  # == DEFAULT_SECRET_KEY
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     REFRESH_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7
@@ -53,6 +54,10 @@ class Settings(BaseSettings):
     # Real-time Deal Room Translation
     TRANSLATION_MODEL: str = "gpt-oss:20b"
     TRANSLATION_TIMEOUT_SECONDS: float = 10.0
+    # When the local translation model fails, fall back to an external
+    # translation service. Off by default: deal-room text must not leave the
+    # host unless the operator opts in.
+    TRANSLATION_EXTERNAL_FALLBACK: bool = False
 
     # Image safety moderation via vision model
     IMAGE_MODERATION_MODEL: str = "qwen3-vl:8b"
@@ -82,16 +87,73 @@ class Settings(BaseSettings):
 
     UPLOAD_DIR: str = "uploads"
 
+    # Lifetime of the HMAC-signed URLs handed out for private media (deal-room
+    # live captures). Browsers load these through <img src>, which cannot send
+    # an Authorization header, so the signature is the credential.
+    MEDIA_SIGNED_URL_TTL_SECONDS: int = 6 * 60 * 60
+
+    # --- Rate limiting (see core/rate_limit.py) ------------------------------
+    # Each limit is "<max requests>/<window seconds>". The limiter is in-memory
+    # and per process: with several workers the effective limit is multiplied
+    # by the worker count until it moves to Redis.
+    RATE_LIMIT_ENABLED: bool = True
+    RATE_LIMIT_LOGIN: str = "10/300"  # failed logins per IP + email
+    RATE_LIMIT_LOGIN_IP: str = "100/300"  # failed logins per IP, any email
+    RATE_LIMIT_SIGNUP: str = "20/3600"  # signups per IP
+    RATE_LIMIT_REFRESH: str = "60/300"  # token refreshes per IP
+    RATE_LIMIT_MODERATION: str = "120/60"  # /moderation/check per user
+    RATE_LIMIT_UPLOAD: str = "20/3600"  # certificate uploads per user
+
+    @field_validator(
+        "RATE_LIMIT_LOGIN",
+        "RATE_LIMIT_LOGIN_IP",
+        "RATE_LIMIT_SIGNUP",
+        "RATE_LIMIT_REFRESH",
+        "RATE_LIMIT_MODERATION",
+        "RATE_LIMIT_UPLOAD",
+    )
+    @classmethod
+    def _check_rate(cls, value: str) -> str:
+        if not _RATE_RE.match(value.strip()):
+            raise ValueError("rate limits must look like '<count>/<seconds>', e.g. '10/300'")
+        return value.strip()
+
     @property
     def is_production(self) -> bool:
         return self.ENVIRONMENT.lower() == "production"
+
+    @property
+    def is_dev_like(self) -> bool:
+        """Environments where the built-in development secret is tolerated."""
+        return self.ENVIRONMENT.strip().lower() in DEV_ENVIRONMENTS
+
+
+_RATE_RE = re.compile(r"^\d+/\d+(?:\.\d+)?$")
+
+# Anything not listed here (production, prod, staging, qa, ...) must run with a
+# real secret. An allow-list rather than a check for "production" so a typo or a
+# new environment name fails closed.
+DEV_ENVIRONMENTS = frozenset({"development", "dev", "local", "test"})
+DEFAULT_SECRET_KEY = "dev-only-insecure-key-change-me"
+MIN_SECRET_KEY_LENGTH = 32
+
+
+def check_secret_key(settings: Settings) -> None:
+    if settings.is_dev_like:
+        return
+    key = settings.SECRET_KEY or ""
+    if key == DEFAULT_SECRET_KEY or key.startswith("dev-only") or len(key) < MIN_SECRET_KEY_LENGTH:
+        raise RuntimeError(
+            f"SECRET_KEY must be a random secret of at least {MIN_SECRET_KEY_LENGTH} characters "
+            f"when ENVIRONMENT={settings.ENVIRONMENT!r} (generate one with "
+            "python -c \"import secrets; print(secrets.token_urlsafe(64))\")"
+        )
 
 
 @lru_cache
 def get_settings() -> Settings:
     settings = Settings()
-    if settings.is_production and settings.SECRET_KEY.startswith("dev-only"):
-        raise RuntimeError("SECRET_KEY must be set to a real secret in production")
+    check_secret_key(settings)
     return settings
 
 

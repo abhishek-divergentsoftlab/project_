@@ -65,6 +65,30 @@ def _extract_json(text: str) -> Optional[dict[str, Any]]:
     return None
 
 
+_TRUE_STRINGS = {"true", "yes", "1", "flagged", "unsafe"}
+_FALSE_STRINGS = {"false", "no", "0", "none", "null", "safe", ""}
+
+
+def _parse_flagged(value: Any) -> Optional[bool]:
+    """Strict reading of the model's ``flagged`` field.
+
+    ``bool("false")`` is True, so strings are matched explicitly. Returns None
+    for anything that is not a recognisable yes/no, which the caller treats as
+    "no verdict". A missing field (None) also counts as no verdict.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in _TRUE_STRINGS:
+            return True
+        if lowered in _FALSE_STRINGS:
+            return False
+    return None
+
+
 async def inspect_live_image(
     image_bytes: bytes,
     content_type: str = "image/jpeg",
@@ -122,19 +146,23 @@ async def inspect_live_image(
 
         parsed = _extract_json(response_text) or _extract_json(thinking_text)
 
-        if not parsed:
-            logger.warning("Could not parse JSON from Ollama moderation response: %s / %s", response_text, thinking_text)
-            # Check for keyword clues if JSON parsing failed
+        is_flagged = _parse_flagged(parsed.get("flagged")) if parsed else None
+
+        if is_flagged is None:
+            # No usable verdict: not JSON, a refusal ("I'm sorry, I can't..."),
+            # or a "flagged" value that is neither true nor false.
+            logger.warning("Could not parse a moderation verdict from Ollama: %s / %s", response_text, thinking_text)
             combined = f"{response_text} {thinking_text}".lower()
-            if any(term in combined for term in ("flagged\": true", "vulgar", "violence", "sexual")):
+            if settings.IMAGE_MODERATION_FAIL_CLOSED or any(
+                term in combined for term in ('flagged": true', "vulgar", "violence", "sexual")
+            ):
                 return (
                     False,
-                    "⚠️ Content Warning: Image flagged for potential vulgarity, violence, or sexual content. Upload blocked.",
-                    {"raw_response": response_text, "raw_thinking": thinking_text},
+                    "⚠️ Image safety verification could not confirm this image is safe. Upload blocked.",
+                    {"raw_response": response_text, "raw_thinking": thinking_text, "unparseable": True},
                 )
-            return True, None, {"raw_response": response_text}
+            return True, None, {"raw_response": response_text, "unparseable": True}
 
-        is_flagged = bool(parsed.get("flagged", False))
         category = parsed.get("category") or "disallowed content"
         reason = parsed.get("reason") or "Image contains content violating marketplace policies."
 

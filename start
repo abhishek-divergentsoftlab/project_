@@ -54,15 +54,22 @@ else
         "$PROJECT_DIR/backend/.venv/bin/pip" install -r "$PROJECT_DIR/backend/requirements.txt"
     fi
 
+    BACKEND_LOG="$PROJECT_DIR/.logs/backend.log"
+    # Append, never truncate: the migration output below and earlier runs'
+    # tracebacks must survive the server start.
+    echo "===== backend start $(date '+%Y-%m-%d %H:%M:%S') =====" >> "$BACKEND_LOG"
+
     # Run database migrations
     if [ -x "$PROJECT_DIR/backend/.venv/bin/alembic" ]; then
         echo -e "${YELLOW}[*] Applying database migrations...${NC}"
-        (cd "$PROJECT_DIR/backend" && .venv/bin/alembic upgrade head >> "$PROJECT_DIR/.logs/backend.log" 2>&1) || true
+        if ! (cd "$PROJECT_DIR/backend" && .venv/bin/alembic upgrade head >> "$BACKEND_LOG" 2>&1); then
+            echo -e "${RED}[!] Database migration failed -- see $BACKEND_LOG${NC}"
+        fi
     fi
 
     (
         cd "$PROJECT_DIR/backend"
-        nohup "$VENV_UVICORN" app:app --reload --port 8011 > "$PROJECT_DIR/.logs/backend.log" 2>&1 &
+        nohup "$VENV_UVICORN" app:app --reload --port 8011 >> "$BACKEND_LOG" 2>&1 &
         echo $! > "$BACKEND_PID_FILE"
     )
     echo -e "${GREEN}[✓] Backend service started (PID: $(cat "$BACKEND_PID_FILE")).${NC}"

@@ -1,8 +1,9 @@
 """Notification API endpoints."""
 
 import uuid
+from typing import Annotated
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 
 from api.deps import CurrentUser, DbSession
 from services import notification_service
@@ -14,13 +15,13 @@ router = APIRouter(prefix="/notifications", tags=["notifications"])
 async def list_notifications(
     current_user: CurrentUser,
     db: DbSession,
-    limit: int = 30,
-    offset: int = 0,
+    limit: Annotated[int, Query(ge=1, le=100)] = 30,
+    offset: Annotated[int, Query(ge=0, le=100_000)] = 0,
     unread_only: bool = False,
 ) -> dict:
     """Paginated notifications, newest first."""
     items, total = await notification_service.list_notifications(
-        db, current_user.id, limit=min(limit, 100), offset=offset, unread_only=unread_only
+        db, current_user.id, limit=limit, offset=offset, unread_only=unread_only
     )
     return {"items": items, "total": total, "limit": limit, "offset": offset}
 

@@ -2,10 +2,29 @@
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Optional
+from typing import Literal, Optional
 import uuid
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+# Funding is simulated (there is no payment gateway yet), but it must at least
+# name a real payment rail and carry the payer's reference (UTR, card auth id,
+# LC number...) so the vault is never "secured" by an arbitrary string.
+PaymentMethod = Literal["bank_transfer", "upi", "card", "letter_of_credit"]
+
+DisputeCategory = Literal[
+    "quality",
+    "non_delivery",
+    "delay",
+    "delivery",
+    "specification_mismatch",
+    "packaging",
+    "payment",
+    "documentation",
+    "other",
+]
+DisputeSeverity = Literal["low", "medium", "high", "critical"]
+DisputeResolution = Literal["release_funds", "refund_buyer", "mutual_settlement"]
 
 
 class EscrowMilestoneOut(BaseModel):
@@ -62,8 +81,22 @@ class EscrowAccountOut(BaseModel):
 
 
 class EscrowDepositPayload(BaseModel):
-    payment_method: str = Field(default="mock_instant", description="Payment method: mock_instant, wire_transfer, lc")
+    payment_method: PaymentMethod = Field(
+        ..., description="Payment rail: bank_transfer, upi, card, letter_of_credit"
+    )
+    payment_reference: str = Field(
+        ..., min_length=1, max_length=120,
+        description="Payer's transaction reference (UTR / card auth id / LC number)",
+    )
     notes: Optional[str] = Field(default=None, max_length=1000)
+
+    @field_validator("payment_reference")
+    @classmethod
+    def _reference_not_blank(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("payment_reference must not be blank")
+        return cleaned
 
 
 class MilestoneReleaseRequestPayload(BaseModel):
@@ -76,12 +109,15 @@ class MilestoneReleaseApprovePayload(BaseModel):
 
 class DealDisputeCreatePayload(BaseModel):
     title: str = Field(..., min_length=3, max_length=255, description="Dispute summary")
-    category: str = Field(default="quality", description="quality, non_delivery, delay, specification_mismatch, payment")
+    category: DisputeCategory = Field(default="quality", description="Dispute category")
     reason: str = Field(..., min_length=10, max_length=4000, description="Detailed explanation of the grievance or breach")
-    severity: str = Field(default="medium", description="low, medium, high, critical")
+    severity: DisputeSeverity = Field(default="medium", description="low, medium, high, critical")
     suggested_resolution: Optional[str] = Field(default=None, max_length=2000)
 
 
 class DealDisputeResolvePayload(BaseModel):
-    resolution: str = Field(..., description="release_funds, refund_buyer, mutual_settlement")
+    # Concession rule (enforced in the service): release_funds may only be
+    # chosen by the buyer, refund_buyer only by the seller -- the side giving
+    # up money -- and mutual_settlement by either.
+    resolution: DisputeResolution = Field(..., description="release_funds, refund_buyer, mutual_settlement")
     resolution_notes: str = Field(..., min_length=5, max_length=2000, description="Settlement explanation agreed by counterparties")

@@ -15,7 +15,8 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
 
-from services import currency, unit_converter
+from services import currency, product_synonyms, unit_converter
+from services.locations import normalise_country
 
 # How much each dimension contributes. Dimensions that cannot be evaluated
 # (a missing price, say) are dropped and the remainder is renormalised, so an
@@ -49,7 +50,8 @@ _UNIT_SYNONYMS: dict[str, str] = {
     "kg": "kg", "kgs": "kg", "kilo": "kg", "kilos": "kg", "kilogram": "kg",
     "kilograms": "kg",
     "tonne": "tonne", "tonnes": "tonne", "ton": "tonne", "tons": "tonne",
-    "mt": "tonne", "metric ton": "tonne", "metric tons": "tonne",
+    "mt": "tonne", "t": "tonne", "metric ton": "tonne", "metric tons": "tonne",
+    "metric tonne": "tonne", "metric tonnes": "tonne",
     "quintal": "quintal", "quintals": "quintal", "qtl": "quintal",
     "g": "g", "gm": "g", "gms": "g", "gram": "g", "grams": "g",
     "lb": "lb", "lbs": "lb", "pound": "lb", "pounds": "lb",
@@ -59,6 +61,9 @@ _UNIT_SYNONYMS: dict[str, str] = {
     "bora": "bora", "boras": "bora", "bori": "bora", "boris": "bora",
     "katta": "bora", "kattas": "bora",
     "bag": "bag", "bags": "bag", "sack": "bag", "sacks": "bag",
+    "dozen": "dozen", "dozens": "dozen", "doz": "dozen", "dz": "dozen",
+    "pair": "pair", "pairs": "pair",
+    "l": "l", "litre": "l", "litres": "l", "liter": "l", "liters": "l",
 }
 
 # ---------------------------------------------------------------------------
@@ -420,11 +425,29 @@ _STOPWORDS = frozenset(
         "our that the to we with need want buy sell supply looking "
         "role category product quantity target price location deadline "
         "attributes notes buyer seller units within days bulk orders "
-        "gst invoice provided ready stock yes no inr india"
+        "gst invoice provided ready stock yes no inr india "
+        # Quantity words. "500 kg" is scored by the quantity dimension; left in
+        # the text it made every bulk listing share vocabulary.
+        "kg kgs tonne ton mt pc pcs piece quintal qtl dozen lakh crore"
     ).split()
 )
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+# Plurals the suffix rules below would get wrong: words whose singular itself
+# ends in -s (bus, gas, lens) take -es, and a plain "strip -es" would also turn
+# "cases" into "cas".
+_IRREGULAR_PLURALS: dict[str, str] = {
+    "buses": "bus", "gases": "gas", "lenses": "lens", "canvases": "canvas",
+    "bonuses": "bonus", "statuses": "status", "campuses": "campus",
+    "viruses": "virus", "atlases": "atlas", "cactuses": "cactus",
+    "focuses": "focus", "censuses": "census", "walruses": "walrus",
+    "quizzes": "quiz", "series": "series", "species": "species",
+    "news": "news", "chassis": "chassis",
+}
+# Words ending in -oes whose singular keeps the e (shoe, canoe).
+_OE_SINGULARS = ("shoes", "canoes", "oboes", "floes", "throes", "tiptoes", "sloes")
 
 
 def singularise(word: str) -> str:
@@ -432,25 +455,47 @@ def singularise(word: str) -> str:
 
     Deliberately not a real stemmer: it only has to be consistent on both sides
     of a comparison. Short words are left alone so units like "pcs" survive.
+
+    ``tomatoes`` -> ``tomato`` (-oes), ``boxes`` -> ``box``, ``glasses`` ->
+    ``glass``, ``cases`` -> ``case``, ``buses`` -> ``bus``.
     """
     if len(word) <= 3:
         return word
-    if word.endswith(("xes", "ses", "zes", "ches", "shes")):
-        return word[:-2]
+    irregular = _IRREGULAR_PLURALS.get(word)
+    if irregular is not None:
+        return irregular
+    if word.endswith("oes") and len(word) >= 6 and not word.endswith(_OE_SINGULARS):
+        return word[:-2]  # tomatoes, potatoes, mangoes, cargoes, echoes
+    if word.endswith(("xes", "sses", "ches", "shes")):
+        return word[:-2]  # boxes, glasses, inches, dishes
+    if word.endswith("zzes"):
+        return word[:-3]
     if word.endswith("ies") and len(word) > 4:
         return word[:-3] + "y"
     if word.endswith("ss"):
         return word
     if word.endswith("s"):
-        return word[:-1]
+        return word[:-1]  # cables, cases, sizes, shoes, onions
     return word
 
 
 def normalise_unit(unit: Optional[str]) -> Optional[str]:
-    if not unit:
+    cleaned = unit_converter.clean_unit(unit)
+    if not cleaned:
         return None
-    cleaned = unit.strip().lower()
     return _UNIT_SYNONYMS.get(cleaned, cleaned)
+
+
+def product_token(raw: str) -> str:
+    """One word as matching compares it: singular, and in English.
+
+    "tomatoes" -> "tomato", "pyaz" -> "onion", "chillies" -> "chilli".
+    """
+    canonical = product_synonyms.canonical_token(raw)
+    if canonical is not None:
+        return canonical
+    word = singularise(raw)
+    return product_synonyms.canonical_token(word) or word
 
 
 def tokenize(text: Optional[str]) -> set[str]:
@@ -468,9 +513,10 @@ def tokenize(text: Optional[str]) -> set[str]:
         # noise from quantities and titles.
         if raw in _STOPWORDS or (len(raw) < 2 and not raw.isalpha()):
             continue
-        word = singularise(raw)
+        # Canonical English form, so "pyaz" and "onion" are one token.
+        word = product_token(raw)
         if word not in _STOPWORDS:
-            tokens.add(word)
+            tokens.update(word.split())
     return tokens
 
 
@@ -497,6 +543,21 @@ def _overlap(left: set[str], right: set[str]) -> float:
     return len(left & right) / min(len(left), len(right))
 
 
+def _symmetric_overlap(left: set[str], right: set[str]) -> float:
+    """Ochiai (set cosine): |L & R| / sqrt(|L| * |R|).
+
+    Symmetric, so neither side can win by being vague. Dividing by the smaller
+    set (``_overlap``) gave a one-word "cable" listing full marks against a
+    detailed "hdmi braided 8k cable" request. Ochiai is the geometric mean of
+    the two coverages: a detailed seller who covers everything a three-word
+    request named still scores 0.5 against a 12-token listing, where Dice
+    (the harmonic mean) would give it 0.4.
+    """
+    if not left or not right:
+        return 0.0
+    return len(left & right) / math.sqrt(len(left) * len(right))
+
+
 def relevance_score(
     requester_tags: list[str],
     requester_text: Optional[str],
@@ -509,8 +570,8 @@ def relevance_score(
     Qdrant retrieval will fill; the weighting and the rest of the pipeline do not
     change when it is swapped.
     """
-    tag_overlap = _overlap(tag_tokens(requester_tags), tag_tokens(candidate_tags))
-    text_overlap = _overlap(tokenize(requester_text), tokenize(candidate_text))
+    tag_overlap = _symmetric_overlap(tag_tokens(requester_tags), tag_tokens(candidate_tags))
+    text_overlap = _symmetric_overlap(tokenize(requester_text), tokenize(candidate_text))
 
     # Tags are curated and weigh more, but text carries the long tail.
     if requester_tags and candidate_tags:
@@ -701,26 +762,81 @@ def attribute_score(
     return total / weight_sum if weight_sum else None
 
 
+def _per_unit_prices(
+    buyer_target: Decimal,
+    buyer_unit: Optional[str],
+    seller_ask: Decimal,
+    seller_unit: Optional[str],
+) -> Optional[tuple[Decimal, Decimal]]:
+    """Both prices restated per the same unit, or None if that is impossible.
+
+    Units resolvable to a base (kg, pcs, m, l) are converted: 28,000/tonne and
+    30/kg become 28 and 30 per kg. Units without a fixed base ("bora",
+    "carton") compare only when they are the same word. When only one side, or
+    neither, said what the price is per, both are assumed to be quoted on the
+    same basis -- the same assumption the listing form makes.
+    """
+    left, right = normalise_unit(buyer_unit), normalise_unit(seller_unit)
+    if not left or not right:
+        return buyer_target, seller_ask
+
+    b = unit_converter.price_per_base_unit(buyer_target, left)
+    s = unit_converter.price_per_base_unit(seller_ask, right)
+    if b is not None and s is not None:
+        if b[1] != s[1]:
+            return None  # per kg vs per piece: not the same thing
+        return b[0], s[0]
+    if left == right:
+        return buyer_target, seller_ask
+    return None
+
+
 def price_score(
     buyer_target: Optional[Decimal],
     seller_ask: Optional[Decimal],
     buyer_currency: Optional[str] = None,
     seller_currency: Optional[str] = None,
+    buyer_unit: Optional[str] = None,
+    seller_unit: Optional[str] = None,
 ) -> Optional[float]:
     """1.0 when the seller is at or under the buyer's target, decaying above it.
 
-    Different currencies are converted to the buyer's before comparing, using
-    the static table in ``services/currency``. An unknown currency still yields
-    None: a fabricated comparison is worse than an absent one.
+    Unscored (None) rather than guessed when:
+
+    * either price is missing or not positive -- a 0 is "price on request",
+      not a free offer, and must not beat every real quote;
+    * either currency is missing -- 100 of an unknown currency is not
+      comparable to 90 USD;
+    * a currency is unknown to the conversion table;
+    * the units are incomparable (per kg vs per piece).
+
+    Different currencies are converted to the buyer's first, then both prices
+    are restated per a common base unit (see ``_per_unit_prices``).
     """
-    if buyer_target is None or seller_ask is None or buyer_target <= 0:
+    if buyer_target is None or seller_ask is None:
+        return None
+    try:
+        if buyer_target <= 0 or seller_ask <= 0:
+            return None
+    except (InvalidOperation, TypeError):
         return None
 
-    if buyer_currency and seller_currency and buyer_currency != seller_currency:
-        converted = currency.convert(seller_ask, seller_currency, buyer_currency)
+    buyer_ccy = (buyer_currency or "").strip().upper() or None
+    seller_ccy = (seller_currency or "").strip().upper() or None
+    if (buyer_ccy is None and seller_ccy is not None) or (buyer_ccy is not None and seller_ccy is None):
+        return None
+    if buyer_ccy and seller_ccy and buyer_ccy != seller_ccy:
+        converted = currency.convert(seller_ask, seller_ccy, buyer_ccy)
         if converted is None:
             return None
         seller_ask = converted
+
+    pair = _per_unit_prices(buyer_target, buyer_unit, seller_ask, seller_unit)
+    if pair is None:
+        return None
+    buyer_target, seller_ask = pair
+    if buyer_target <= 0:
+        return None
 
     if seller_ask <= buyer_target:
         return 1.0
@@ -791,12 +907,18 @@ def quantity_score(
 
     left, right = normalise_unit(needed_unit), normalise_unit(available_unit)
     if left and right and left != right:
-        # Comparing 500 kg to 500 cartons would be nonsense.
-        return None
+        # Same dimension in different units: 24 pcs vs 2 dozen, 5 m vs 500 cm.
+        lb, rb = unit_converter.base_unit(left), unit_converter.base_unit(right)
+        if lb is None or rb is None or lb[1] != rb[1]:
+            # Comparing 500 kg to 500 cartons would be nonsense.
+            return None
+        needed, available = needed * lb[0], available * rb[0]
+        if needed <= 0:
+            return None
 
     if available >= needed:
         return 1.0
-    return float(available / needed)
+    return max(0.0, min(1.0, float(available / needed)))
 
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -844,12 +966,24 @@ def _administrative_score(
         left, right = requester.get(field), candidate.get(field)
         return bool(left and right and str(left).strip().lower() == str(right).strip().lower())
 
-    if same("city"):
+    # A city or state name is only local inside one country: Hyderabad in
+    # India and Hyderabad in Pakistan are a border apart.
+    left_country = normalise_country(requester.get("country"))
+    right_country = normalise_country(candidate.get("country"))
+    if left_country and right_country and left_country != right_country:
+        return 0.1
+
+    # Likewise a city name shared by two states (Aurangabad, Maharashtra and
+    # Aurangabad, Bihar) is not the same city.
+    states_conflict = bool(
+        requester.get("state") and candidate.get("state") and not same("state")
+    )
+    if same("city") and not states_conflict:
         return 1.0
     if same("state"):
         return 0.6
-    if same("country"):
-        return 0.3
+    if left_country and right_country:
+        return 0.3  # same country, different state
     # Both sides stated a location and they share no level of it: that is a
     # cross-border match, which is a real answer rather than a missing one.
     if any(requester.get(f) for f in ("city", "state", "country")) and any(
@@ -885,19 +1019,31 @@ def location_score(
     return round(max(geographic, administrative), 4)
 
 
+# Days of lateness over which the deadline score falls from 1 to 0.
+_DEADLINE_GRACE_DAYS = 14
+
+
 def deadline_score(
-    requester_deadline: Optional[datetime], candidate_deadline: Optional[datetime]
+    buyer_need_by: Optional[datetime], seller_ready_by: Optional[datetime]
 ) -> Optional[float]:
-    """Whether the counterparty's window still covers the requester's date."""
-    if requester_deadline is None or candidate_deadline is None:
+    """Can the seller deliver by the buyer's date? Always the buyer's view.
+
+    A buyer RFQ's ``deadline_at`` is the date the goods are needed by; a seller
+    RFQ's is the date they can dispatch by (the card adds transit on top). So
+    the arguments are positional by role, not by who is searching: the caller
+    passes the buyer side first whichever of them ran the match.
+
+    Ready on or before the need-by date is full marks -- earlier is never worse.
+    Every day late costs 1/14th, reaching zero two weeks past the date.
+    """
+    if buyer_need_by is None or seller_ready_by is None:
         return None
 
-    if candidate_deadline >= requester_deadline:
+    if seller_ready_by <= buyer_need_by:
         return 1.0
 
-    # The counterparty's window closes first; decay over a fortnight of shortfall.
-    shortfall_days = (requester_deadline - candidate_deadline).total_seconds() / 86400
-    return max(0.0, 1.0 - shortfall_days / 14)
+    late_days = (seller_ready_by - buyer_need_by).total_seconds() / 86400
+    return max(0.0, 1.0 - late_days / _DEADLINE_GRACE_DAYS)
 
 
 def blend(
@@ -914,11 +1060,45 @@ def blend(
         if value is None:
             continue
         weight = active_weights.get(dimension, WEIGHTS.get(dimension, 0.0))
+        try:
+            weight = float(weight)
+        except (TypeError, ValueError):
+            weight = 0.0
+        # A negative weight would let the mean leave [0, 1].
+        if not math.isfinite(weight) or weight < 0:
+            weight = 0.0
         total += weight * value
         weight_sum += weight
     if weight_sum == 0:
         return 0.0
-    return round(total / weight_sum, 4)
+    return round(min(1.0, max(0.0, total / weight_sum)), 4)
+
+
+def sanitise_weights(raw: Any) -> dict[str, float]:
+    """User-supplied weights made safe to score with.
+
+    Unknown keys and non-numbers are ignored, negatives and non-finite values
+    count as 0, dimensions the user did not mention keep their default, and the
+    result is renormalised to sum to 1. If nothing usable is left, the defaults
+    are returned -- a bad preference must never break matching.
+    """
+    if not isinstance(raw, dict):
+        return dict(WEIGHTS)
+    merged = dict(WEIGHTS)
+    for key, value in raw.items():
+        if key not in WEIGHTS or isinstance(value, bool):
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(number):
+            continue
+        merged[key] = max(0.0, number)
+    total = sum(merged.values())
+    if total <= 0:
+        return dict(WEIGHTS)
+    return {key: value / total for key, value in merged.items()}
 
 
 def estimate_logistics(

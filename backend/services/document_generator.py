@@ -9,13 +9,19 @@ from datetime import UTC, datetime
 from decimal import Decimal
 import hashlib
 import io
-from typing import Optional
+import logging
+import os
+import re
+import threading
+from typing import TYPE_CHECKING, Optional
 import xml.sax.saxutils as saxutils
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import HRFlowable, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 from models.quotation import Quotation
@@ -23,12 +29,152 @@ from models.rfq import RFQ
 from models.shipment import Shipment
 from models.user import User
 
+if TYPE_CHECKING:
+    from models.escrow import EscrowAccount
 
-def _esc(val: Optional[str]) -> str:
-    """Safely escape text for ReportLab XML/HTML Paragraph elements."""
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Unicode text support
+#
+# The layout uses the core Helvetica fonts, which only cover WinAnsi (Latin-1
+# plus a few symbols). Anything else -- Hindi, Chinese, Arabic, the rupee sign
+# -- used to be drawn as ZapfDingbats boxes. ReportLab has no per-glyph font
+# fallback, so _esc() splits text into runs and wraps each non-WinAnsi run in a
+# <font> tag naming a system TrueType font that actually has those glyphs.
+# If no suitable font is installed the text degrades to the old behaviour
+# rather than failing.
+# ---------------------------------------------------------------------------
+
+_FONT_DIRS: tuple[str, ...] = (
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "fonts"),
+    "/usr/share/fonts",
+    "/usr/local/share/fonts",
+    os.path.expanduser("~/.fonts"),
+    os.path.expanduser("~/.local/share/fonts"),
+)
+
+# (registered name, candidate file names in preference order). Only TrueType
+# outlines work with ReportLab, which is why CFF-based Noto CJK .otf/.ttc files
+# are not listed; Droid Sans Fallback / AR PL UMing cover CJK instead.
+_FALLBACK_FONTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("UniSans", ("DejaVuSans.ttf", "NotoSans-Regular.ttf", "LiberationSans-Regular.ttf", "FreeSans.ttf")),
+    ("UniDevanagari", ("NotoSansDevanagari-Regular.ttf", "Lohit-Devanagari.ttf", "NotoSerifDevanagari-Regular.ttf")),
+    ("UniArabic", ("NotoSansArabic-Regular.ttf", "NotoNaskhArabic-Regular.ttf")),
+    ("UniBengali", ("NotoSansBengali-Regular.ttf", "Lohit-Bengali.ttf")),
+    ("UniGujarati", ("NotoSansGujarati-Regular.ttf", "Lohit-Gujarati.ttf")),
+    ("UniTamil", ("NotoSansTamil-Regular.ttf", "Lohit-Tamil.ttf")),
+    ("UniCJK", ("DroidSansFallbackFull.ttf", "DroidSansFallback.ttf", "uming.ttc", "wqy-microhei.ttc", "wqy-zenhei.ttc")),
+    ("UniSymbols", ("DejaVuSans-Bold.ttf", "FreeSerif.ttf")),
+)
+
+_font_lock = threading.Lock()
+_fonts_loaded = False
+# Registered font name -> set of code points it has a glyph for.
+_font_coverage: list[tuple[str, frozenset[int]]] = []
+_char_font_cache: dict[str, Optional[str]] = {}
+
+
+def _locate_font_files() -> dict[str, str]:
+    wanted = {name for _, names in _FALLBACK_FONTS for name in names}
+    found: dict[str, str] = {}
+    for base in _FONT_DIRS:
+        if not os.path.isdir(base):
+            continue
+        for root, _dirs, files in os.walk(base):
+            for fname in files:
+                if fname in wanted and fname not in found:
+                    found[fname] = os.path.join(root, fname)
+    return found
+
+
+def _load_unicode_fonts() -> None:
+    global _fonts_loaded
+    if _fonts_loaded:
+        return
+    with _font_lock:
+        if _fonts_loaded:
+            return
+        try:
+            files = _locate_font_files()
+        except Exception:  # noqa: BLE001
+            logger.warning("Could not scan system font directories", exc_info=True)
+            files = {}
+        for reg_name, candidates in _FALLBACK_FONTS:
+            for fname in candidates:
+                path = files.get(fname)
+                if not path:
+                    continue
+                try:
+                    font = TTFont(reg_name, path, subfontIndex=0) if path.endswith(".ttc") else TTFont(reg_name, path)
+                    pdfmetrics.registerFont(font)
+                    pdfmetrics.registerFontFamily(
+                        reg_name, normal=reg_name, bold=reg_name, italic=reg_name, boldItalic=reg_name
+                    )
+                    _font_coverage.append((reg_name, frozenset(font.face.charToGlyph.keys())))
+                    break
+                except Exception:  # noqa: BLE001 -- unusable font file, try the next one
+                    logger.debug("Font %s unusable", path, exc_info=True)
+        if not _font_coverage:
+            logger.warning("No Unicode TrueType font found; non-Latin PDF text will not render")
+        _fonts_loaded = True
+
+
+def _winansi_ok(ch: str) -> bool:
+    try:
+        ch.encode("cp1252")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
+def _font_for(ch: str) -> Optional[str]:
+    """Registered fallback font covering ``ch``, or None to keep Helvetica."""
+    if _winansi_ok(ch):
+        return None
+    if ch in _char_font_cache:
+        return _char_font_cache[ch]
+    _load_unicode_fonts()
+    cp = ord(ch)
+    choice = next((name for name, cover in _font_coverage if cp in cover), None)
+    _char_font_cache[ch] = choice
+    return choice
+
+
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _esc(val: Optional[object]) -> str:
+    """Escape text for a ReportLab Paragraph, switching fonts for non-Latin runs."""
     if val is None:
         return "—"
-    return saxutils.escape(str(val))
+    text = _CONTROL_CHARS.sub(" ", str(val))
+    out: list[str] = []
+    run: list[str] = []
+    run_font: Optional[str] = None
+
+    def flush() -> None:
+        if not run:
+            return
+        chunk = saxutils.escape("".join(run))
+        out.append(f'<font name="{run_font}">{chunk}</font>' if run_font else chunk)
+        run.clear()
+
+    for ch in text:
+        # Whitespace joins whichever run it sits in.
+        font = run_font if ch.isspace() else _font_for(ch)
+        if font != run_font:
+            flush()
+            run_font = font
+        run.append(ch)
+    flush()
+    return "".join(out)
+
+
+def _doc_date(quotation: Quotation) -> datetime:
+    """A date fixed by the quotation itself, so re-downloads are identical."""
+    return quotation.created_at or datetime(1970, 1, 1, tzinfo=UTC)
 
 
 def _get_entity_info(user: User) -> dict[str, str]:
@@ -136,8 +282,8 @@ def generate_purchase_order_pdf(
     buyer_info = _get_entity_info(buyer)
     seller_info = _get_entity_info(seller)
 
-    po_ref = quotation.purchase_order_reference or f"PO-{datetime.now(UTC).strftime('%Y%m%d')}-{str(quotation.id)[:6].upper()}"
-    issue_date = quotation.created_at.strftime("%B %d, %Y") if quotation.created_at else datetime.now(UTC).strftime("%B %d, %Y")
+    po_ref = quotation.purchase_order_reference or f"PO-{_doc_date(quotation).strftime('%Y%m%d')}-{str(quotation.id)[:6].upper()}"
+    issue_date = _doc_date(quotation).strftime("%B %d, %Y")
 
     story = []
 
@@ -224,13 +370,13 @@ def generate_purchase_order_pdf(
     qty_val = float(quotation.quantity)
     unit_price = float(quotation.unit_price)
     total_amt = float(quotation.total_amount)
-    curr = quotation.currency
+    curr = _esc(quotation.currency)
 
     # Build technical attributes summary
     specs_summary = ""
     if rfq and rfq.product_details:
         specs_list = [
-            f"{k.replace('_', ' ')}: {v}"
+            f"{_esc(str(k).replace('_', ' '))}: {_esc(v)}"
             for k, v in rfq.product_details.items()
             if not k.endswith("__must_match") and k != "name"
         ]
@@ -358,8 +504,13 @@ def generate_commercial_invoice_pdf(
     buyer: User,
     seller: User,
     rfq: Optional[RFQ] = None,
+    escrow: Optional["EscrowAccount"] = None,
 ) -> bytes:
-    """Generate an official B2B Commercial Tax Invoice PDF."""
+    """Generate an official B2B Commercial Tax Invoice PDF.
+
+    ``escrow`` is the deal's vault, if one exists. The invoice only states that
+    escrow is cleared when money was actually deposited (funded_amount > 0).
+    """
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
         buffer,
@@ -434,9 +585,35 @@ def generate_commercial_invoice_pdf(
     buyer_info = _get_entity_info(buyer)
     seller_info = _get_entity_info(seller)
 
-    inv_num = f"INV-{datetime.now(UTC).strftime('%Y%m%d')}-{str(quotation.id)[:6].upper()}"
+    # Derived from the quotation, not today's date, so every download of the
+    # same invoice carries the same number.
+    inv_num = f"INV-{_doc_date(quotation).strftime('%Y%m%d')}-{str(quotation.id)[:8].upper()}"
     po_ref = quotation.purchase_order_reference or "PO-DIRECT-SETTLEMENT"
-    issue_date = datetime.now(UTC).strftime("%B %d, %Y")
+    issue_date = _doc_date(quotation).strftime("%B %d, %Y")
+
+    funded = Decimal(str(escrow.funded_amount)) if escrow is not None and escrow.funded_amount else Decimal("0")
+    released = Decimal(str(escrow.released_amount)) if escrow is not None and escrow.released_amount else Decimal("0")
+    refunded = Decimal(str(escrow.refunded_amount)) if escrow is not None and escrow.refunded_amount else Decimal("0")
+    if funded > 0:
+        if escrow.status == "completed":
+            payment_status = "SETTLED / ESCROW RELEASED"
+        elif escrow.status == "refunded":
+            payment_status = "REFUNDED FROM ESCROW"
+        elif escrow.status == "disputed":
+            payment_status = "ESCROW FUNDED / UNDER DISPUTE"
+        else:
+            payment_status = "ESCROW SECURED"
+        gateway_line = (
+            f"B2B-ESCROW-CLEARED-{str(quotation.id)[:8].upper()} "
+            f"(deposited {escrow.currency} {funded:,.2f}; released {released:,.2f}; refunded {refunded:,.2f})"
+        )
+    else:
+        payment_status = "PAYMENT PENDING"
+        gateway_line = (
+            "Not funded - no escrow deposit has been recorded for this order"
+            if escrow is not None
+            else "Not funded - no escrow vault has been opened for this order"
+        )
 
     story = []
 
@@ -468,7 +645,7 @@ def generate_commercial_invoice_pdf(
             Paragraph(f"<b>{_esc(inv_num)}</b>", meta_val),
             Paragraph(_esc(issue_date), meta_val),
             Paragraph(f"<b>{_esc(po_ref)}</b>", meta_val),
-            Paragraph("<b>SETTLED / ESCROW SECURED</b>", meta_val),
+            Paragraph(f"<b>{_esc(payment_status)}</b>", meta_val),
         ],
     ]
     t_meta = Table(meta_table_data, colWidths=[2.2 * inch, 1.7 * inch, 1.8 * inch, 1.6 * inch])
@@ -522,7 +699,7 @@ def generate_commercial_invoice_pdf(
     qty_val = float(quotation.quantity)
     unit_price = float(quotation.unit_price)
     total_amt = float(quotation.total_amount)
-    curr = quotation.currency
+    curr = _esc(quotation.currency)
     hsn_code = "8544.42" if "cable" in item_title.lower() else "1006.30" if "rice" in item_title.lower() else "4819.10"
 
     items_data = [
@@ -585,7 +762,7 @@ def generate_commercial_invoice_pdf(
         [Paragraph("<b>REMITTANCE &amp; SETTLEMENT DETAILS</b>", h2_style)],
         [
             Paragraph(
-                f"• <b>Payment Gateway Reference</b>: B2B-ESCROW-CLEARED-{str(quotation.id)[:8].upper()}<br/>"
+                f"• <b>Escrow / Payment Reference</b>: {_esc(gateway_line)}<br/>"
                 f"• <b>Delivery / Incoterm</b>: {_esc(quotation.incoterms.value if quotation.incoterms else 'EXW')}<br/>"
                 f"• <b>Payment Terms</b>: {_esc(quotation.payment_terms or '100% Secured Settlement')}",
                 body_style,
@@ -688,7 +865,7 @@ def generate_waybill_pdf(
     story = []
 
     # 1. Header Banner
-    mode_label = shipment.shipping_mode.upper()
+    mode_label = _esc(shipment.shipping_mode.upper())
     header_data = [
         [
             Paragraph(
@@ -783,7 +960,7 @@ def generate_waybill_pdf(
     story.append(Spacer(1, 4))
 
     cbm_val = f"{float(shipment.volume_cbm):.3f} CBM" if shipment.volume_cbm else "—"
-    incoterm_val = quotation.incoterms if quotation and quotation.incoterms else "FOB"
+    incoterm_val = (getattr(quotation.incoterms, "value", quotation.incoterms) if quotation and quotation.incoterms else "FOB")
 
     cargo_headers = [
         Paragraph("<b>Package Count</b>", body_bold),

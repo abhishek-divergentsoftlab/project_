@@ -400,6 +400,8 @@ export interface AIChatChunk {
   conversation_id?: string | null;
   matched_candidates?: MatchCandidate[] | null;
   routed_agent?: AgentInfo | null;
+  /** When true, `content` replaces the text streamed so far instead of appending. */
+  replace_content?: boolean;
   done: boolean;
 }
 
@@ -540,6 +542,15 @@ export const aiChat = {
             try {
               const chunk: AIChatChunk = JSON.parse(trimmed.slice(6));
               onChunk(chunk);
+              if (chunk.done) {
+                // Backend finished generating. Release stream immediately so UI never stays stuck loading.
+                try {
+                  await reader.cancel();
+                } catch {
+                  // ignore cancellation error
+                }
+                return;
+              }
             } catch {
               // Ignore partial JSON
             }
@@ -592,12 +603,18 @@ export const notifications = {
 };
 
 export const marketplace = {
-  async getCatalog(params: CatalogFilterParams = {}): Promise<CatalogListResponse> {
-    const { data } = await api.get<CatalogListResponse>("/marketplace/catalog", { params });
+  async getCatalog(
+    params: CatalogFilterParams = {},
+    signal?: AbortSignal,
+  ): Promise<CatalogListResponse> {
+    const { data } = await api.get<CatalogListResponse>("/marketplace/catalog", { params, signal });
     return data;
   },
-  async getCategories(): Promise<CategoryCount[]> {
-    const { data } = await api.get<CategoryCount[]>("/marketplace/categories");
+  async getCategories(
+    params?: Partial<CatalogFilterParams>,
+    signal?: AbortSignal,
+  ): Promise<CategoryCount[]> {
+    const { data } = await api.get<CategoryCount[]>("/marketplace/categories", { params, signal });
     return data;
   },
   async getListing(rfqId: string): Promise<CatalogItem> {

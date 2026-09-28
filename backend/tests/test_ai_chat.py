@@ -927,6 +927,10 @@ async def test_ai_chat_message_endpoint_handles_send_counterparty_message(client
     conn_data = conn_res.json()
     conn_id = conn_data["id"]
 
+    # Counterparty accepts the connection so chat/deal room messaging is permitted
+    acc_res = await seller.post(f"/connections/{conn_id}/accept")
+    assert acc_res.status_code == 200
+
     orig_post = httpx.AsyncClient.post
 
     async def mock_ollama_post(self, url, *args, **kwargs):
@@ -1286,7 +1290,12 @@ async def test_super_agent_autonomous_routing():
     assert agent.id == "rfq_drafting"
     tool_names = [t["function"]["name"] for t in tools]
     assert "update_rfq_draft" in tool_names
-    assert "create_rfq" in tool_names
+    assert "create_rfq" not in tool_names
+
+    # Explicit creation request provisions create_rfq
+    agent_pub, tools_pub, meta_pub = route_query_to_agent("Please publish and create the RFQ now")
+    tool_names_pub = [t["function"]["name"] for t in tools_pub]
+    assert "create_rfq" in tool_names_pub
 
 
 @pytest.mark.asyncio

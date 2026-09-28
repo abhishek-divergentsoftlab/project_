@@ -13,7 +13,7 @@ import {
   IconUpload,
   IconX,
 } from "@/components/icons";
-import { LocationMapPicker } from "@/components/map/LocationMapPicker";
+import { LocationMapPicker } from "@/components/map/lazy";
 import { Menu } from "@/components/ui/Menu";
 import { Modal } from "@/components/ui/Modal";
 import { useAuth } from "@/context/useAuth";

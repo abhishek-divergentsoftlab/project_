@@ -7,6 +7,9 @@ Provides exact conversion factors for metric and imperial mass units:
 - Grams / g / gm (0.001 kg)
 - Pounds / lbs (0.453592 kg)
 
+Count units resolve to pieces (pcs, dozen = 12, pair = 2, gross = 144), and
+``clean_unit`` absorbs typing noise such as "Kgs." or "Metric  Tons".
+
 And recognized commercial & agricultural packaging containers:
 - Bora / Bori / Katta / Gunny bag / Bag / Sack (jute/poly bags)
 - Bale / Carton / Box / Crate / Drum / Pallet
@@ -24,6 +27,11 @@ MASS_CONVERSION_TO_KG: dict[str, Decimal] = {
     "ton": Decimal("1000"),
     "tons": Decimal("1000"),
     "mt": Decimal("1000"),
+    "t": Decimal("1000"),
+    "metric ton": Decimal("1000"),
+    "metric tons": Decimal("1000"),
+    "metric tonne": Decimal("1000"),
+    "metric tonnes": Decimal("1000"),
     # Quintals (standard in Indian and agricultural mandis: 1 quintal = 100 kg)
     "quintal": Decimal("100"),
     "quintals": Decimal("100"),
@@ -127,6 +135,32 @@ CAPACITY_CONVERSION_TO_AH: dict[str, Decimal] = {
     "mah": Decimal("0.001"),
 }
 
+# Count units, as multiples of one piece. "2 dozen" is 24 pieces, so a buyer
+# asking for 24 pcs and a seller offering 2 dozen are the same order.
+COUNT_CONVERSION_TO_PIECES: dict[str, Decimal] = {
+    "pc": Decimal("1"),
+    "pcs": Decimal("1"),
+    "piece": Decimal("1"),
+    "pieces": Decimal("1"),
+    "unit": Decimal("1"),
+    "units": Decimal("1"),
+    "no": Decimal("1"),
+    "nos": Decimal("1"),
+    "number": Decimal("1"),
+    "numbers": Decimal("1"),
+    "each": Decimal("1"),
+    "ea": Decimal("1"),
+    "item": Decimal("1"),
+    "items": Decimal("1"),
+    "pair": Decimal("2"),
+    "pairs": Decimal("2"),
+    "dozen": Decimal("12"),
+    "dozens": Decimal("12"),
+    "doz": Decimal("12"),
+    "dz": Decimal("12"),
+    "gross": Decimal("144"),
+}
+
 # Recognized trade packaging containers
 PACKAGING_UNITS: frozenset[str] = frozenset(
     {
@@ -160,23 +194,94 @@ PACKAGING_UNITS: frozenset[str] = frozenset(
 )
 
 
+_UNIT_PUNCT_RE = re.compile(r"[.\s]+")
+
+
+def clean_unit(unit: Optional[str]) -> Optional[str]:
+    """Canonical spelling of a unit as people type it.
+
+    Lowercased, trailing dots dropped and whitespace collapsed, so "Kgs.",
+    " KG " and "Metric  Tons" look the way the conversion tables expect.
+    """
+    if unit is None:
+        return None
+    cleaned = str(unit).strip().lower().rstrip(".")
+    cleaned = _UNIT_PUNCT_RE.sub(" ", cleaned).strip()
+    if cleaned.startswith("per "):
+        cleaned = cleaned[4:].strip()
+    return cleaned or None
+
+
 def is_mass_unit(unit: Optional[str]) -> bool:
-    if not unit:
-        return False
-    return unit.strip().lower() in MASS_CONVERSION_TO_KG
+    cleaned = clean_unit(unit)
+    return bool(cleaned) and cleaned in MASS_CONVERSION_TO_KG
+
+
+def is_count_unit(unit: Optional[str]) -> bool:
+    cleaned = clean_unit(unit)
+    return bool(cleaned) and cleaned in COUNT_CONVERSION_TO_PIECES
 
 
 def is_packaging_unit(unit: Optional[str]) -> bool:
-    if not unit:
-        return False
-    return unit.strip().lower() in PACKAGING_UNITS
+    cleaned = clean_unit(unit)
+    return bool(cleaned) and cleaned in PACKAGING_UNITS
+
+
+def to_pieces(value: Optional[Decimal], unit: Optional[str]) -> Optional[Decimal]:
+    """Converts a count (pcs, dozen, pair, gross) to pieces. None if not a count unit."""
+    if value is None:
+        return None
+    cleaned = clean_unit(unit)
+    multiplier = COUNT_CONVERSION_TO_PIECES.get(cleaned) if cleaned else None
+    if multiplier is None:
+        return None
+    return value * multiplier
+
+
+def base_unit(unit: Optional[str]) -> Optional[tuple[Decimal, str]]:
+    """(factor, base) for a quantity unit: how many base units one ``unit`` is.
+
+    Mass resolves to kg, counts to pcs, length to m and volume to l. Anything
+    else (a packaging unit, an unknown word) returns None: "1 bora" has no
+    fixed size without a declared pack weight.
+    """
+    cleaned = clean_unit(unit)
+    if not cleaned:
+        return None
+    if cleaned in MASS_CONVERSION_TO_KG:
+        return MASS_CONVERSION_TO_KG[cleaned], "kg"
+    if cleaned in COUNT_CONVERSION_TO_PIECES:
+        return COUNT_CONVERSION_TO_PIECES[cleaned], "pcs"
+    if cleaned in LENGTH_CONVERSION_TO_METER:
+        return LENGTH_CONVERSION_TO_METER[cleaned], "m"
+    if cleaned in VOLUME_CONVERSION_TO_LITER:
+        return VOLUME_CONVERSION_TO_LITER[cleaned], "l"
+    return None
+
+
+def price_per_base_unit(
+    amount: Optional[Decimal], per_unit: Optional[str]
+) -> Optional[tuple[Decimal, str]]:
+    """A unit price restated per base unit: 28,000/tonne -> (28, "kg").
+
+    Returns None when the unit has no fixed base (see ``base_unit``).
+    """
+    if amount is None:
+        return None
+    resolved = base_unit(per_unit)
+    if resolved is None:
+        return None
+    factor, base = resolved
+    if factor == 0:
+        return None
+    return amount / factor, base
 
 
 def to_kg(value: Optional[Decimal], unit: Optional[str]) -> Optional[Decimal]:
     """Converts any mass value to kilograms (kg). Returns None if not a mass unit."""
     if value is None or not unit:
         return None
-    multiplier = MASS_CONVERSION_TO_KG.get(unit.strip().lower())
+    multiplier = MASS_CONVERSION_TO_KG.get(clean_unit(unit) or "")
     if multiplier is None:
         return None
     return value * multiplier
@@ -195,7 +300,7 @@ def convert_mass(value: Decimal, from_unit: str, to_unit: str) -> Optional[Decim
     kg = to_kg(value, from_unit)
     if kg is None:
         return None
-    target_mult = MASS_CONVERSION_TO_KG.get(to_unit.strip().lower())
+    target_mult = MASS_CONVERSION_TO_KG.get(clean_unit(to_unit) or "")
     if target_mult is None:
         return None
     return kg / target_mult
@@ -260,7 +365,7 @@ def to_base_si(value: Decimal, unit: str) -> Optional[tuple[Decimal, str, str]]:
 
     Returns None if the unit is unrecognized.
     """
-    cleaned = unit.strip().lower()
+    cleaned = clean_unit(unit) or ""
 
     # 1. Length [L] -> meter (m)
     if cleaned in LENGTH_CONVERSION_TO_METER:

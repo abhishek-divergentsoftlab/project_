@@ -13,12 +13,12 @@ from fastapi import APIRouter, HTTPException, Query, status
 from api.deps import CurrentUser, DbSession
 from models.enums import RFQStatus
 from models.rfq import RFQ
-from schemas.rfq import RFQCreate, RFQListOut, RFQOut, RFQUpdate
+from schemas.rfq import RFQCreate, RFQListOut, RFQOut, RFQPatch
 from schemas.marketplace import CatalogListOut
 from schemas.connection import ConnectionOut
 from services import connection_service, rfq_service, saved_rfq_service
 from services.saved_rfq_service import SavedRFQNotFoundError
-from services.rfq_service import RFQError
+from services.rfq_service import RFQError, RFQStateError
 
 router = APIRouter()
 
@@ -29,7 +29,19 @@ async def _get_owned(db: DbSession, rfq_id: uuid.UUID, user_id: uuid.UUID) -> RF
     # exists, which is an enumeration oracle.
     if rfq is None or rfq.user_id != user_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "RFQ not found")
+    # Keep the owner's view honest: a listing past expires_at reads 'expired'
+    # even if the periodic sweep has not run yet.
+    await rfq_service.expire_due_rfqs(db, rfq_ids=[rfq.id])
     return rfq
+
+
+def _raise_for(exc: RFQError) -> None:
+    code = (
+        status.HTTP_409_CONFLICT
+        if isinstance(exc, RFQStateError)
+        else status.HTTP_422_UNPROCESSABLE_CONTENT
+    )
+    raise HTTPException(code, str(exc)) from exc
 
 
 @router.post("", response_model=RFQOut, status_code=status.HTTP_201_CREATED)
@@ -97,13 +109,15 @@ async def get_rfq(rfq_id: uuid.UUID, current_user: CurrentUser, db: DbSession) -
 
 @router.patch("/{rfq_id}", response_model=RFQOut)
 async def update_rfq(
-    rfq_id: uuid.UUID, payload: RFQUpdate, current_user: CurrentUser, db: DbSession
+    rfq_id: uuid.UUID, payload: RFQPatch, current_user: CurrentUser, db: DbSession
 ) -> RFQOut:
+    """Edit an RFQ's content. ``status`` is not accepted here (422): use
+    ``/publish`` and ``/close``. Closed or expired RFQs are immutable (409)."""
     rfq = await _get_owned(db, rfq_id, current_user.id)
     try:
         rfq = await rfq_service.update_rfq(db, rfq, payload)
     except RFQError as exc:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
+        _raise_for(exc)
     pending_counts = await connection_service.get_rfq_pending_counts(db, current_user.id)
     return rfq_service.to_out(rfq, pending_connections=pending_counts.get(rfq.id, 0))
 
@@ -112,17 +126,16 @@ async def update_rfq(
 async def publish_rfq(
     rfq_id: uuid.UUID, current_user: CurrentUser, db: DbSession
 ) -> RFQOut:
-    """Move a draft to active, making it eligible for matching."""
+    """Move a draft to active, making it eligible for matching.
+
+    409 when the RFQ is not a draft (closed/expired), or its deadline passed.
+    """
     rfq = await _get_owned(db, rfq_id, current_user.id)
+    try:
+        rfq = await rfq_service.publish_rfq(db, rfq)
+    except RFQError as exc:
+        _raise_for(exc)
     pending_counts = await connection_service.get_rfq_pending_counts(db, current_user.id)
-    if rfq.status is RFQStatus.ACTIVE:
-        return rfq_service.to_out(rfq, pending_connections=pending_counts.get(rfq.id, 0))
-    if rfq.status is not RFQStatus.DRAFT:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            f"only a draft can be published; this RFQ is {rfq.status.value}",
-        )
-    rfq = await rfq_service.update_rfq(db, rfq, RFQUpdate(status=RFQStatus.ACTIVE))
     return rfq_service.to_out(rfq, pending_connections=pending_counts.get(rfq.id, 0))
 
 
@@ -130,13 +143,15 @@ async def publish_rfq(
 async def close_rfq(
     rfq_id: uuid.UUID, current_user: CurrentUser, db: DbSession
 ) -> RFQOut:
+    """Withdraw a draft or active RFQ (terminal). Idempotent when already closed."""
     rfq = await _get_owned(db, rfq_id, current_user.id)
     try:
-        rfq = await rfq_service.update_rfq(db, rfq, RFQUpdate(status=RFQStatus.CLOSED))
+        rfq = await rfq_service.close_rfq(db, rfq)
     except RFQError as exc:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
+        _raise_for(exc)
     pending_counts = await connection_service.get_rfq_pending_counts(db, current_user.id)
     return rfq_service.to_out(rfq, pending_connections=pending_counts.get(rfq.id, 0))
+
 
 @router.get("/{rfq_id}/connections", response_model=list[ConnectionOut])
 async def list_rfq_connections(

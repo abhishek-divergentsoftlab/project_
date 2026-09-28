@@ -17,14 +17,14 @@ router = APIRouter(prefix="/marketplace", tags=["marketplace"])
 async def get_marketplace_catalog(
     current_user: CurrentUser,
     db: DbSession,
-    q: Annotated[Optional[str], Query(description="Search term")] = None,
+    q: Annotated[Optional[str], Query(description="Search term (first 200 chars / 10 words are used)")] = None,
     role: Annotated[Optional[RFQRole], Query(description="Market side (buyer or seller)")] = None,
-    category: Annotated[Optional[str], Query(description="Category filter")] = None,
-    city: Annotated[Optional[str], Query(description="City filter")] = None,
-    country: Annotated[Optional[str], Query(description="Country filter")] = None,
-    min_price: Annotated[Optional[float], Query(ge=0, description="Min target price")] = None,
-    max_price: Annotated[Optional[float], Query(ge=0, description="Max target price")] = None,
-    currency: Annotated[Optional[str], Query(description="Currency filter (e.g. USD, INR)")] = None,
+    category: Annotated[Optional[str], Query(max_length=120, description="Category filter")] = None,
+    city: Annotated[Optional[str], Query(max_length=120, description="City filter")] = None,
+    country: Annotated[Optional[str], Query(max_length=120, description="Country filter")] = None,
+    min_price: Annotated[Optional[float], Query(ge=0, le=1e13, allow_inf_nan=False, description="Min target price")] = None,
+    max_price: Annotated[Optional[float], Query(ge=0, le=1e13, allow_inf_nan=False, description="Max target price")] = None,
+    currency: Annotated[Optional[str], Query(max_length=64, description="Currency filter (e.g. USD, INR)")] = None,
     verified_only: Annotated[bool, Query(description="Filter KYC-verified or high-trust suppliers")] = False,
     saved_only: Annotated[bool, Query(description="Filter saved listings only")] = False,
     sort_by: Annotated[
@@ -38,7 +38,7 @@ async def get_marketplace_catalog(
     offset: Annotated[int, Query(ge=0)] = 0,
     lat: Annotated[Optional[float], Query(ge=-90, le=90, description="Reference latitude for radius and distance")] = None,
     lon: Annotated[Optional[float], Query(ge=-180, le=180, description="Reference longitude for radius and distance")] = None,
-    radius_km: Annotated[Optional[float], Query(gt=0, description="Max distance in kilometers")] = None,
+    radius_km: Annotated[Optional[float], Query(gt=0, le=20100, allow_inf_nan=False, description="Max distance in kilometers")] = None,
 ) -> CatalogListOut:
     """Browse and filter active listings across the wholesale marketplace."""
     return await catalog_service.get_catalog(
@@ -67,9 +67,28 @@ async def get_marketplace_catalog(
 async def get_marketplace_categories(
     current_user: CurrentUser,
     db: DbSession,
+    q: Annotated[Optional[str], Query(description="Search term (first 200 chars / 10 words are used)")] = None,
+    city: Annotated[Optional[str], Query(max_length=120)] = None,
+    country: Annotated[Optional[str], Query(max_length=120)] = None,
+    min_price: Annotated[Optional[float], Query(ge=0, le=1e13, allow_inf_nan=False)] = None,
+    max_price: Annotated[Optional[float], Query(ge=0, le=1e13, allow_inf_nan=False)] = None,
+    currency: Annotated[Optional[str], Query(max_length=64)] = None,
+    verified_only: bool = False,
+    saved_only: bool = False,
 ) -> list[CategoryCountOut]:
     """Retrieve top marketplace categories and active listing counts."""
-    return await catalog_service.get_categories_summary(db)
+    return await catalog_service.get_categories_summary(
+        db,
+        viewer=current_user,
+        q=q,
+        city=city,
+        country=country,
+        min_price=min_price,
+        max_price=max_price,
+        currency=currency,
+        verified_only=verified_only,
+        saved_only=saved_only,
+    )
 
 
 @router.get("/catalog/{rfq_id}", response_model=CatalogItemOut)

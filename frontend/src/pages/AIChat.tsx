@@ -136,7 +136,8 @@ function MatchCartView({
         <>
           <ul className="ai-match-cards-list">
             {matchState.candidates.map((candidate) => {
-              const scorePct = Math.round((candidate.score?.total ?? 0) * 100);
+              const scoreTotal = candidate.score?.total;
+              const scorePct = scoreTotal == null ? null : Math.round(scoreTotal * 100);
               const where = [
                 candidate.location?.city,
                 candidate.location?.state,
@@ -151,9 +152,11 @@ function MatchCartView({
 
               return (
                 <li key={candidate.rfq_id} className="ai-chat-match-card">
-                  <span className="ai-match-card-score-box" title="Match score">
-                    {scorePct}%
-                  </span>
+                  {scorePct !== null && (
+                    <span className="ai-match-card-score-box" title="Match score">
+                      {scorePct}%
+                    </span>
+                  )}
                   <div className="ai-match-card-main-info">
                     <Link
                       to={`/marketplace?rfq=${candidate.rfq_id}`}
@@ -694,7 +697,10 @@ export function AIChat() {
           setMessages((prev) =>
             prev.map((msg) => {
               if (msg.id !== aiMessageId) return msg;
-              const nextContent = (msg.content || "") + (chunk.content || "");
+              // The server replaces text it streamed but had to correct (e.g. a false refusal).
+              const nextContent = chunk.replace_content
+                ? chunk.content || ""
+                : (msg.content || "") + (chunk.content || "");
               const nextThinking = (msg.thinking || "") + (chunk.thinking || "");
               const nextThinkingAfter = (msg.thinkingAfter || "") + (chunk.thinking_after || "");
               const nextToolStep = chunk.tool_step || msg.toolStep || null;
@@ -716,7 +722,10 @@ export function AIChat() {
           );
 
           if (chunk.done) {
+            loadingRef.current = false;
+            setLoading(false);
             void refreshAiSessions();
+            setTimeout(() => textareaRef.current?.focus(), 50);
           }
         },
         currentRfqRef.current,
@@ -1139,14 +1148,26 @@ export function AIChat() {
                 maxLength={5000}
                 aria-label="Message"
               />
-              <button
-                type="submit"
-                className="ai-send-btn"
-                disabled={!input.trim() || loading}
-                aria-label="Send message"
-              >
-                <IconSend size={15} />
-              </button>
+              {loading ? (
+                <button
+                  type="button"
+                  className="ai-stop-btn"
+                  onClick={handleStop}
+                  aria-label="Stop response"
+                  title="Stop generating"
+                >
+                  <span className="stop-square" />
+                </button>
+              ) : (
+                <button
+                  type="submit"
+                  className="ai-send-btn"
+                  disabled={!input.trim()}
+                  aria-label="Send message"
+                >
+                  <IconSend size={15} />
+                </button>
+              )}
             </form>
             <p className="ai-composer-hint">
               Enter to send · Shift + Enter for a new line

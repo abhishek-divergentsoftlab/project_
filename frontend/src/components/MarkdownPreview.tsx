@@ -86,6 +86,7 @@ function parseBlocks(markdown: string): Block[] {
   let i = 0;
 
   while (i < lines.length) {
+    const startI = i;
     const line = lines[i];
     const trimmed = line.trim();
 
@@ -115,7 +116,7 @@ function parseBlocks(markdown: string): Block[] {
       continue;
     }
 
-    // 3. Headings: #, ##, ###, ####
+    // 3. Headings: #, ##, ###, #### (must be followed by whitespace to be a genuine heading)
     const headingMatch = trimmed.match(/^(#{1,6})\s+(.*)$/);
     if (headingMatch) {
       blocks.push({
@@ -168,6 +169,12 @@ function parseBlocks(markdown: string): Block[] {
           rows,
         });
         continue;
+      } else {
+        blocks.push({
+          type: "paragraph",
+          text: tableLines.join("\n"),
+        });
+        continue;
       }
     }
 
@@ -205,7 +212,7 @@ function parseBlocks(markdown: string): Block[] {
       i < lines.length &&
       lines[i].trim() &&
       !lines[i].trim().startsWith("```") &&
-      !lines[i].trim().startsWith("#") &&
+      !/^#{1,6}\s+/.test(lines[i].trim()) &&
       !lines[i].trim().startsWith(">") &&
       !(lines[i].trim().startsWith("|") && lines[i].trim().endsWith("|")) &&
       !/^[-*•]\s+/.test(lines[i].trim()) &&
@@ -221,13 +228,29 @@ function parseBlocks(markdown: string): Block[] {
         text: paraLines.join("\n"),
       });
     }
+
+    // Failsafe guarantee: if i did not advance, force advance by 1 to prevent infinite loop
+    if (i === startI) {
+      blocks.push({
+        type: "paragraph",
+        text: lines[i],
+      });
+      i++;
+    }
   }
 
   return blocks;
 }
 
 export function MarkdownPreview({ content, className = "" }: MarkdownPreviewProps) {
-  const blocks = useMemo(() => parseBlocks(content), [content]);
+  const blocks = useMemo(() => {
+    try {
+      return parseBlocks(content);
+    } catch (err) {
+      console.error("Markdown parsing error:", err);
+      return [{ type: "paragraph", text: content } as Block];
+    }
+  }, [content]);
 
   if (!content.trim()) return null;
 

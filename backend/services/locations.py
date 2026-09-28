@@ -295,3 +295,28 @@ DIALLING_CODES: dict[str, str] = {
 def dialling_code(country: Optional[str]) -> str:
     """Country calling code, defaulting to India's for anywhere unlisted."""
     return DIALLING_CODES.get(country or "", "91")
+
+
+# Spellings of the same country, so "IN", "Bharat" and "India" compare equal
+# when deciding whether two listings are domestic to each other.
+_COUNTRY_ALIASES: dict[str, str] = {
+    "in": "india", "ind": "india", "bharat": "india", "republic of india": "india",
+    "us": "united states", "usa": "united states", "u.s.": "united states",
+    "u.s.a.": "united states", "united states of america": "united states", "america": "united states",
+    "uk": "united kingdom", "u.k.": "united kingdom", "gb": "united kingdom",
+    "great britain": "united kingdom", "britain": "united kingdom", "england": "united kingdom",
+    "uae": "united arab emirates", "u.a.e.": "united arab emirates", "emirates": "united arab emirates",
+    "ksa": "saudi arabia", "prc": "china", "people's republic of china": "china",
+    "pk": "pakistan", "bd": "bangladesh", "cn": "china", "de": "germany",
+    "viet nam": "vietnam", "turkiye": "turkey", "türkiye": "turkey",
+}
+
+
+def normalise_country(country: Optional[object]) -> Optional[str]:
+    """Lowercase canonical country name, or None when not given."""
+    if country is None:
+        return None
+    cleaned = " ".join(str(country).strip().lower().split())
+    if not cleaned:
+        return None
+    return _COUNTRY_ALIASES.get(cleaned, cleaned)

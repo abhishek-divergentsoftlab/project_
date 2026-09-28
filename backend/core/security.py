@@ -62,6 +62,18 @@ def create_access_token(subject: str) -> str:
     )
 
 
+_revoked_jtis: set[str] = set()
+
+
+def revoke_jti(jti: str) -> None:
+    if jti:
+        _revoked_jtis.add(jti)
+
+
+def is_jti_revoked(jti: str) -> bool:
+    return jti in _revoked_jtis
+
+
 def create_refresh_token(subject: str) -> str:
     return _create_token(
         subject, "refresh", timedelta(minutes=settings.REFRESH_TOKEN_EXPIRE_MINUTES)
@@ -81,4 +93,6 @@ def decode_token(token: str, expected_type: TokenType) -> dict:
 
     if payload.get("type") != expected_type:
         raise TokenError(f"expected a {expected_type} token")
+    if payload.get("jti") and is_jti_revoked(payload["jti"]):
+        raise TokenError("token has been revoked")
     return payload

@@ -4,10 +4,11 @@ import uuid
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from models.connection import Connection
 from models.enums import QuotationStatus, RFQRole
 from models.quotation import Quotation
 from models.review import Review
@@ -230,12 +231,24 @@ async def create_review(
     if other_review is not None:
         quote.status = QuotationStatus.COMPLETED
 
+    # Trust moves only on the FIRST review a reviewer gives a reviewee. Two
+    # colluding accounts looping tiny deals on one connection used to earn +5
+    # per loop until they crossed the "verified only" threshold (60).
+    # (The session does not autoflush, so the pending review is not counted.)
+    prior_reviews_same_pair = await db.scalar(
+        select(func.count(Review.id)).where(
+            Review.reviewer_id == reviewer_id,
+            Review.reviewee_id == reviewee_id,
+        )
+    )
+
     # Update reviewee's trust score and recalculate overall average rating
     profile_query = select(UserProfile).where(UserProfile.user_id == reviewee_id)
     profile = (await db.execute(profile_query)).scalar_one_or_none()
     if profile:
-        bonus = 5 if payload.rating >= 4 else (1 if payload.rating == 3 else -5)
-        profile.trust_score = max(0, min(100, profile.trust_score + bonus))
+        if not prior_reviews_same_pair:
+            bonus = 5 if payload.rating >= 4 else (1 if payload.rating == 3 else -5)
+            profile.trust_score = max(0, min(100, profile.trust_score + bonus))
 
         existing_ratings = (await db.scalars(
             select(Review.rating).where(Review.reviewee_id == reviewee_id)
@@ -261,14 +274,39 @@ async def create_review(
     return review
 
 
+class ReviewNotFoundError(ReviewError):
+    """The quotation/user does not exist or is not visible to the caller (404)."""
+
+
 async def list_quote_reviews(
-    db: AsyncSession, connection_id: uuid.UUID, quote_id: uuid.UUID
+    db: AsyncSession,
+    connection_id: uuid.UUID,
+    quote_id: uuid.UUID,
+    viewer_id: Optional[uuid.UUID] = None,
 ) -> list[ReviewOut]:
-    """Fetch reviews submitted for a specific quotation."""
+    """Fetch reviews submitted for a specific quotation.
+
+    The quotation must belong to ``connection_id`` and, when ``viewer_id`` is
+    given, the viewer must be a party to it; otherwise ``ReviewNotFoundError``
+    (a 404, so quote ids cannot be probed).
+    """
+    quote = await db.scalar(
+        select(Quotation).where(
+            Quotation.id == quote_id,
+            Quotation.connection_id == connection_id,
+        )
+    )
+    if quote is None:
+        raise ReviewNotFoundError("Quotation not found")
+    if viewer_id is not None and viewer_id not in (quote.sender_id, quote.receiver_id):
+        connection = await db.get(Connection, connection_id)
+        if connection is None or viewer_id not in (connection.sender_id, connection.receiver_id):
+            raise ReviewNotFoundError("Quotation not found")
+
     query = (
         select(Review)
         .options(selectinload(Review.reviewer).selectinload(User.profile))
-        .where(Review.quotation_id == quote_id)
+        .where(Review.quotation_id == quote_id, Review.connection_id == connection_id)
     )
     result = await db.execute(query)
     reviews = list(result.scalars().all())
@@ -297,6 +335,9 @@ async def list_quote_reviews(
 
 
 async def get_user_review_stats(db: AsyncSession, user_id: uuid.UUID) -> UserReviewStatsOut:
+    """Public rating summary for a user. ``ReviewNotFoundError`` for unknown ids."""
+    if await db.get(User, user_id) is None:
+        raise ReviewNotFoundError("User not found")
     query = (
         select(Review)
         .options(
