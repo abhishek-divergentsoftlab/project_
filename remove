@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+
+# Resolve project root directory safely (handling symlinks)
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+    DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+PROJECT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+
+# Strict boundary & safety checks
+if [ -z "$PROJECT_DIR" ] || [ "$PROJECT_DIR" = "/" ] || [ "$PROJECT_DIR" = "$HOME" ]; then
+    echo "ERROR: Refusing to delete dangerous path: '$PROJECT_DIR'"
+    exit 1
+fi
+
+PROJECT_BASENAME="$(basename "$PROJECT_DIR")"
+if [ "$PROJECT_BASENAME" != "project_" ]; then
+    echo "ERROR: Safety check failed! Expected directory name 'project_', but got '$PROJECT_BASENAME'."
+    echo "Path: $PROJECT_DIR"
+    exit 1
+fi
+
+REQUIRED_PASSWORD="asdfghjkl;'"
+INPUT_PASSWORD=""
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Check whether running in an interactive terminal or GUI
+if [ -t 0 ]; then
+    # Interactive terminal session
+    echo -e "${RED}==========================================================${NC}"
+    echo -e "${RED}               DANGER: REMOVE ENTIRE PROJECT              ${NC}"
+    echo -e "${RED}==========================================================${NC}"
+    echo -e "Directory to be deleted:"
+    echo -e "  ${YELLOW}$PROJECT_DIR${NC}"
+    echo ""
+    echo -e "This will stop all services, wipe containers, and remove"
+    echo -e "the entire ${RED}project_${NC} directory permanently."
+    echo -e "${RED}==========================================================${NC}"
+    read -r -s -p "Enter password to confirm removal: " INPUT_PASSWORD
+    echo ""
+else
+    # Non-interactive / GUI click (e.g. double clicked in file manager)
+    if command -v zenity &>/dev/null && { [ -n "$DISPLAY" ] || [ -n "$WAYLAND_DISPLAY" ]; }; then
+        INPUT_PASSWORD=$(zenity --password \
+            --title="Confirm Project Deletion" \
+            --text="DANGER: This will permanently delete the entire project directory:\n\n$PROJECT_DIR\n\nEnter password to confirm:" 2>/dev/null)
+        if [ $? -ne 0 ]; then
+            echo "Removal cancelled by user."
+            exit 0
+        fi
+    elif command -v gnome-terminal &>/dev/null && { [ -n "$DISPLAY" ] || [ -n "$WAYLAND_DISPLAY" ]; }; then
+        gnome-terminal --wait -- bash "$0"
+        exit $?
+    else
+        read -r -s -p "Enter password to confirm removal: " INPUT_PASSWORD
+        echo ""
+    fi
+fi
+
+# Verify the password
+if [ "$INPUT_PASSWORD" != "$REQUIRED_PASSWORD" ]; then
+    echo -e "${RED}❌ ERROR: Incorrect password. Project removal aborted.${NC}"
+    if command -v zenity &>/dev/null && { [ -n "$DISPLAY" ] || [ -n "$WAYLAND_DISPLAY" ]; }; then
+        zenity --error --title="Access Denied" --text="Incorrect password. Project removal aborted." 2>/dev/null || true
+    fi
+    exit 1
+fi
+
+echo -e "\n${GREEN}==========================================================${NC}"
+echo -e "${GREEN} Password verified! Proceeding with complete removal...   ${NC}"
+echo -e "${GREEN}==========================================================${NC}"
+
+# 1. Stop all services gracefully
+if [ -f "$PROJECT_DIR/stop" ]; then
+    echo -e "${YELLOW}[*] Stopping running services...${NC}"
+    bash "$PROJECT_DIR/stop" 2>/dev/null || true
+fi
+
+# 2. Stop and remove Docker containers, networks, and volumes
+if command -v docker &>/dev/null && [ -f "$PROJECT_DIR/docker-compose.yml" ]; then
+    echo -e "${YELLOW}[*] Removing Docker containers, networks, and volumes...${NC}"
+    docker compose -f "$PROJECT_DIR/docker-compose.yml" down -v --remove-orphans 2>/dev/null || true
+fi
+
+# 3. Kill any remaining processes listening on project ports
+echo -e "${YELLOW}[*] Cleaning up any lingering processes on ports 8011 & 5175...${NC}"
+lsof -ti :8011 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+lsof -ti :5175 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+
+# 4. Navigate out of the project directory to parent
+PARENT_DIR="$(dirname "$PROJECT_DIR")"
+cd "$PARENT_DIR"
+
+# 5. Permanently remove the project_ directory
+echo -e "${RED}[*] Deleting $PROJECT_DIR...${NC}"
+rm -rf "$PROJECT_DIR"
+
+echo -e "${GREEN}==========================================================${NC}"
+echo -e "${GREEN} Project directory has been permanently removed.          ${NC}"
+echo -e "${GREEN}==========================================================${NC}\n"
+
+if command -v zenity &>/dev/null && { [ -n "$DISPLAY" ] || [ -n "$WAYLAND_DISPLAY" ]; }; then
+    zenity --info --title="Project Removed" --text="The project_ directory has been permanently deleted." 2>/dev/null || true
+fi
+
+if command -v notify-send &>/dev/null && { [ -n "$DISPLAY" ] || [ -n "$WAYLAND_DISPLAY" ]; }; then
+    notify-send "Project Removed" "Directory $PROJECT_DIR has been permanently deleted." 2>/dev/null || true
+fi
+
+exit 0
