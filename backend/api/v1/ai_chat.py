@@ -145,6 +145,7 @@ async def chat_message(
         counterparty_message=result.get("counterparty_message"),
         conversation_id=result.get("conversation_id"),
         routed_agent=result.get("routed_agent"),
+        matched_candidates=result.get("matched_candidates"),
     )
 
 

@@ -1780,6 +1780,7 @@ class TurnResult:
     counterparty_message: Optional[dict[str, Any]]
     conversation_id: Optional[uuid.UUID]
     routed_agent: dict[str, Any]
+    matched_candidates: Optional[list[dict[str, Any]]] = None
 
     def as_response(self) -> dict[str, Any]:
         return {
@@ -1791,6 +1792,7 @@ class TurnResult:
             "counterparty_message": self.counterparty_message,
             "conversation_id": self.conversation_id,
             "routed_agent": self.routed_agent,
+            "matched_candidates": self.matched_candidates,
         }
 
 
@@ -1852,6 +1854,99 @@ def _cards_from_tool_results(tool_results: list[dict[str, Any]]) -> list[dict[st
                 "rank": len(cards) + 1,
             })
     return cards[:10]
+
+
+async def _match_payloads(
+    db: Optional[AsyncSession], user: Optional[User], tool_results: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Frontend ``MatchCandidate`` objects for the listings the read tools returned this turn.
+
+    They come from the same serializer as the match API (``match_service._to_candidate``),
+    loaded from the database in tool order, at most 10. A find_matches row carries the
+    matcher's real score breakdown (recomputed with the same call the tool made). A
+    search_listings row was never scored, so its ``score`` is null, which the UI renders
+    without a percentage; no score is ever invented.
+    """
+    if db is None or user is None:
+        return []
+    from types import SimpleNamespace
+
+    from sqlalchemy.orm import selectinload
+
+    from models.rfq import RFQ
+    from models.user import UserProfile
+    from schemas.match import MatchScore
+    from services import match_service
+
+    # (rfq id, requester rfq id for find_matches rows) in tool order, de-duplicated
+    ordered: list[tuple[uuid.UUID, Optional[uuid.UUID]]] = []
+    seen: set[uuid.UUID] = set()
+    for res in tool_results or []:
+        tool = res.get("tool")
+        if tool not in ("find_matches", "search_listings") or not res.get("ok", True):
+            continue
+        data = res.get("data") or {}
+        rows = data.get("matches") if tool == "find_matches" else data.get("samples")
+        requester = res.get("args", {}).get("rfq_id") if tool == "find_matches" else None
+        for row in rows or []:
+            try:
+                rid = uuid.UUID(str(row.get("id")))
+                req_id = uuid.UUID(str(requester)) if requester else None
+            except (ValueError, TypeError):
+                continue
+            if rid not in seen:
+                seen.add(rid)
+                ordered.append((rid, req_id))
+    ordered = ordered[:10]
+    if not ordered:
+        return []
+
+    try:
+        rfqs = {
+            r.id: r
+            for r in (
+                await db.scalars(
+                    select(RFQ)
+                    .options(selectinload(RFQ.user).selectinload(User.profile))
+                    .where(RFQ.id.in_([rid for rid, _ in ordered]))
+                )
+            ).all()
+        }
+        connections = await match_service._connections_for(db, user.id, list(rfqs))
+        scores: dict[uuid.UUID, dict[uuid.UUID, Any]] = {}
+        requesters: dict[uuid.UUID, Any] = {}
+        for req_id in {req for _, req in ordered if req}:
+            requester = await db.get(RFQ, req_id)
+            if requester is None:
+                continue
+            requesters[req_id] = requester
+            prefs = (
+                await db.execute(select(UserProfile.matching_preferences).where(UserProfile.user_id == user.id))
+            ).scalar_one_or_none() or None
+            pairs, _path = await match_service._collect(db, requester, user.id, prefs)
+            scores[req_id] = {cand.id: score for cand, score in pairs}
+
+        blank = SimpleNamespace(latitude=None, longitude=None, location_country=None)
+        out: list[dict[str, Any]] = []
+        for rid, req_id in ordered:
+            cand = rfqs.get(rid)
+            if cand is None:
+                continue
+            score = (scores.get(req_id) or {}).get(rid) if req_id else None
+            card = match_service._to_candidate(
+                requesters.get(req_id, blank) if req_id else blank,
+                cand,
+                score or MatchScore(total=0),
+                len(out) + 1,
+                connections.get(rid),
+            ).model_dump(mode="json")
+            if score is None:
+                card["score"] = None  # unscored listing: never show a made-up percentage
+            out.append(card)
+        return out
+    except Exception as exc:
+        logger.warning("Could not build match cards: %s", exc)
+        return []
 
 
 def _last_user_and_previous_assistant(messages: list[Any]) -> tuple[str, str]:
@@ -2002,14 +2097,16 @@ async def _run_chat_turn(
     readiness = rfq_tool_service.evaluate_rfq_readiness(draft)
     window_messages, older_summary = build_sliding_window_messages(messages, max_history_turns=8)
     tool_cards: list[dict[str, Any]] = []
+    cards_state: dict[str, list[dict[str, Any]]] = {"match_cards": []}
 
     # ---- event helpers -------------------------------------------------
     def emit(chunk: dict[str, Any]) -> dict[str, Any]:
         if active_conv_id:
             chunk["conversation_id"] = active_conv_id
         chunk.setdefault("routed_agent", agent_state["info"])
-        if client_cands and chunk.get("done") and "matched_candidates" not in chunk:
-            chunk["matched_candidates"] = client_cands
+        shown = cards_state["match_cards"] or client_cands
+        if shown and chunk.get("done") and "matched_candidates" not in chunk:
+            chunk["matched_candidates"] = shown
         return chunk
 
     def wire(
@@ -2089,6 +2186,7 @@ async def _run_chat_turn(
             reply=persisted, thinking=thinking or None, rfq_draft=draft, readiness=readiness,
             created_rfq=created, counterparty_message=cp_msg,
             conversation_id=conversation.id if conversation else None, routed_agent=agent_state["info"],
+            matched_candidates=(cards_state["match_cards"] or client_cands) or None,
         )
         return ChatEvent(kind, chunk, result)
 
@@ -2234,6 +2332,7 @@ async def _run_chat_turn(
         total_content = engine_result.text
         thinking = engine_result.thinking or None
         tool_cards = _cards_from_tool_results(engine_result.tool_results)
+        cards_state["match_cards"] = await _match_payloads(db, user, engine_result.tool_results)
 
         # The badge follows the tools the assistant really used.
         used = [r.get("tool") for r in engine_result.tool_results] + [a.get("tool") for a in engine_result.action_results]
@@ -2358,7 +2457,7 @@ async def _run_chat_turn(
                 appendix = build_rfq_link_appendix(tool_cards)
             yield await finish(
                 reply=total_content + appendix, wire_content=appendix, thinking=thinking,
-                tool_step=captured_tool_step, cards=tool_cards or None,
+                tool_step=captured_tool_step, cards=cards_state["match_cards"] or tool_cards or None,
             )
         else:
             yield await finish(

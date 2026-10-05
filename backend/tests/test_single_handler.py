@@ -145,3 +145,83 @@ async def test_model_outage_reply_is_identical(client, db, make_actor, make_rfq)
     with patch("services.answer_engine._chat", down):
         msg, stream = await _run_both(make_actor, db, make_rfq, body)
     assert _normalise(msg) == _normalise(stream)
+
+
+# ---- match cards reach the frontend, in the MatchCandidate shape ---------------------------
+
+MATCH_KEYS = {
+    "rfq_id", "role", "rank", "title", "category", "description", "quantity", "price", "location", "deadline",
+    "product_details", "search_tags", "distance_km", "logistics", "counterparty", "score",
+}
+
+
+def _scripted_tool_turn(tool: str, **args):
+    """Round 1: the model calls a read tool. Round 2: it answers from the result."""
+    state = {"n": 0}
+
+    async def chat(messages, tools):
+        state["n"] += 1
+        if state["n"] == 1:
+            return {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": tool, "arguments": args}}]}
+        return {"role": "assistant", "content": "Matches found."}
+
+    return patch("services.answer_engine._chat", chat)
+
+
+async def _seed(make_actor, make_rfq):
+    seller = await make_actor("seller", company_name="Rice Traders")
+    await make_rfq(seller, role="seller", title="Supplying basmati rice", product="basmati rice", category="Agriculture")
+    buyer = await make_actor("buyer")
+    mine = await make_rfq(buyer, role="buyer", title="Need basmati rice", product="basmati rice", category="Agriculture")
+    return buyer, mine
+
+
+def _stream_cards(body: str):
+    done = [json.loads(l[6:]) for l in body.splitlines() if l.startswith("data: ")][-1]
+    return done.get("matched_candidates")
+
+
+async def test_find_matches_turn_sends_matchcandidate_cards_on_both_endpoints(client, db, make_actor, make_rfq):
+    buyer, mine = await _seed(make_actor, make_rfq)
+    body = {"messages": [{"role": "user", "content": "find suppliers for my rice rfq"}]}
+    with _scripted_tool_turn("find_matches", rfq_id=mine["id"]):
+        res = await buyer.post("/ai-chat/stream", json=body)
+    cards = _stream_cards(res.text)
+    assert cards and set(cards[0]) == MATCH_KEYS
+    assert cards[0]["counterparty"]["company_name"] == "Rice Traders"
+    assert 0 <= cards[0]["score"]["total"] <= 1
+    assert cards[0]["counterparty"]["email"] is None  # contact stays hidden until accepted
+
+    with _scripted_tool_turn("find_matches", rfq_id=mine["id"]):
+        res = await buyer.post("/ai-chat/message", json=body)
+    assert res.status_code == 200
+    assert res.json()["matched_candidates"][0]["rfq_id"] == cards[0]["rfq_id"]
+    state = (await db.execute(text("select state from conversations order by created_at desc limit 1"))).scalar_one()
+    assert state["matched_candidates"][0]["rfq_id"] == cards[0]["rfq_id"]
+
+
+async def test_search_listings_cards_are_unscored_not_invented(client, db, make_actor, make_rfq):
+    buyer, _ = await _seed(make_actor, make_rfq)
+    with _scripted_tool_turn("search_listings", product="basmati rice", role="seller"):
+        res = await buyer.post("/ai-chat/stream", json={"messages": [{"role": "user", "content": "sellers of basmati rice"}]})
+    cards = _stream_cards(res.text)
+    assert cards and set(cards[0]) == MATCH_KEYS and cards[0]["score"] is None
+
+
+async def test_turn_without_tool_rows_sends_no_cards(client, db, make_actor, make_rfq):
+    buyer, _ = await _seed(make_actor, make_rfq)
+    body = {"messages": [{"role": "user", "content": "hello there"}]}
+    with _script("Noted."):
+        stream = await buyer.post("/ai-chat/stream", json=body)
+        msg = await buyer.post("/ai-chat/message", json=body)
+    assert not _stream_cards(stream.text)
+    assert msg.json()["matched_candidates"] is None
+
+
+async def test_client_cards_are_still_echoed_when_no_tool_rows(client, db, make_actor, make_rfq):
+    buyer, _ = await _seed(make_actor, make_rfq)
+    client_cards = [{"rfq_id": "11111111-1111-1111-1111-111111111111", "title": "x"}]
+    body = {"messages": [{"role": "user", "content": "hello there"}], "matched_candidates": client_cards}
+    with _script("Noted."):
+        stream = await buyer.post("/ai-chat/stream", json=body)
+    assert _stream_cards(stream.text) == client_cards
