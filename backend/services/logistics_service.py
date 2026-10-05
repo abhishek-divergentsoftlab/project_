@@ -574,6 +574,25 @@ async def create_shipment_dispatch(
     quote_res = await db.execute(stmt)
     latest_quote = quote_res.scalars().first()
 
+    if not latest_quote:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Cannot dispatch order without an accepted quotation on this deal",
+        )
+
+    # Only the seller (the issuer of the quotation) may dispatch
+    if user_id != latest_quote.sender_id:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only the seller can dispatch an order",
+        )
+
+    if latest_quote.status != QuotationStatus.ACCEPTED:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Cannot dispatch order without an accepted quotation on this deal",
+        )
+
     # Generate tracking number if not given
     tracking = payload.tracking_number
     if not tracking or not tracking.strip():
@@ -583,6 +602,16 @@ async def create_shipment_dispatch(
         elif payload.shipping_mode == "air":
             prefix = "AWB"
         tracking = f"{prefix}-{str(uuid.uuid4())[:8].upper()}-{datetime.now(UTC).strftime('%y%m')}"
+
+    # Check for duplicate tracking number before inserting
+    existing_tracking = await db.scalar(
+        select(Shipment.id).where(Shipment.tracking_number == tracking)
+    )
+    if existing_tracking:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Tracking number '{tracking}' is already registered",
+        )
 
     now = datetime.now(UTC)
     eta = now + timedelta(days=payload.estimated_delivery_days or 5)
@@ -627,16 +656,16 @@ async def create_shipment_dispatch(
 
     db.add(shipment)
 
-    # Update quotation status to DISPATCHED if accepted
-    if latest_quote and latest_quote.status in (QuotationStatus.ACCEPTED, QuotationStatus.PENDING):
-        latest_quote.status = QuotationStatus.DISPATCHED
-        latest_quote.updated_at = now
+    # Update quotation status to DISPATCHED
+    latest_quote.status = QuotationStatus.DISPATCHED
+    latest_quote.updated_at = now
 
     # Optionally trigger Phase 4 Escrow Milestone 2 ("Dispatch & B/L") release request
     if payload.trigger_escrow_milestone:
         try:
             from services.escrow_service import get_or_create_escrow_for_connection, request_milestone_release
-            esc = await get_or_create_escrow_for_connection(db, connection_id)
+            from schemas.escrow import MilestoneReleaseRequestPayload
+            esc = await get_or_create_escrow_for_connection(db, connection_id, user_id)
             if esc and esc.status in ("funded", "partially_released") and esc.milestones:
                 # Milestone with order_index 1 is the 40% dispatch tranche
                 dispatch_milestone = next((m for m in esc.milestones if m.order_index == 1), None)
@@ -646,12 +675,21 @@ async def create_shipment_dispatch(
                         connection_id,
                         dispatch_milestone.id,
                         user_id,
-                        proof_note=f"Dispatched via {payload.carrier_name} under tracking {tracking}.",
+                        MilestoneReleaseRequestPayload(
+                            proof_note=f"Dispatched via {payload.carrier_name} under tracking {tracking}."
+                        ),
                     )
         except Exception as exc:
             logger.warning("Could not auto-trigger escrow dispatch milestone: %s", exc)
 
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Tracking number '{tracking}' is already in use by another shipment",
+        ) from exc
     await db.refresh(shipment)
 
     # Real-time WebSocket notification
@@ -684,21 +722,79 @@ async def append_shipment_event(
     if user_id not in (shipment.sender_id, shipment.receiver_id):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Not authorized to update this shipment")
 
+    try:
+        current_status = ShipmentStatus(shipment.status)
+    except ValueError:
+        current_status = None
+
+    target_status = payload.status
+
+    VALID_SHIPMENT_TRANSITIONS = {
+        ShipmentStatus.BOOKED: {
+            ShipmentStatus.DISPATCHED,
+            ShipmentStatus.EXCEPTION,
+        },
+        ShipmentStatus.DISPATCHED: {
+            ShipmentStatus.IN_TRANSIT,
+            ShipmentStatus.CUSTOMS_HOLD,
+            ShipmentStatus.CUSTOMS_CLEARED,
+            ShipmentStatus.OUT_FOR_DELIVERY,
+            ShipmentStatus.DELIVERED,
+            ShipmentStatus.EXCEPTION,
+        },
+        ShipmentStatus.IN_TRANSIT: {
+            ShipmentStatus.CUSTOMS_HOLD,
+            ShipmentStatus.CUSTOMS_CLEARED,
+            ShipmentStatus.OUT_FOR_DELIVERY,
+            ShipmentStatus.DELIVERED,
+            ShipmentStatus.EXCEPTION,
+        },
+        ShipmentStatus.CUSTOMS_HOLD: {
+            ShipmentStatus.CUSTOMS_CLEARED,
+            ShipmentStatus.EXCEPTION,
+        },
+        ShipmentStatus.CUSTOMS_CLEARED: {
+            ShipmentStatus.IN_TRANSIT,
+            ShipmentStatus.OUT_FOR_DELIVERY,
+            ShipmentStatus.DELIVERED,
+            ShipmentStatus.EXCEPTION,
+        },
+        ShipmentStatus.OUT_FOR_DELIVERY: {
+            ShipmentStatus.DELIVERED,
+            ShipmentStatus.EXCEPTION,
+        },
+        ShipmentStatus.DELIVERED: set(),  # Terminal state: forward-only, no regression allowed
+        ShipmentStatus.EXCEPTION: {
+            ShipmentStatus.IN_TRANSIT,
+            ShipmentStatus.OUT_FOR_DELIVERY,
+            ShipmentStatus.DELIVERED,
+        },
+    }
+
+    if current_status:
+        valid_next = VALID_SHIPMENT_TRANSITIONS.get(current_status, set())
+        if target_status != current_status or current_status == ShipmentStatus.DELIVERED:
+            if target_status not in valid_next:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    f"Invalid shipment status transition from '{shipment.status}' to '{target_status.value}'",
+                )
+
     now = datetime.now(UTC)
     new_event = {
-        "status": payload.status,
+        "status": payload.status.value if isinstance(payload.status, ShipmentStatus) else payload.status,
         "location": payload.location,
         "timestamp": now.isoformat(),
-        "note": payload.note or f"Status updated to {payload.status.replace('_', ' ')}",
+        "note": payload.note or f"Status updated to {str(payload.status).replace('_', ' ')}",
     }
 
     events = list(shipment.tracking_events or [])
     events.append(new_event)
     shipment.tracking_events = events
-    shipment.status = payload.status
+    shipment.status = payload.status.value if isinstance(payload.status, ShipmentStatus) else payload.status
     shipment.updated_at = now
 
-    if payload.status == "delivered":
+    if shipment.status == "delivered":
         shipment.delivered_at = now
         # Update quote status if linked
         if shipment.quotation_id:

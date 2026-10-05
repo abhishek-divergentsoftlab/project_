@@ -116,7 +116,15 @@ export const auth = {
     const { data } = await api.get<User>("/auth/me");
     return data;
   },
-  logout() {
+  async logout() {
+    const refresh = tokenStore.refresh();
+    if (refresh) {
+      try {
+        await api.post("/auth/logout", { refresh_token: refresh });
+      } catch {
+        // Network or revocation errors on logout do not block client session clearing
+      }
+    }
     tokenStore.clear();
   },
 };

@@ -11,7 +11,7 @@ than being assumed to be the base.
 import re
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Optional
+from typing import Any, Optional
 
 BASE = "USD"
 
@@ -44,6 +44,24 @@ DEFAULT_RATES: dict[str, Decimal] = {
     "SEK": Decimal("10.5"),
     "NOK": Decimal("10.8"),
     "DKK": Decimal("6.9"),
+    # Additional Global Trade Currencies
+    "NZD": Decimal("1.65"),
+    "HKD": Decimal("7.81"),
+    "TWD": Decimal("32.2"),
+    "KWD": Decimal("0.31"),
+    "BHD": Decimal("0.38"),
+    "OMR": Decimal("0.385"),
+    "QAR": Decimal("3.64"),
+    "PKR": Decimal("278.0"),
+    "BDT": Decimal("118.0"),
+    "LKR": Decimal("302.0"),
+    "PHP": Decimal("58.5"),
+    "NGN": Decimal("1550.0"),
+    "GHS": Decimal("15.2"),
+    "RUB": Decimal("92.5"),
+    # B2B Digital Stablecoins
+    "USDT": Decimal("1.0"),
+    "USDC": Decimal("1.0"),
 }
 
 # When the static DEFAULT_RATES baseline was compiled (approximate). Reported
@@ -276,13 +294,49 @@ def supported(code: Optional[str]) -> bool:
     return bool(norm and norm in RATES)
 
 
-def convert(amount: Decimal, source: str, target: str) -> Optional[Decimal]:
+def convert(amount: Any, source: str, target: str) -> Optional[Decimal]:
     """Convert between two currencies with automatic natural language normalization."""
+    if amount is None:
+        return None
+    try:
+        amount_d = Decimal(str(amount))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
     source_code = normalize_currency(source) or (source or "").upper()
     target_code = normalize_currency(target) or (target or "").upper()
     if source_code == target_code:
-        return amount
+        return amount_d
     if source_code not in RATES or target_code not in RATES:
         return None
-    return amount / RATES[source_code] * RATES[target_code]
+    return amount_d / RATES[source_code] * RATES[target_code]
+
+
+async def fetch_live_rates() -> bool:
+    """Fetch live exchange rates from European Central Bank / Frankfurter public feed.
+
+    Updates working RATES table dynamically without blocking or failing if offline.
+    """
+    import asyncio
+    import json
+    import logging
+    import urllib.request
+    
+    url = "https://api.frankfurter.app/latest?from=USD"
+    req = urllib.request.Request(url, headers={"User-Agent": "B2BMarketplace/1.0"})
+    
+    def _fetch_sync():
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read())
+
+    try:
+        data = await asyncio.to_thread(_fetch_sync)
+        live_rates = data.get("rates", {})
+        if live_rates:
+            update_rates(live_rates, source="live_ecb_frankfurter")
+            return True
+    except Exception as exc:
+        # Gracefully preserve cached/baseline rates if network is offline
+        pass
+    return False
 

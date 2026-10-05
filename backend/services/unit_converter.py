@@ -54,6 +54,20 @@ MASS_CONVERSION_TO_KG: dict[str, Decimal] = {
     "lbs": Decimal("0.453592"),
     "pound": Decimal("0.453592"),
     "pounds": Decimal("0.453592"),
+    # Hindi / Mandi mass units
+    "क्विंटल": Decimal("100"),
+    "क्विंतल": Decimal("100"),
+    "किलो": Decimal("1"),
+    "किलोग्राम": Decimal("1"),
+    "कीलो": Decimal("1"),
+    "ग्राम": Decimal("0.001"),
+    "टन": Decimal("1000"),
+    "मीट्रिक टन": Decimal("1000"),
+    # Fixed packaging weight representations
+    "100kg": Decimal("100"),
+    "100 kg": Decimal("100"),
+    "50kg": Decimal("50"),
+    "50 kg": Decimal("50"),
 }
 
 # Standard conversion multiplier to Meters (m)
@@ -159,6 +173,10 @@ COUNT_CONVERSION_TO_PIECES: dict[str, Decimal] = {
     "doz": Decimal("12"),
     "dz": Decimal("12"),
     "gross": Decimal("144"),
+    # Hindi count units
+    "दर्जन": Decimal("12"),
+    "पीस": Decimal("1"),
+    "नग": Decimal("1"),
 }
 
 # Recognized trade packaging containers
@@ -190,25 +208,54 @@ PACKAGING_UNITS: frozenset[str] = frozenset(
         "pallets",
         "pack",
         "packs",
+        # Hindi packaging containers
+        "बोरी",
+        "बोरा",
+        "कट्टा",
+        "कट्टे",
+        "बैग",
+        "थैला",
+        "पेटी",
+        "कार्टन",
     }
 )
 
 
 _UNIT_PUNCT_RE = re.compile(r"[.\s]+")
+_PREFIX_STRIP_RE = re.compile(
+    r"^(?:"
+    r"per\s*[/:\-]?\s*"
+    r"|/\s*-\s*"
+    r"|/\s*"
+    r"|-\s*"
+    r"|प्रति\s*[/:\-]?\s*"
+    r"|(?:₹|rs\.?|inr|rupees?|रुपये|रुपया|\$|usd|eur|€|£|gbp)\s*(?:/|per\s*|प्रति\s*)?\s*"
+    r")+",
+    re.IGNORECASE,
+)
 
 
 def clean_unit(unit: Optional[str]) -> Optional[str]:
     """Canonical spelling of a unit as people type it.
 
-    Lowercased, trailing dots dropped and whitespace collapsed, so "Kgs.",
+    Lowercased, trailing dots dropped, leading slashes/hyphens/currencies/per stripped,
+    and whitespace collapsed, so "/quintal", "rs/kg", "per/kg", "Kgs.",
     " KG " and "Metric  Tons" look the way the conversion tables expect.
     """
     if unit is None:
         return None
-    cleaned = str(unit).strip().lower().rstrip(".")
+    cleaned = str(unit).strip().lower().rstrip(".").strip()
+    cleaned = _PREFIX_STRIP_RE.sub("", cleaned).strip()
     cleaned = _UNIT_PUNCT_RE.sub(" ", cleaned).strip()
-    if cleaned.startswith("per "):
-        cleaned = cleaned[4:].strip()
+    # Check if last word is a known unit (e.g. "rupees per kg" -> "kg", "1000 per quintal" -> "quintal")
+    if cleaned not in MASS_CONVERSION_TO_KG and cleaned not in COUNT_CONVERSION_TO_PIECES and cleaned not in PACKAGING_UNITS:
+        words = cleaned.split()
+        if words and words[-1] in MASS_CONVERSION_TO_KG:
+            cleaned = words[-1]
+        elif words and words[-1] in COUNT_CONVERSION_TO_PIECES:
+            cleaned = words[-1]
+        elif words and words[-1] in PACKAGING_UNITS:
+            cleaned = words[-1]
     return cleaned or None
 
 
@@ -227,15 +274,19 @@ def is_packaging_unit(unit: Optional[str]) -> bool:
     return bool(cleaned) and cleaned in PACKAGING_UNITS
 
 
-def to_pieces(value: Optional[Decimal], unit: Optional[str]) -> Optional[Decimal]:
+def to_pieces(value: Any, unit: Optional[str]) -> Optional[Decimal]:
     """Converts a count (pcs, dozen, pair, gross) to pieces. None if not a count unit."""
     if value is None:
+        return None
+    try:
+        dec_val = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
         return None
     cleaned = clean_unit(unit)
     multiplier = COUNT_CONVERSION_TO_PIECES.get(cleaned) if cleaned else None
     if multiplier is None:
         return None
-    return value * multiplier
+    return dec_val * multiplier
 
 
 def base_unit(unit: Optional[str]) -> Optional[tuple[Decimal, str]]:
@@ -260,7 +311,7 @@ def base_unit(unit: Optional[str]) -> Optional[tuple[Decimal, str]]:
 
 
 def price_per_base_unit(
-    amount: Optional[Decimal], per_unit: Optional[str]
+    amount: Any, per_unit: Optional[str]
 ) -> Optional[tuple[Decimal, str]]:
     """A unit price restated per base unit: 28,000/tonne -> (28, "kg").
 
@@ -268,26 +319,34 @@ def price_per_base_unit(
     """
     if amount is None:
         return None
+    try:
+        dec_amt = amount if isinstance(amount, Decimal) else Decimal(str(amount))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
     resolved = base_unit(per_unit)
     if resolved is None:
         return None
     factor, base = resolved
     if factor == 0:
         return None
-    return amount / factor, base
+    return dec_amt / factor, base
 
 
-def to_kg(value: Optional[Decimal], unit: Optional[str]) -> Optional[Decimal]:
+def to_kg(value: Any, unit: Optional[str]) -> Optional[Decimal]:
     """Converts any mass value to kilograms (kg). Returns None if not a mass unit."""
     if value is None or not unit:
+        return None
+    try:
+        dec_val = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
         return None
     multiplier = MASS_CONVERSION_TO_KG.get(clean_unit(unit) or "")
     if multiplier is None:
         return None
-    return value * multiplier
+    return dec_val * multiplier
 
 
-def to_tonnes(value: Optional[Decimal], unit: Optional[str]) -> Optional[Decimal]:
+def to_tonnes(value: Any, unit: Optional[str]) -> Optional[Decimal]:
     """Converts any mass value to metric tonnes (MT). Returns None if not a mass unit."""
     kg = to_kg(value, unit)
     if kg is None:
@@ -295,7 +354,7 @@ def to_tonnes(value: Optional[Decimal], unit: Optional[str]) -> Optional[Decimal
     return kg / Decimal("1000")
 
 
-def convert_mass(value: Decimal, from_unit: str, to_unit: str) -> Optional[Decimal]:
+def convert_mass(value: Any, from_unit: str, to_unit: str) -> Optional[Decimal]:
     """Converts between two mass units. Returns None if either is not a mass unit."""
     kg = to_kg(value, from_unit)
     if kg is None:
@@ -304,6 +363,36 @@ def convert_mass(value: Decimal, from_unit: str, to_unit: str) -> Optional[Decim
     if target_mult is None:
         return None
     return kg / target_mult
+
+
+def convert(value: Any, from_unit: str, to_unit: str) -> Optional[Decimal]:
+    """Universal unit converter across mass, count, and dimensional units."""
+    if value is None or not from_unit or not to_unit:
+        return None
+    # 1. Mass conversion
+    mass_res = convert_mass(value, from_unit, to_unit)
+    if mass_res is not None:
+        return mass_res
+
+    # 2. Count conversion (e.g. dozen, gross, pairs to pcs)
+    try:
+        val_d = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+    if is_count_unit(from_unit) and is_count_unit(to_unit):
+        p_from = to_pieces(val_d, from_unit)
+        p_to_base = to_pieces(Decimal("1"), to_unit)
+        if p_from is not None and p_to_base is not None and p_to_base > 0:
+            return p_from / p_to_base
+
+    # 3. SI dimension conversion (e.g. mm to cm, m to mm)
+    si_from = to_base_si(val_d, from_unit)
+    si_to = to_base_si(Decimal("1"), to_unit)
+    if si_from and si_to and si_from[2] == si_to[2] and si_to[0] > 0:
+        return si_from[0] / si_to[0]
+
+    return None
 
 
 def compute_effective_mass_kg(

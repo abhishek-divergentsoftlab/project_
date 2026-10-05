@@ -142,6 +142,15 @@ async def prune_match_history_job(
     return removed
 
 
+async def refresh_currency_rates_job(
+    db: AsyncSession,
+) -> int:
+    """Periodically fetch real-time live FX rates from European Central Bank feed."""
+    from services import currency
+    updated = await currency.fetch_live_rates()
+    return 1 if updated else 0
+
+
 # --- runner -----------------------------------------------------------------
 
 
@@ -158,6 +167,7 @@ def default_jobs() -> list[Job]:
         Job("expire_rfqs", expire_rfqs_job, interval),
         Job("retry_embeddings", retry_embeddings_job, interval),
         Job("prune_match_history", prune_match_history_job, interval),
+        Job("refresh_currency_rates", refresh_currency_rates_job, interval),
     ]
 
 

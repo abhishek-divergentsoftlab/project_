@@ -1,6 +1,4 @@
-"""Dashboard API endpoints — aggregated business metrics and activity feed."""
-
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 
 from api.deps import CurrentUser, DbSession
 from services import dashboard_service
@@ -21,7 +19,7 @@ async def dashboard_stats(
 async def dashboard_activity(
     current_user: CurrentUser,
     db: DbSession,
-    limit: int = 20,
+    limit: int = Query(default=20, ge=1, le=50),
 ) -> list[dict]:
     """Recent connections, quotations, messages — ordered by timestamp."""
-    return await dashboard_service.get_activity_feed(db, current_user.id, limit=min(limit, 50))
+    return await dashboard_service.get_activity_feed(db, current_user.id, limit=limit)

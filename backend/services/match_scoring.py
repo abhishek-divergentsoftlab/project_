@@ -11,11 +11,12 @@ about and tested without a database.
 
 import math
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from functools import lru_cache
 from typing import Any, Optional
 
-from services import currency, product_synonyms, unit_converter
+from services import currency, embeddings, hsn_service, product_synonyms, unit_converter
 from services.locations import normalise_country
 
 # How much each dimension contributes. Dimensions that cannot be evaluated
@@ -64,6 +65,16 @@ _UNIT_SYNONYMS: dict[str, str] = {
     "dozen": "dozen", "dozens": "dozen", "doz": "dozen", "dz": "dozen",
     "pair": "pair", "pairs": "pair",
     "l": "l", "litre": "l", "litres": "l", "liter": "l", "liters": "l",
+    # Hindi / Mandi synonyms
+    "क्विंटल": "quintal", "क्विंतल": "quintal",
+    "किलो": "kg", "किलोग्राम": "kg", "कीलो": "kg",
+    "टन": "tonne", "मीट्रिक टन": "tonne",
+    "ग्राम": "g",
+    "दर्जन": "dozen",
+    "पीस": "pcs", "नग": "pcs",
+    "बोरी": "bora", "बोरा": "bora", "कट्टा": "bora", "कट्टे": "bora",
+    "बैग": "bag", "थैला": "bag",
+    "कार्टन": "carton", "पेटी": "carton",
 }
 
 # ---------------------------------------------------------------------------
@@ -307,39 +318,63 @@ _SYNONYM_GROUPS: dict[str, dict[str, float]] = {
     "flat": {
         "flat": 1.0, "sheet": 0.80, "plate": 0.80,
     },
+
+    # --- Out-of-the-Box Varieties & Attributes ---
+    "hair spray": {
+        "hair spray": 1.0, "hair sprey": 1.0, "hairspray": 1.0,
+        "hair lacquer": 0.90, "finishing mist": 0.85, "styling spray": 0.90,
+    },
+    "hair color": {
+        "hair color": 1.0, "hair colour": 1.0, "hair dye": 1.0,
+        "hair tint": 0.90, "hair toner": 0.85, "permanent color": 0.90,
+    },
+    "shampoo": {
+        "shampoo": 1.0, "hair cleanser": 0.95, "scalp cleanser": 0.90,
+        "hair wash": 0.90,
+    },
+    "corn": {
+        "corn": 1.0, "sweet corn": 0.95, "maize": 1.0, "yellow maize": 0.95,
+        "baby corn": 0.85, "dent corn": 0.90, "popping corn": 0.85,
+    },
+    "brake pads": {
+        "brake pads": 1.0, "brake pad": 1.0, "disc pads": 0.95,
+        "friction pads": 0.90,
+    },
+    "solar panel": {
+        "solar panel": 1.0, "solar panels": 1.0, "pv module": 0.95,
+        "solar module": 0.95, "photovoltaic panel": 0.95,
+    },
 }
 
-# Build flat lookup: token → (canonical_group, similarity)
-# "gray" → ("grey", 1.0), "crimson" → ("red", 0.85)
-_SYNONYM_LOOKUP: dict[str, tuple[str, float]] = {}
+# Multi-mapping lookup: token → list of (canonical_group, similarity)
+# Allows homonyms (e.g. "flat" as finish 0.90 vs "flat" as shape 1.0) to coexist without overwriting
+_SYNONYM_LOOKUP: dict[str, list[tuple[str, float]]] = {}
 for _canonical, _variants in _SYNONYM_GROUPS.items():
     for _variant, _sim in _variants.items():
         _key = _variant.lower().strip()
-        # If already mapped, keep the higher similarity
-        if _key in _SYNONYM_LOOKUP:
-            existing_sim = _SYNONYM_LOOKUP[_key][1]
-            if _sim > existing_sim:
-                _SYNONYM_LOOKUP[_key] = (_canonical, _sim)
-        else:
-            _SYNONYM_LOOKUP[_key] = (_canonical, _sim)
+        if _key not in _SYNONYM_LOOKUP:
+            _SYNONYM_LOOKUP[_key] = []
+        _SYNONYM_LOOKUP[_key].append((_canonical, _sim))
+
+
+def _resolve_all_synonyms(text: str) -> list[tuple[str, float]]:
+    """Resolve a text value to all canonical synonym groups it belongs to."""
+    cleaned = text.strip().lower()
+    matches = list(_SYNONYM_LOOKUP.get(cleaned, []))
+    singular = singularise(cleaned)
+    if singular != cleaned and singular in _SYNONYM_LOOKUP:
+        for canon, sim in _SYNONYM_LOOKUP[singular]:
+            if not any(c == canon for c, _ in matches):
+                matches.append((canon, sim))
+    return matches
 
 
 def _resolve_synonym(text: str) -> tuple[Optional[str], float]:
-    """Resolve a text value to its canonical synonym group.
-
-    Returns (canonical_name, similarity) or (None, 0.0) if not found.
-    Tries exact match first, then the singularised/stemmed form.
-    """
-    cleaned = text.strip().lower()
-    if cleaned in _SYNONYM_LOOKUP:
-        return _SYNONYM_LOOKUP[cleaned]
-
-    # Try singularised form
-    singular = singularise(cleaned)
-    if singular in _SYNONYM_LOOKUP:
-        return _SYNONYM_LOOKUP[singular]
-
-    return None, 0.0
+    """Backwards-compatible: returns the highest-similarity canonical match."""
+    matches = _resolve_all_synonyms(text)
+    if not matches:
+        return None, 0.0
+    return max(matches, key=lambda cs: cs[1])
 
 
 def _semantic_text_similarity(wanted: str, offered: str) -> float:
@@ -347,8 +382,8 @@ def _semantic_text_similarity(wanted: str, offered: str) -> float:
 
     Resolution order:
     1. Exact string match (case-insensitive) → 1.0
-    2. Both resolve to the same synonym group → min(sim_wanted, sim_offered)
-       e.g. "grey" (1.0 to grey) vs "charcoal" (0.85 to grey) → 0.85
+    2. Shared synonym group match → max(min(sim_wanted, sim_offered) for shared groups)
+       Handles homonyms: "matte" vs "flat" matches via shared "matte" finish group at 0.90!
     3. Multi-token: resolve each token, compute overlap on canonical forms
     4. Fallback: original token overlap with 0.4 discount
     """
@@ -359,17 +394,21 @@ def _semantic_text_similarity(wanted: str, offered: str) -> float:
     if w == o:
         return 1.0
 
-    # 2. Full-phrase synonym resolution
-    w_canon, w_sim = _resolve_synonym(w)
-    o_canon, o_sim = _resolve_synonym(o)
+    # 2. Multi-concept synonym resolution: do they share ANY canonical concept?
+    w_matches = _resolve_all_synonyms(w)
+    o_matches = _resolve_all_synonyms(o)
 
-    if w_canon is not None and o_canon is not None:
-        if w_canon == o_canon:
-            # Both map to the same concept — return the weaker link
-            return min(w_sim, o_sim)
-        else:
-            # Different concepts (e.g. "red" vs "blue")
-            return 0.0
+    if w_matches and o_matches:
+        shared_sims = [
+            min(w_sim, o_sim)
+            for w_canon, w_sim in w_matches
+            for o_canon, o_sim in o_matches
+            if w_canon == o_canon
+        ]
+        if shared_sims:
+            return max(shared_sims)
+        # Both resolved to known concepts with zero intersection (e.g. "red" vs "blue")
+        return 0.0
 
     # 3. Multi-token resolution: resolve each token individually and compare
     w_tokens = tokenize(w)
@@ -402,16 +441,72 @@ def _semantic_text_similarity(wanted: str, offered: str) -> float:
         if resolved_overlap >= 0.999:
             return min_sim
         if resolved_overlap > 0:
+            return resolved_overlap * 0.4 * min_sim
             # Partial overlap on multi-token values (e.g. "SS 316L" vs "SS 304"
             # sharing only "stainless steel") gets the 0.4 discount — the
             # unmatched tokens (grade numbers) are the distinguishing part.
             return resolved_overlap * 0.4 * min_sim
 
     # 4. Fallback: raw token overlap with 0.4 penalty (original behaviour)
-    if not w_tokens or not o_tokens:
-        return 0.0
-    raw_overlap = _overlap(w_tokens, o_tokens)
-    return raw_overlap if raw_overlap >= 0.999 else raw_overlap * 0.4
+    if w_tokens and o_tokens:
+        raw_overlap = _overlap(w_tokens, o_tokens)
+        if raw_overlap >= 0.999:
+            return raw_overlap
+        if raw_overlap > 0:
+            return raw_overlap * 0.4
+
+    # 5. Dynamic Open-World Semantic Fallback (HSN Codes + Dense Vector Embeddings)
+    dynamic = _dynamic_semantic_similarity(w, o)
+    if dynamic is not None and dynamic > 0.0:
+        return dynamic
+
+    return 0.0
+
+
+@lru_cache(maxsize=20000)
+def _dynamic_semantic_similarity(w: str, o: str) -> Optional[float]:
+    """Zero-shot open-world semantic similarity via HSN codes & dense vector embeddings."""
+    if not w or not o or len(w) < 2 or len(o) < 2:
+        return None
+
+    # 1. HSN Customs Classification
+    try:
+        ha = hsn_service.predict_hsn_from_text(w)
+        hb = hsn_service.predict_hsn_from_text(o)
+        h_sim = hsn_service.hsn_similarity(ha, hb)
+        if h_sim is not None and h_sim >= 0.88:
+            return h_sim
+    except Exception:
+        pass
+
+    # 2. Vector Embedding Cosine Similarity
+    try:
+        vecs = embeddings._embed_sync([w, o])
+        if vecs and len(vecs) == 2:
+            dot = sum(a * b for a, b in zip(vecs[0], vecs[1]))
+            m1 = math.sqrt(sum(a * a for a in vecs[0]))
+            m2 = math.sqrt(sum(b * b for b in vecs[1]))
+            if m1 > 0 and m2 > 0:
+                cos = dot / (m1 * m2)
+                if cos >= 0.85:
+                    return round(cos, 4)
+                return 0.0
+    except Exception:
+        pass
+
+    return None
+
+
+def hsn_score(buyer_hsn: Optional[str], seller_hsn: Optional[str]) -> Optional[float]:
+    """Customs-grade HSN hierarchical compatibility score.
+
+    Uses World Customs Organization 6-digit subheading and 4-digit heading logic:
+    - 6-digit match: 1.0 (Identical tariff commodity)
+    - 4-digit match: 0.88 (Direct commercial substitute)
+    - 2-digit match: 0.55 (Same industrial chapter)
+    - Chapter mismatch: 0.0 (Different industries)
+    """
+    return hsn_service.hsn_similarity(buyer_hsn, seller_hsn)
 
 # Dropped before comparing text: they carry no product signal.
 #
@@ -432,7 +527,7 @@ _STOPWORDS = frozenset(
     ).split()
 )
 
-_TOKEN_RE = re.compile(r"[a-z0-9]+")
+_TOKEN_RE = re.compile(r"[a-z0-9\u0900-\u097f]+", re.IGNORECASE)
 
 
 # Plurals the suffix rules below would get wrong: words whose singular itself
@@ -636,18 +731,23 @@ def _value_similarity(wanted: Any, offered: Any) -> float:
     return _semantic_text_similarity(w_str, o_str)
 
 
-# Synonymous attribute keys across different industry conventions.
-_KEY_SYNONYMS: dict[str, frozenset[str]] = {
-    "type": frozenset({"type", "variety", "grade", "kind", "category", "farming_type", "quality", "nature", "spec"}),
-    "grade": frozenset({"grade", "type", "quality", "standard", "alloy", "steel_grade", "purity"}),
-    "material": frozenset({"material", "fabric", "composition", "alloy", "metal", "fiber", "cloth", "substance"}),
-    "port": frozenset({"port", "connector", "interface", "plug", "socket", "connection"}),
-    "dia": frozenset({"dia", "diameter", "thickness", "gauge", "width", "od", "id", "size"}),
-    "thickness": frozenset({"thickness", "dia", "diameter", "gauge", "depth", "width"}),
-    "length": frozenset({"length", "len", "bar_len", "span", "dimension"}),
-    "finish": frozenset({"finish", "coating", "treatment", "surface", "plating"}),
-    "color": frozenset({"color", "colour", "shade", "hue", "tint"}),
-}
+# Synonymous attribute keys across different industry conventions (fully bidirectional).
+_RAW_KEY_SYNONYMS: tuple[frozenset[str], ...] = (
+    frozenset({"type", "variety", "grade", "kind", "category", "farming_type", "quality", "nature", "spec"}),
+    frozenset({"grade", "type", "quality", "standard", "alloy", "steel_grade", "purity"}),
+    frozenset({"material", "fabric", "composition", "alloy", "metal", "fiber", "cloth", "substance"}),
+    frozenset({"port", "connector", "interface", "plug", "socket", "connection"}),
+    frozenset({"dia", "diameter", "thickness", "gauge", "width", "od", "id", "size"}),
+    frozenset({"thickness", "dia", "diameter", "gauge", "depth", "width"}),
+    frozenset({"length", "len", "bar_len", "span", "dimension"}),
+    frozenset({"finish", "coating", "treatment", "surface", "plating"}),
+    frozenset({"color", "colour", "shade", "hue", "tint"}),
+    frozenset({"certification", "certified", "standard", "compliance"}),
+)
+_KEY_SYNONYMS: dict[str, frozenset[str]] = {}
+for _group in _RAW_KEY_SYNONYMS:
+    for _k in _group:
+        _KEY_SYNONYMS[_k] = _KEY_SYNONYMS.get(_k, frozenset()) | _group
 
 
 def _find_best_attribute_match(wanted_key: str, wanted_val: Any, offered: dict[str, Any]) -> tuple[float, bool]:
@@ -680,10 +780,14 @@ def _find_best_attribute_match(wanted_key: str, wanted_val: Any, offered: dict[s
                 if str(ov).strip().lower() in ("true", "yes", "1", "certified", val_clean):
                     return 1.0, True
 
-    # Case B: Requester specified boolean (e.g. organic: True) and counterparty has string value (e.g. type: "organic")
+    # Case B: Requester specified boolean (e.g. organic: True, is_certified: True) and counterparty has string value
     if isinstance(wanted_val, bool) and wanted_val:
+        stem = wk_clean
+        if stem.startswith("is_"):
+            stem = stem[3:]
         for ok, ov in offered.items():
-            if isinstance(ov, str) and ov.strip().lower() in (wk_clean, f"is_{wk_clean}"):
+            ov_clean = str(ov).strip().lower()
+            if ov_clean in (wk_clean, f"is_{wk_clean}", stem) or (stem and stem in ov_clean):
                 return 1.0, True
 
     # 3. Key Synonym Resolution
@@ -767,21 +871,52 @@ def _per_unit_prices(
     buyer_unit: Optional[str],
     seller_ask: Decimal,
     seller_unit: Optional[str],
+    buyer_attributes: Optional[dict[str, Any]] = None,
+    seller_attributes: Optional[dict[str, Any]] = None,
 ) -> Optional[tuple[Decimal, Decimal]]:
     """Both prices restated per the same unit, or None if that is impossible.
 
     Units resolvable to a base (kg, pcs, m, l) are converted: 28,000/tonne and
     30/kg become 28 and 30 per kg. Units without a fixed base ("bora",
-    "carton") compare only when they are the same word. When only one side, or
-    neither, said what the price is per, both are assumed to be quoted on the
-    same basis -- the same assumption the listing form makes.
+    "carton") resolve via pack_weight_kg if supplied (or default 50kg for standard
+    agricultural bags/boras) or compare directly when they are the same word.
+    When only one side, or neither, said what the price is per, both are assumed
+    to be quoted on the same basis -- the same assumption the listing form makes.
     """
     left, right = normalise_unit(buyer_unit), normalise_unit(seller_unit)
     if not left or not right:
         return buyer_target, seller_ask
 
     b = unit_converter.price_per_base_unit(buyer_target, left)
+    if b is None and unit_converter.is_packaging_unit(left):
+        pw_kg = None
+        if buyer_attributes:
+            pw_kg = buyer_attributes.get("pack_weight_kg") or buyer_attributes.get("pack_weight")
+        if pw_kg is None and left in ("bora", "boras", "bori", "katta", "kattas", "bag", "bags", "sack", "sacks", "बोरी", "बोरा", "कट्टा"):
+            pw_kg = Decimal("50")
+        if pw_kg is not None:
+            try:
+                pw_dec = Decimal(str(pw_kg))
+                if pw_dec > 0:
+                    b = (buyer_target / pw_dec, "kg")
+            except (InvalidOperation, ValueError, TypeError):
+                pass
+
     s = unit_converter.price_per_base_unit(seller_ask, right)
+    if s is None and unit_converter.is_packaging_unit(right):
+        pw_kg = None
+        if seller_attributes:
+            pw_kg = seller_attributes.get("pack_weight_kg") or seller_attributes.get("pack_weight")
+        if pw_kg is None and right in ("bora", "boras", "bori", "katta", "kattas", "bag", "bags", "sack", "sacks", "बोरी", "बोरा", "कट्टा"):
+            pw_kg = Decimal("50")
+        if pw_kg is not None:
+            try:
+                pw_dec = Decimal(str(pw_kg))
+                if pw_dec > 0:
+                    s = (seller_ask / pw_dec, "kg")
+            except (InvalidOperation, ValueError, TypeError):
+                pass
+
     if b is not None and s is not None:
         if b[1] != s[1]:
             return None  # per kg vs per piece: not the same thing
@@ -798,6 +933,8 @@ def price_score(
     seller_currency: Optional[str] = None,
     buyer_unit: Optional[str] = None,
     seller_unit: Optional[str] = None,
+    buyer_attributes: Optional[dict[str, Any]] = None,
+    seller_attributes: Optional[dict[str, Any]] = None,
 ) -> Optional[float]:
     """1.0 when the seller is at or under the buyer's target, decaying above it.
 
@@ -816,9 +953,12 @@ def price_score(
     if buyer_target is None or seller_ask is None:
         return None
     try:
-        if buyer_target <= 0 or seller_ask <= 0:
-            return None
-    except (InvalidOperation, TypeError):
+        b_target = Decimal(str(buyer_target))
+        s_ask = Decimal(str(seller_ask))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+    if b_target <= 0 or s_ask <= 0:
         return None
 
     buyer_ccy = (buyer_currency or "").strip().upper() or None
@@ -826,23 +966,26 @@ def price_score(
     if (buyer_ccy is None and seller_ccy is not None) or (buyer_ccy is not None and seller_ccy is None):
         return None
     if buyer_ccy and seller_ccy and buyer_ccy != seller_ccy:
-        converted = currency.convert(seller_ask, seller_ccy, buyer_ccy)
+        converted = currency.convert(s_ask, seller_ccy, buyer_ccy)
         if converted is None:
             return None
-        seller_ask = converted
+        s_ask = converted
 
-    pair = _per_unit_prices(buyer_target, buyer_unit, seller_ask, seller_unit)
+    pair = _per_unit_prices(
+        b_target, buyer_unit, s_ask, seller_unit,
+        buyer_attributes=buyer_attributes, seller_attributes=seller_attributes,
+    )
     if pair is None:
         return None
-    buyer_target, seller_ask = pair
-    if buyer_target <= 0:
+    b_target, s_ask = pair
+    if b_target <= 0:
         return None
 
-    if seller_ask <= buyer_target:
+    if s_ask <= b_target:
         return 1.0
 
     # Linear decay: at twice the target the score reaches zero.
-    overshoot = float((seller_ask - buyer_target) / buyer_target)
+    overshoot = float((s_ask - b_target) / b_target)
     return max(0.0, 1.0 - overshoot)
 
 
@@ -862,7 +1005,15 @@ def quantity_score(
     Supports mass-to-mass conversions (e.g. kg to tonnes, quintals to kg)
     and packaging conversions (e.g. 1,000 boras of 55 kg to bulk tonnes).
     """
-    if needed is None or available is None or needed <= 0:
+    if needed is None or available is None:
+        return None
+    try:
+        needed_d = Decimal(str(needed))
+        available_d = Decimal(str(available))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+    if needed_d <= 0:
         return None
 
     # Try resolving both sides to kilograms (kg)
@@ -873,12 +1024,17 @@ def quantity_score(
         except (InvalidOperation, ValueError, TypeError):
             pass
     if needed_kg is None and needed_unit and unit_converter.is_mass_unit(needed_unit):
-        needed_kg = unit_converter.to_kg(needed, needed_unit)
-    if needed_kg is None and needed_attributes:
-        pw_kg = needed_attributes.get("pack_weight_kg")
+        needed_kg = unit_converter.to_kg(needed_d, needed_unit)
+    if needed_kg is None:
+        pw_kg = None
+        if needed_attributes:
+            pw_kg = needed_attributes.get("pack_weight_kg") or needed_attributes.get("pack_weight")
+        clean_nu = unit_converter.clean_unit(needed_unit)
+        if pw_kg is None and clean_nu in ("bora", "boras", "bori", "katta", "kattas", "bag", "bags", "sack", "sacks", "बोरी", "बोरा", "कट्टा"):
+            pw_kg = Decimal("50")
         if pw_kg is not None:
             try:
-                needed_kg = needed * Decimal(str(pw_kg))
+                needed_kg = needed_d * Decimal(str(pw_kg))
             except (InvalidOperation, ValueError, TypeError):
                 pass
 
@@ -889,19 +1045,24 @@ def quantity_score(
         except (InvalidOperation, ValueError, TypeError):
             pass
     if available_kg is None and available_unit and unit_converter.is_mass_unit(available_unit):
-        available_kg = unit_converter.to_kg(available, available_unit)
-    if available_kg is None and available_attributes:
-        pw_kg = available_attributes.get("pack_weight_kg")
+        available_kg = unit_converter.to_kg(available_d, available_unit)
+    if available_kg is None:
+        pw_kg = None
+        if available_attributes:
+            pw_kg = available_attributes.get("pack_weight_kg") or available_attributes.get("pack_weight")
+        clean_au = unit_converter.clean_unit(available_unit)
+        if pw_kg is None and clean_au in ("bora", "boras", "bori", "katta", "kattas", "bag", "bags", "sack", "sacks", "बोरी", "बोरा", "कट्टा"):
+            pw_kg = Decimal("50")
         if pw_kg is not None:
             try:
-                available_kg = available * Decimal(str(pw_kg))
+                available_kg = available_d * Decimal(str(pw_kg))
             except (InvalidOperation, ValueError, TypeError):
                 pass
 
     if needed_kg is not None and available_kg is not None:
         if needed_kg <= 0:
             return None
-        if available_kg >= needed_kg:
+        if available_kg >= needed_kg or math.isclose(float(available_kg), float(needed_kg), rel_tol=1e-5):
             return 1.0
         return max(0.0, min(1.0, float(available_kg / needed_kg)))
 
@@ -912,13 +1073,13 @@ def quantity_score(
         if lb is None or rb is None or lb[1] != rb[1]:
             # Comparing 500 kg to 500 cartons would be nonsense.
             return None
-        needed, available = needed * lb[0], available * rb[0]
-        if needed <= 0:
+        needed_d, available_d = needed_d * lb[0], available_d * rb[0]
+        if needed_d <= 0:
             return None
 
-    if available >= needed:
+    if available_d >= needed_d or math.isclose(float(available_d), float(needed_d), rel_tol=1e-5):
         return 1.0
-    return max(0.0, min(1.0, float(available / needed)))
+    return max(0.0, min(1.0, float(available_d / needed_d)))
 
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -952,9 +1113,17 @@ def distance_km(
     c_lat, c_lng = candidate.get("latitude"), candidate.get("longitude")
     if None in (r_lat, r_lng, c_lat, c_lng):
         return None
-    return haversine_km(
-        float(r_lat), float(r_lng), float(c_lat), float(c_lng)  # type: ignore[arg-type]
-    )
+    try:
+        r_lat_f, r_lng_f = float(r_lat), float(r_lng)
+        c_lat_f, c_lng_f = float(c_lat), float(c_lng)
+    except (ValueError, TypeError):
+        return None
+
+    # Null Island guard: (0.0, 0.0) is often an uninitialized or default coordinate placeholder
+    if (r_lat_f == 0.0 and r_lng_f == 0.0) or (c_lat_f == 0.0 and c_lng_f == 0.0):
+        return None
+
+    return haversine_km(r_lat_f, r_lng_f, c_lat_f, c_lng_f)
 
 
 def _administrative_score(
@@ -1023,6 +1192,13 @@ def location_score(
 _DEADLINE_GRACE_DAYS = 14
 
 
+def _as_utc(dt: datetime) -> datetime:
+    """Ensure datetime is UTC-aware for safe cross-timezone comparison."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def deadline_score(
     buyer_need_by: Optional[datetime], seller_ready_by: Optional[datetime]
 ) -> Optional[float]:
@@ -1039,10 +1215,13 @@ def deadline_score(
     if buyer_need_by is None or seller_ready_by is None:
         return None
 
-    if seller_ready_by <= buyer_need_by:
+    b_need = _as_utc(buyer_need_by)
+    s_ready = _as_utc(seller_ready_by)
+
+    if s_ready <= b_need:
         return 1.0
 
-    late_days = (seller_ready_by - buyer_need_by).total_seconds() / 86400
+    late_days = (s_ready - b_need).total_seconds() / 86400
     return max(0.0, 1.0 - late_days / _DEADLINE_GRACE_DAYS)
 
 

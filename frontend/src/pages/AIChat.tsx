@@ -451,11 +451,16 @@ export function AIChat() {
           return msg;
         }),
       );
-      setRfqMatches((prev) => ({
-        ...prev,
-        [rfqId]: { ...(prev[rfqId] || {}), isOpen: false, candidates: [], total: 0, loading: false, error: null },
-      }));
-    } catch (err) {
+      setRfqMatches((prev) => {
+        const existingMatch = prev[rfqId];
+        return {
+          ...prev,
+          [rfqId]: existingMatch
+            ? { ...existingMatch, isOpen: false, candidates: [], total: 0, loading: false, error: null }
+            : { isOpen: false, candidates: [], total: 0, loading: false, error: null },
+        };
+      });
+    } catch {
       toast("Could not close the RFQ.", "error");
     }
   }

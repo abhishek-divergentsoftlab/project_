@@ -21,6 +21,10 @@ CANONICAL_CATEGORIES: tuple[str, ...] = (
     "Construction",
     "Stationery",
     "Learning",
+    "Beauty & Personal Care",
+    "Food & Beverages",
+    "Healthcare & Medical",
+    "Automotive",
 )
 
 # Common aliases, singular forms, colloquial terms and misspellings -> Canonical Category
@@ -118,6 +122,51 @@ CATEGORY_ALIASES: dict[str, str] = {
     # Learning / Education
     "learning": "Learning",
     "education": "Learning",
+
+    # Beauty & Personal Care
+    "beauty": "Beauty & Personal Care",
+    "personal care": "Beauty & Personal Care",
+    "beauty & personal care": "Beauty & Personal Care",
+    "cosmetics": "Beauty & Personal Care",
+    "cosmetic": "Beauty & Personal Care",
+    "hair care": "Beauty & Personal Care",
+    "hair spray": "Beauty & Personal Care",
+    "hair sprey": "Beauty & Personal Care",
+    "hairspray": "Beauty & Personal Care",
+    "hair color": "Beauty & Personal Care",
+    "hair colour": "Beauty & Personal Care",
+    "hair dye": "Beauty & Personal Care",
+    "skincare": "Beauty & Personal Care",
+    "skin care": "Beauty & Personal Care",
+    "toiletries": "Beauty & Personal Care",
+
+    # Food & Beverages
+    "food": "Food & Beverages",
+    "beverage": "Food & Beverages",
+    "beverages": "Food & Beverages",
+    "food & beverages": "Food & Beverages",
+    "food and beverages": "Food & Beverages",
+    "corn": "Food & Beverages",
+    "sweet corn": "Food & Beverages",
+    "maize": "Food & Beverages",
+
+    # Healthcare & Medical
+    "medical": "Healthcare & Medical",
+    "healthcare": "Healthcare & Medical",
+    "healthcare & medical": "Healthcare & Medical",
+    "pharma": "Healthcare & Medical",
+    "pharmaceutical": "Healthcare & Medical",
+    "pharmaceuticals": "Healthcare & Medical",
+    "gloves": "Healthcare & Medical",
+    "surgical": "Healthcare & Medical",
+
+    # Automotive
+    "automotive": "Automotive",
+    "auto": "Automotive",
+    "auto parts": "Automotive",
+    "automobile": "Automotive",
+    "vehicles": "Automotive",
+    "spare parts": "Automotive",
 }
 
 # Lookup map with lowercased canonical categories for direct case-insensitive matching

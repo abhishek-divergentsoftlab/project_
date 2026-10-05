@@ -46,6 +46,13 @@ class Settings(BaseSettings):
     OLLAMA_TIMEOUT_SECONDS: int = 45
     # Use the LLM and prompt-based agent for conversational search
     DIRECT_SEARCH_LLM: bool = True
+    # Open-world AI-first message understanding (services/ai_query_parser.py).
+    # Empty model = reuse the router model; failures fall back to the rule parser.
+    QUERY_AI_ENABLED: bool = True
+    QUERY_AI_MODEL: str = ""
+    QUERY_AI_TIMEOUT_SECONDS: float = 6.0
+    # Vocabulary learned from grounded AI parses; relative paths resolve against backend/.
+    LEARNED_VOCAB_PATH: str = "data/learned_vocab.json"
     # AI Conversational Business Assistant (Ollama)
     AI_CHAT_MODEL: str = OLLAMA_MODEL
     AI_CHAT_TIMEOUT_SECONDS: int = 180

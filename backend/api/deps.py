@@ -62,7 +62,10 @@ async def get_optional_current_user(
         user_id = uuid.UUID(payload["sub"])
     except (TokenError, ValueError, KeyError):
         return None
-    return await auth_service.get_user(db, user_id)
+    user = await auth_service.get_user(db, user_id)
+    if user is None or not user.is_active:
+        return None
+    return user
 
 
 CurrentUserOptional = Annotated[User | None, Depends(get_optional_current_user)]

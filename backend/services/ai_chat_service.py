@@ -66,7 +66,15 @@ _COMMERCIAL_TERMS_RE = re.compile(
     r"listings?|orders?|prices?|pcs|pieces?|quantity|costs?|quotes?|"
     r"markets?|suppliers?|buyers?|sellers?|t-shirts?|cotton|textiles?|"
     r"agriculture|packaging|electronics|inr|usd|eur|gbp|fob|"
-    r"cif|rfqs?|kyc|shipping|freight|incoterms?|kg|ton|tons|mt|quintals?"
+    r"cif|rfqs?|kyc|shipping|freight|incoterms?|kg|ton|tons|mt|quintals?|"
+    r"cement|sugar|manufacturers?|payments?|advance|credit|disputes?|escrow|"
+    r"demurrage|detention|gst|transport|procurement|procure|b2b|invoices?|"
+    r"exports?|imports?|trade|viable|viability|chemicals|minerals|plastics|"
+    r"metals|construction|hardware|logistics|audit|inspections?|lc|letter\s+of\s+credit|"
+    r"bank\s+guarantee|ex-factory|ex\s+factory|stock|inventory|wholesale|wholesalers?|"
+    r"retail|boxes?|cartons?|bottles?|tins?|bags?|rolls?|"
+    r"transit|transporters?|goods|cargo|damaged?|compensation|claims?|carriers?|"
+    r"consignments?|challan|bill\s+of\s+lading|lorry\s+receipt|lr"
     r")\b",
     re.IGNORECASE,
 )
@@ -372,25 +380,45 @@ async def _fetch_live_marketplace_aggregates(
 
         def _build_product_match_clauses(term: str) -> list[Any]:
             clean_term = term.strip()
+            if not clean_term:
+                return []
             escaped = re.escape(clean_term)
             pattern = rf"\m{escaped}" if re.match(r"^\w", clean_term) else escaped
             clauses = [
                 RFQ.title.op("~*")(pattern),
             ]
-            boilerplate_words = {"role", "category", "product", "quantity", "target", "price", "location", "deadline", "attributes", "notes", "buyer", "seller", "units"}
+            boilerplate_words = {
+                "role", "category", "product", "quantity", "target", "price", "location", "deadline",
+                "attributes", "notes", "buyer", "seller", "units", "procurement", "listing", "listings",
+                "bottle", "bottles", "pcs", "piece", "pieces", "kg", "box", "boxes", "tin", "tins",
+                "pack", "packs", "food", "beverages", "order", "orders", "supply", "trade", "material",
+                "goods", "item", "items", "typical", "market", "condition", "conditions", "viable",
+                "viability", "fair", "high", "cheap", "expensive", "quote", "quotes",
+            }
             if clean_term.lower() not in boilerplate_words:
                 clauses.append(RFQ.search_text.op("~*")(pattern))
-            tokens = [t.strip() for t in re.split(r"[^\w]+", clean_term.lower()) if len(t.strip()) >= 3 and t.strip() not in boilerplate_words]
-            if len(tokens) > 1:
-                for t in tokens:
+
+            meaningful_tokens = [
+                t.strip() for t in re.split(r"[^\w]+", clean_term.lower())
+                if len(t.strip()) >= 3 and t.strip() not in boilerplate_words
+            ]
+            if len(meaningful_tokens) > 1:
+                # Require ALL meaningful tokens to be present together (AND logic)
+                # to prevent cross-category token contamination (e.g. matching 'bottle' or 'food' across other products)
+                and_token_clauses = []
+                for t in meaningful_tokens:
                     t_esc = re.escape(t)
                     t_pat = rf"\m{t_esc}" if re.match(r"^\w", t) else t_esc
-                    clauses.append(RFQ.title.op("~*")(t_pat))
+                    and_token_clauses.append(or_(RFQ.title.op("~*")(t_pat), RFQ.search_text.op("~*")(t_pat)))
+                clauses.append(and_(*and_token_clauses))
+
             return clauses
 
         if product_name:
             target_label = product_name.strip()
-            conditions.append(or_(*_build_product_match_clauses(product_name)))
+            prod_clauses = _build_product_match_clauses(product_name)
+            if prod_clauses:
+                conditions.append(or_(*prod_clauses))
             if category:
                 conditions.append(RFQ.category.ilike(f"%{category.strip()}%"))
         elif category:
@@ -398,15 +426,17 @@ async def _fetch_live_marketplace_aggregates(
             conditions.append(RFQ.category.ilike(f"%{category.strip()}%"))
         elif query_text:
             from services import query_extractor
-            req = query_extractor.extract(query_text)
+            req = await query_extractor.extract_async(query_text)
             if req.product:
                 target_label = req.product
-                conditions.append(or_(*_build_product_match_clauses(req.product)))
+                prod_clauses = _build_product_match_clauses(req.product)
+                if prod_clauses:
+                    conditions.append(or_(*prod_clauses))
                 if req.category:
-                    conditions.append(RFQ.category.ilike(f"%{req.category}%"))
+                    conditions.append(RFQ.category.ilike(f"%{req.category.strip()}%"))
             elif req.category:
                 target_label = req.category
-                conditions.append(RFQ.category.ilike(f"%{req.category}%"))
+                conditions.append(RFQ.category.ilike(f"%{req.category.strip()}%"))
             else:
                 # No product or category in the message: there is nothing to benchmark.
                 # Reporting "0 listings for '<the whole sentence>'" would be a false claim.
@@ -482,7 +512,8 @@ def format_marketplace_aggregates_prompt(aggregates: dict[str, Any]) -> str:
         avg_p = aggregates.get("avg_price")
         cities = aggregates.get("top_cities", [])
 
-        unit_note = f"per {p_unit}"
+        clean_unit = p_unit[4:].strip() if p_unit.lower().startswith("per ") else p_unit.strip()
+        unit_note = f"per {clean_unit}"
         is_tonne = p_unit in ("tonne", "tons", "ton", "mt")
 
         def _range_line(stats: Optional[dict[str, Any]]) -> str:
@@ -1576,6 +1607,22 @@ def _requested_listing_side(message: str) -> Optional[str]:
     return None
 
 
+_HINDI_COMMODITY_MAP = {
+    "चावल": "rice", "बासमती": "basmati", "गेहूं": "wheat", "कपास": "cotton",
+    "दाल": "pulses", "चीनी": "sugar", "चाय": "tea", "लोहा": "steel", "पाइप": "pipe",
+    "सेब": "apple", "केला": "banana", "प्याज़": "onion", "टमाटर": "tomato",
+    "मक्का": "corn", "बाजरा": "millet", "सोयाबीन": "soybean", "हल्दी": "turmeric",
+}
+
+
+def _clean_city_name(city: Optional[str]) -> Optional[str]:
+    if not city:
+        return None
+    c = str(city).strip()
+    c = re.sub(r"[\s,.-]+(?:में|me|mein|se|ko|ke|in|at)\s*$", "", c, flags=re.IGNORECASE).strip()
+    return c or None
+
+
 def _grounded_ai_product(ai_product: Optional[str], message: str) -> Optional[str]:
     """Accept the LLM's product only when the user actually said it.
 
@@ -1592,8 +1639,16 @@ def _grounded_ai_product(ai_product: Optional[str], message: str) -> Optional[st
         if len(word) < 3:
             continue
         stem = word[:-1] if word.endswith("s") and len(word) > 3 else word
-        if not re.search(rf"\b{re.escape(stem)}", lowered):
-            return None
+        if re.search(rf"\b{re.escape(stem)}", lowered):
+            continue
+        # Check if Hindi synonym exists in user message
+        matched_hindi = any(
+            h_word in lowered and (h_trans in word.lower() or word.lower() in h_trans)
+            for h_word, h_trans in _HINDI_COMMODITY_MAP.items()
+        )
+        if matched_hindi:
+            continue
+        return None
     return cleaned
 
 
@@ -2019,6 +2074,10 @@ async def generate_business_chat_reply(
                 has_prev_counterparty = True
                 break
 
+    # Warm the AI parse cache so the sync extract()/detect_role() calls below reuse it.
+    from services import query_extractor as _qx
+    await _qx.extract_async(last_user_content)
+
     is_counterparty_msg = rfq_tool_service.check_counterparty_message_intent(
         last_user_content,
         has_active_connection=bool(active_connection_id),
@@ -2122,10 +2181,11 @@ async def generate_business_chat_reply(
             draft["category"] = effective_cat
 
         if ai_loc and not (draft.get("location") or {}).get("city"):
-            city_name = ai_loc.split(",")[0].strip()
+            raw_city = ai_loc.split(",")[0].strip()
+            city_name = _clean_city_name(raw_city) or raw_city
             draft["location"] = {"city": city_name, "country": "India"}
         elif req_linguistic.city and not (draft.get("location") or {}).get("city"):
-            draft["location"] = {"city": req_linguistic.city, "country": req_linguistic.country or "India"}
+            draft["location"] = {"city": _clean_city_name(req_linguistic.city) or req_linguistic.city, "country": req_linguistic.country or "India"}
 
     readiness = rfq_tool_service.evaluate_rfq_readiness(draft)
 
@@ -2343,7 +2403,15 @@ async def generate_business_chat_reply(
                     connection_hint=_connection_hint(last_user_content, focus),
                 )
                 if err and not reply:
-                    reply = f"⚠️ {err}"
+                    msg_body = raw_args.get("message")
+                    if msg_body:
+                        reply = (
+                            f"📝 **Negotiation Message Draft:**\n\n"
+                            f"> {msg_body}\n\n"
+                            f"⚠️ *Note: {err}*"
+                        )
+                    else:
+                        reply = f"⚠️ {err}"
             elif tc_name == "close_rfq":
                 rfq_arg = raw_args.get("rfq_id")
                 closed_rfq_obj, err = await execute_close_rfq_call(
@@ -2504,6 +2572,10 @@ async def stream_business_chat_reply(
 
     active_conv_id = str(conversation.id) if conversation else None
 
+    # Warm the AI parse cache so the sync extract()/detect_role() calls below reuse it.
+    from services import query_extractor as _qx
+    await _qx.extract_async(last_user_content)
+
     is_counterparty_msg = rfq_tool_service.check_counterparty_message_intent(
         last_user_content,
         has_active_connection=bool(active_connection_id),
@@ -2607,10 +2679,11 @@ async def stream_business_chat_reply(
             draft["category"] = effective_cat
 
         if ai_loc and not (draft.get("location") or {}).get("city"):
-            city_name = ai_loc.split(",")[0].strip()
+            raw_city = ai_loc.split(",")[0].strip()
+            city_name = _clean_city_name(raw_city) or raw_city
             draft["location"] = {"city": city_name, "country": "India"}
         elif req_linguistic.city and not (draft.get("location") or {}).get("city"):
-            draft["location"] = {"city": req_linguistic.city, "country": req_linguistic.country or "India"}
+            draft["location"] = {"city": _clean_city_name(req_linguistic.city) or req_linguistic.city, "country": req_linguistic.country or "India"}
 
     readiness = rfq_tool_service.evaluate_rfq_readiness(draft)
 
@@ -2872,6 +2945,7 @@ async def stream_business_chat_reply(
         captured_tool_step = None
         created_rfq_obj = None
         counterparty_msg_obj = None
+        draft_msg_fallback = None
         # Set when the streamed text is wrong and the client must replace it.
         content_replaced = False
 
@@ -2972,14 +3046,17 @@ async def stream_business_chat_reply(
                                 connection_hint=_connection_hint(last_user_content, focus),
                             )
                             c_name = counterparty_msg_obj.get("counterparty_name", "Counterparty") if counterparty_msg_obj else "Counterparty"
+                            draft_msg_text = raw_args.get("message")
+                            if err and not counterparty_msg_obj and draft_msg_text:
+                                draft_msg_fallback = (draft_msg_text, err)
                             captured_tool_step = {
                                 "name": "draft_counterparty_message",
                                 "title": f"Drafting Message for {c_name}" if counterparty_msg_obj else "Drafting Negotiation Message",
-                                "status": "completed" if counterparty_msg_obj else "failed",
+                                "status": "completed" if (counterparty_msg_obj or draft_msg_text) else "failed",
                                 "args": (
                                     {"recipient": c_name, "message": counterparty_msg_obj["message"]}
                                     if counterparty_msg_obj
-                                    else {"error": err}
+                                    else ({"recipient": "Counterparty", "message": draft_msg_text, "note": err} if draft_msg_text else {"error": err})
                                 ),
                             }
                             yield emit({
@@ -3056,6 +3133,26 @@ async def stream_business_chat_reply(
                         })
 
                     if is_done:
+                        if draft_msg_fallback and not total_content:
+                            draft_msg_text, draft_err = draft_msg_fallback
+                            formatted_reply = (
+                                f"📝 **Negotiation Message Draft:**\n\n"
+                                f"> {draft_msg_text}\n\n"
+                                f"⚠️ *Note: {draft_err}*"
+                            )
+                            total_content = formatted_reply
+                            content_replaced = True
+                            yield emit({
+                                "content": formatted_reply,
+                                "thinking": "",
+                                "thinking_after": "",
+                                "tool_step": None,
+                                "rfq_draft": draft,
+                                "readiness": readiness,
+                                "created_rfq": None,
+                                "counterparty_message": None,
+                                "done": False,
+                            })
                         break
 
         # Guardrail recovery: the model refused a legitimate business request.

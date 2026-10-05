@@ -340,19 +340,15 @@ def _sql_query(rfq: RFQ, requester_id: uuid.UUID, *, unindexed_only: bool = Fals
     if unindexed_only:
         query = query.where(RFQ.embedding_status != EmbeddingStatus.INDEXED)
 
-    # Category as a filter, by canonical name: rows filed under a *different*
-    # known category are excluded, while free-text categories we cannot map
-    # stay in and are scored with a milder penalty in stage 2.
+    # Soft category preference: prioritize same/canonical category in the ranking
+    # without hard-excluding cross-category candidates that match the product specs.
     canonical = categories.normalize_category(rfq.category)
-    if canonical in categories.CANONICAL_CATEGORIES:
-        query = query.where(
-            func.lower(func.trim(RFQ.category)).not_in(_category_exclusions(canonical))
-        )
+    category_rank = case(
+        (func.lower(func.trim(RFQ.category)) == canonical.lower(), 2),
+        else_=0,
+    )
 
     # Rank by how many of the requester's product words each row contains.
-    # Newest-first inside a tag used to push an exact but older seller out of
-    # a 200-row pool; relevance ordering keeps it at the top however many
-    # newer near-misses exist.
     terms = _search_terms(rfq)
     if terms:
         text_rank = sum(
@@ -374,7 +370,7 @@ def _sql_query(rfq: RFQ, requester_id: uuid.UUID, *, unindexed_only: bool = Fals
     else:
         text_rank = literal(0)
 
-    order = [text_rank.desc()]
+    order = [text_rank.desc(), category_rank.desc()]
     if rfq.search_tags:
         order.append(RFQ.search_tags.overlap(rfq.search_tags).desc())
     order += [RFQ.created_at.desc(), RFQ.id]
@@ -535,6 +531,8 @@ def _score(
             buyer.price_currency, seller.price_currency,
             buyer.price_per_unit or buyer.quantity_unit,
             seller.price_per_unit or seller.quantity_unit,
+            buyer_attributes=buyer.product_details or {},
+            seller_attributes=seller.product_details or {},
         ) if comparable else None,
         "quantity": match_scoring.quantity_score(
             buyer.quantity_value, buyer.quantity_unit,
@@ -579,7 +577,9 @@ def _score(
         commercial_utility = match_scoring.blend(commercial_scores, weights=active_weights)
         base_total = feasibility * ((1 - commercial_gate) + commercial_gate * commercial_utility)
     else:
-        base_total = feasibility
+        # Counterparties that omit all commercial terms (price, quantity, location, deadline)
+        # default to an unquoted baseline utility of 0.70 rather than an unfair 1.0.
+        base_total = feasibility * ((1 - commercial_gate) + commercial_gate * 0.70)
 
     # Core Product Gatekeeping:
     if relevance < settings.RELEVANCE_FLOOR:
@@ -596,7 +596,27 @@ def _score(
         cand_name = _product_name(candidate) or candidate.title or ""
         cand_tokens = match_scoring.tokenize(cand_name)
         is_strong_semantic = similarity is not None and similarity >= 0.85
-        if req_tokens and cand_tokens and not (req_tokens & cand_tokens) and not is_strong_semantic:
+
+        # Dynamic Open-World Commodity Resolution (HSN + Vector Embedding Fallback)
+        hsn_or_dynamic_match = False
+        r_hsn = (rfq.product_details or {}).get("hsn_code") or (rfq.product_details or {}).get("hsn")
+        c_hsn = (candidate.product_details or {}).get("hsn_code") or (candidate.product_details or {}).get("hsn")
+        if r_hsn and c_hsn:
+            h_sim = match_scoring.hsn_score(str(r_hsn), str(c_hsn))
+            if h_sim is not None and h_sim >= 0.85:
+                hsn_or_dynamic_match = True
+        if not hsn_or_dynamic_match and req_prod and cand_name:
+            dyn_sim = match_scoring._dynamic_semantic_similarity(req_prod, cand_name)
+            if dyn_sim is not None and dyn_sim >= 0.82:
+                hsn_or_dynamic_match = True
+
+        if (
+            req_tokens
+            and cand_tokens
+            and not (req_tokens & cand_tokens)
+            and not is_strong_semantic
+            and not hsn_or_dynamic_match
+        ):
             keep = False
 
     # Review & rating reputation adjustment for future match ranking

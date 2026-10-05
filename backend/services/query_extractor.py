@@ -1,14 +1,19 @@
 """Turn a natural-language search message into structured requirements.
 
-This is deliberately a parser rather than a model call. Local models were probed
+Understanding is AI-first and open-world: ``extract_async`` asks a local model
+(``services/ai_query_parser.py``), validates every field against the message
+(``services/query_grounding.py``) and learns what it saw
+(``services/learned_vocabulary.py``). The rule parser below remains the offline
+fallback and the mechanical helper for numbers, prices and dates, and its word
+lists are only seeds. Sync ``extract`` never touches the network.
+
+History: this was originally a parser rather than a model call. Local models were probed
 first (llama3.1:8b, gpt-oss:20b, qwen3:32b) and all three missed the price in
 "at price 2 dollar per unit", two of them mis-parsed quantity, and one read
 "i can supply" as a buy intent -- while taking 7-21 seconds. Numbers, units,
 currencies, dates and known city names are exactly what a parser does with
 perfect precision and no latency.
 
-``services/llm_extractor.py`` layers a model on top to fill what this cannot
-reach, and is opt-in for that reason.
 """
 
 import re
@@ -18,21 +23,36 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
+import logging
+
 from models.enums import RFQRole
+from services import ai_query_parser, learned_vocabulary, query_grounding
 from services import currency as currency_service, product_synonyms, unit_converter
 from services.locations import City, Location, find_city, find_location
 from services.match_scoring import singularise
 
-# --- vocabulary --------------------------------------------------------------
+logger = logging.getLogger(__name__)
+
+# --- seed vocabulary ---------------------------------------------------------
+# Everything below is a SEED, not the source of truth: it keeps the offline rule
+# parser useful when no model is reachable. The model proposes anything outside
+# these lists and ``learned_vocabulary`` extends them at run time.
 
 _SELL_CUES = (
     "i can supply", "i can sell", "i sell", "i am selling", "i'm selling",
     "we supply", "we sell", "we are selling", "i have stock", "i have",
+    "we are manufacturers of", "we are manufacturer of", "manufacturer of", "manufacturers of",
+    "we manufacture", "we produce", "ready stock", "in stock", "ex-factory", "ex factory",
+    "ready to supply", "ready to dispatch",
     "supplying", "offering", "for sale", "i can provide", "i can offer",
+    "बेचना", "बेचने", "बेचना चाहता", "बेचना चाहती", "बेचना चाहते", "बेचना है",
+    "बिक्री", "सप्लाई", "vender", "venta",
 )
 _BUY_CUES = (
     "i want", "i need", "looking for", "i am looking", "i'm looking",
     "need to buy", "want to buy", "i buy", "requirement of", "show me", "find",
+    "खरीदना", "खरीदने", "खरीदना चाहता", "खरीदना चाहती", "खरीदना चाहते", "खरीदना है",
+    "खरीद", "चाहिए", "मंगवाना", "comprar", "compra",
 )
 
 _CURRENCIES: dict[str, str] = {
@@ -53,6 +73,8 @@ _UNITS = (
     "quintal", "quintals", "qtl",
     "meter", "meters", "metre", "metres", "m",
     "box", "boxes", "carton", "cartons", "roll", "rolls", "set", "sets",
+    "tin", "tins", "can", "cans", "bottle", "bottles", "packet", "packets",
+    "sqft", "sqm", "cum",
     # Trade packaging units. Without "pallet", "20 pallets with 1000 kg
     # capacity" was read as an order for 1,000 kg.
     "pallet", "pallets", "bag", "bags", "drum", "drums", "bale", "bales",
@@ -78,7 +100,7 @@ _COUNT_UNITS = frozenset(
     """pc pcs piece pieces unit units no nos each kg kgs kilogram kilograms
     tonne tonnes ton tons mt m meter meters metre metres l litre litres liter
     liters quintal quintals qtl lb lbs bora boras bori boris katta kattas
-    kilo kilos metric dozen dozens""".split()
+    kilo kilos metric dozen dozens tin tins can cans bottle bottles packet packets sqft sqm cum""".split()
 )
 
 _COLORS = (
@@ -215,7 +237,8 @@ _FILLER = frozenset(
     plan plans planning planned wish wishing aim aiming ready
     bhai mujhe chahiye karna krna hoga karo mera meri hum hume ka ki ke ko se me mein
     main mai bechna kharidna khareedna chahta chahti chahte hoon hu hun hai hain tha the thi
-    quiero comprar vender de para un una unos unas por con el la los las""".split()
+    quiero comprar vender de para un una unos unas por con el la los las
+    procurement procure procuring category categories typical condition conditions viable viability fair high cheap expensive quote quotes quoting does""".split()
     + list(_ORDINALS)
 )
 
@@ -229,6 +252,7 @@ _CHITCHAT = frozenset(
 )
 
 _NUMBER = r"\d[\d,]*(?:\.\d+)?"
+_PRICE_NUMBER = r"\d[\d,]*(?:\.\d+)?(?:k|m)?"
 
 _MONTHS: dict[str, int] = {
     "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
@@ -330,7 +354,12 @@ class Requirements(BaseModel):
 
 def _to_decimal(raw: str) -> Optional[Decimal]:
     try:
-        return Decimal(raw.replace(",", ""))
+        s = raw.replace(",", "").strip().lower()
+        if s.endswith("k"):
+            return Decimal(s[:-1]) * Decimal("1000")
+        if s.endswith("m"):
+            return Decimal(s[:-1]) * Decimal("1000000")
+        return Decimal(s)
     except (InvalidOperation, ValueError):
         return None
 
@@ -339,6 +368,8 @@ def _normalise_currency(token: Optional[str]) -> Optional[str]:
     if not token:
         return None
     cleaned = token.strip().lower().rstrip(".")
+    if cleaned in ("रुपये", "रुपया", "rupee", "rupees", "ruppes", "rupess"):
+        return "INR"
     norm = currency_service.normalize_currency(cleaned)
     if norm:
         return norm
@@ -349,7 +380,7 @@ def _normalise_currency(token: Optional[str]) -> Optional[str]:
 
 _CURRENCY_SYMBOLS = (
     r"₹|\$|€|£|¥|₩|c\$|a\$|rs\.?|inr|usd|eur|gbp|jpy|cny|rmb|cad|aud|aed|chf|sek|nok|dkk|krw|sgd|"
-    r"(?:india[n]?\s+)?rup+[e|p]*s*|(?:u\.?s\.?\s+)?(?:dollars?|bucks?)|"
+    r"(?:india[n]?\s+)?rup+[e|p]*s*|रुपये|रुपया|(?:u\.?s\.?\s+)?(?:dollars?|bucks?)|"
     r"euros?|pounds?|(?:swedish\s+)?krona|(?:norwegian\s+)?krone|kronor|kroner|kr|"
     r"dirhams?|yen|yuan|renminbi|won|francs?"
 )
@@ -363,17 +394,24 @@ def _extract_price(text: str) -> tuple[Optional[Decimal], Optional[str], Optiona
     read as a quantity of 2.
     """
     symbols = _CURRENCY_SYMBOLS
-    per = rf"(?:\s*(?:per|/|a)\s*(?P<unit>[a-z]+))?"
+    per = rf"(?:\s*(?:per|/|a|प्रति)\s*(?P<unit>[a-z\u0900-\u097f]+))?"
+    known_units = (
+        r"kg|kgs|kilo|kilos|kilogram|kilograms|quintal|quintals|qtl|ton|tons|tonne|tonnes|mt|g|gm|gram|grams|"
+        r"pcs|pc|piece|pieces|unit|units|dozen|bora|boras|katta|bag|bags|meter|meters|m|l|liter|liters|litre|litres|"
+        r"क्विंटल|किलो|टन|ग्राम|मीटर|लीटर|दर्जन|पीस|बोरी|बोरा|कट्टा"
+    )
 
     patterns = (
         # "₹200/kg", "rs 200 per kg", "$2 per unit", "inr 210/unit"
-        rf"(?P<cur>{symbols})\s*(?P<amt>{_NUMBER}){per}",
+        rf"(?P<cur>{symbols})\s*(?P<amt>{_PRICE_NUMBER}){per}",
         # "200 rupees per kg", "2 dollar per unit", "210 ruppes per unit"
-        rf"(?P<amt>{_NUMBER})\s*(?P<cur>{symbols}){per}",
+        rf"(?P<amt>{_PRICE_NUMBER})\s*(?P<cur>{symbols}){per}",
         # "210/- per unit" (Indian currency notation)
-        rf"(?P<amt>{_NUMBER})\s*(?P<cur>/-){per}",
+        rf"(?P<amt>{_PRICE_NUMBER})\s*(?P<cur>/-){per}",
         # "at price 200 per kg", "can pay 210 per unit", "budget 200/kg", "pay 210"
-        rf"(?:at|for|price|rate|budget|pay|paying|target|upto|up\s+to|max|around)\s+(?:of\s+)?(?P<amt>{_NUMBER}){per}",
+        rf"(?:at|for|price|rate|budget|pay|paying|target|upto|up\s+to|max|around)\s+(?:of\s+)?(?P<amt>{_PRICE_NUMBER}){per}",
+        # Bare price per unit: "1000/quintal", "15/kg", "1.5/kg", "1000 per quintal", "1.5k/quintal"
+        rf"(?:^|\s)(?P<amt>{_PRICE_NUMBER})\s*(?:/|per|प्रति)\s*(?P<unit>{known_units})\b",
     )
 
     for pattern in patterns:
@@ -384,8 +422,14 @@ def _extract_price(text: str) -> tuple[Optional[Decimal], Optional[str], Optiona
         if amount is None:
             continue
         cur_raw = match.groupdict().get("cur")
-        currency = "INR" if cur_raw == "/-" else _normalise_currency(cur_raw)
-        unit = match.groupdict().get("unit")
+        if cur_raw == "/-":
+            currency = "INR"
+        elif cur_raw:
+            currency = _normalise_currency(cur_raw)
+        else:
+            currency = "INR"
+        raw_unit = match.groupdict().get("unit")
+        unit = unit_converter.clean_unit(raw_unit) if raw_unit else None
         if unit in ("unit", "units", "piece", "pieces", "each"):
             unit = "pcs"
         cleaned = text[: match.start()] + " " + text[match.end() :]
@@ -681,9 +725,15 @@ def _extract_compound_packaging(
     return count, pack_unit, attrs, working
 
 
+def _all_units() -> tuple[str, ...]:
+    """Seed units plus units the model taught us."""
+    learned = [u for u in learned_vocabulary.known_units() if u not in _UNITS]
+    return (*_UNITS, *learned)
+
+
 def _unit_alternation() -> str:
     return "|".join(
-        re.escape(u).replace(r"\ ", r"\s+") for u in sorted(_UNITS, key=len, reverse=True)
+        re.escape(u).replace(r"\ ", r"\s+") for u in sorted(_all_units(), key=len, reverse=True)
     )
 
 
@@ -809,10 +859,17 @@ def _extract_role(text: str) -> Optional[RFQRole]:
         rf"\b(?:i\s+)?(?:want|looking|plan|planning|ready|wish|wishing|aim|aiming)\s+to\s+(?:{_SUPPLY_VERB}|sell|offer|provide)\b",
         rf"\b(?:i\s+)?(?:can|could|will|would)\s+(?:{_SUPPLY_VERB}|sell|offer|provide)\b",
         r"\b(?:i\s+)?(?:am|'m|we\s+are|we're)\s+(?:selling|supplying|offering|providing)\b",
-        r"\b(?:have|got)\s+(?:stock|inventory|supplies|availability)\b",
+        r"\b(?:i\s+)?(?:am|'m|we\s+are|we're)\s+(?:a\s+)?(?:supplier|seller|vendor|exporter|manufacturer|wholesaler|producer)s?\b",
+        r"\b(?:as\s+a\s+)?(?:supplier|seller|vendor|exporter|manufacturer|wholesaler)s?\b[^.?!\n]{0,50}\b(?:searching|looking)\s+for\s+buyers?\b",
+        r"\b(?:have|got|with)\s+(?:ready\s+)?(?:stock|inventory|supplies|availability)\b",
+        r"\bready\s+stock\b",
+        r"\bex[- ]factory\b",
+        r"\bwe\s+(?:manufacture|produce|fabricate)\b",
         r"\b(?:for\s+sale|to\s+sell|to\s+supply)\b",
         r"\b(?:supply|selling)\s+of\b",
         r"\b(?:bechna|bechne|vikreta)\b",
+        r"(?:बेचना|बेचने|विक्रेता|बिक्री|सप्लाई)",
+        r"\b(?:vender|venta|suministrar)\b",
     ]
     compound_buy = [
         r"\b(?:i\s+)?(?:want|looking|plan|planning|ready|wish|wishing|aim|aiming)\s+to\s+(?:buy|purchase|procure|order)\b",
@@ -821,6 +878,8 @@ def _extract_role(text: str) -> Optional[RFQRole]:
         r"\b(?:need|require|seeking|looking\s+for|in\s+search\s+of)\b",
         r"\b(?:requirement\s+of|quote\s+for|rfq\s+for)\b",
         r"\b(?:khareedna|khareedne|chahiye|mangwana)\b",
+        r"(?:खरीदना|खरीदने|खरीद|चाहिए|मंगवाना)",
+        r"\b(?:comprar|compra|adquirir)\b",
     ]
 
     for pat in compound_sell:
@@ -829,6 +888,11 @@ def _extract_role(text: str) -> Optional[RFQRole]:
     for pat in compound_buy:
         if re.search(pat, lowered):
             return RFQRole.BUYER
+
+    # 1b. Phrases the model taught us ("we've got ... lying in our godown").
+    learned_role = learned_vocabulary.role_for(text)
+    if learned_role is not None:
+        return learned_role
 
     # 2. General cues fallback
     sell_at = min((lowered.find(cue) for cue in _SELL_CUES if cue in lowered), default=-1)
@@ -944,6 +1008,11 @@ def _extract_attributes(text: str) -> dict[str, Any]:
         if re.search(rf"\b{re.escape(quality)}\b", lowered):
             attributes[quality.replace(" ", "_")] = True
 
+    # Values the model has met before (any colour, material, finish...).
+    for value, key in learned_vocabulary.learned_attribute_values().items():
+        if key not in attributes and value in lowered and re.search(rf"(?<!\w){re.escape(value)}(?!\w)", lowered):
+            attributes[key] = value
+
     ply = re.search(r"(\d+)\s*-?\s*ply", lowered)
     if ply:
         attributes["ply"] = f"{ply.group(1)}-ply"
@@ -988,6 +1057,9 @@ def _extract_attributes(text: str) -> dict[str, Any]:
 
 
 def _infer_category(text: str) -> Optional[str]:
+    learned = learned_vocabulary.category_for(text)
+    if learned:
+        return learned
     # Local names first: "pyaz" is an onion, "haldi" turmeric.
     lowered = product_synonyms.canonicalise_text(text)
     lowered = re.sub(r"\bvagitable[s]?\b", "vegetable", lowered)
@@ -1013,19 +1085,54 @@ def _extract_product(
     location: Optional[Location] = None,
     city: Optional[City] = None,
 ) -> Optional[str]:
-    lowered = text.lower()
+    raw_text = text
+
+    # If the user put the title/product in quotes, e.g. "Procurement of 50,000 pcs Appy Fizz in Indore"
+    m_quoted = re.search(r'["\']([^"\']{3,120})["\']', raw_text)
+    if m_quoted:
+        candidate_quote = m_quoted.group(1).strip()
+        # Ensure the quote is not just a currency or category name
+        if not re.search(r"^(?:inr|rs|usd|eur|food\s*&\s*beverages|agriculture|chemicals|construction|textiles|plastics)$", candidate_quote, re.IGNORECASE):
+            raw_text = candidate_quote
+
+    lowered = raw_text.lower()
     lowered = re.sub(r"\b(?:pan|all)[\s-]+india\b", " ", lowered)
+
+    # Strip leading analytical/prompt scaffolding
+    lowered = re.sub(
+        r"^(?:\s*(?:analyze|analyse|evaluate|check|assess|compare)\s+(?:this\s+)?(?:buyer|seller\s+)?(?:listing|quote|rfq|rate|price|offer)\s+(?:for\s+)?)+",
+        " ",
+        lowered,
+        flags=re.IGNORECASE,
+    )
+    lowered = re.sub(
+        r"^(?:\s*(?:evaluate|check|assess)\s+commercial\s+viability\s+(?:of\s+)?)+",
+        " ",
+        lowered,
+        flags=re.IGNORECASE,
+    )
 
     # 1. Strip secondary conversational/analytical/question clauses so doubt questions
     # do not pollute the core commodity noun phrase (e.g. "but i am confused what price...")
     clause_splits = re.split(
-        r"\b(?:but|however|although|though|can you|could you|please tell|how many|what is|what are|what price|what should|tell me|analyze|analyse|help me decide|am confused|confused about)\b",
+        r"\b(?:but|however|although|though|can you|could you|please tell|how many|what is|what are|what price|what should|tell me|analyze|analyse|help me decide|am confused|confused about|how does this compare|how does it compare|is this price fair|is this fair)\b",
         lowered,
         maxsplit=1,
         flags=re.IGNORECASE,
     )
     if clause_splits and clause_splits[0].strip():
         lowered = clause_splits[0]
+
+    # Strip prompt & transactional scaffolding words
+    _SCAFFOLDING = (
+        r"\b(?:procurement|procure|procuring|buyer|seller|listing|listings|rfq|rfqs|"
+        r"analyze|analyse|analysis|evaluating|evaluate|quote|quotes|quoting|"
+        r"typical|condition|conditions|viable|viability|commercial|commercials|"
+        r"fair|high|cheap|expensive|compare|comparison|budget|budgets|"
+        r"category|categories|specification|specifications|draft|drafting|"
+        r"manufacturers?|producer|producers|factory|factories|available|stock|ready)\b"
+    )
+    lowered = re.sub(_SCAFFOLDING, " ", lowered, flags=re.IGNORECASE)
 
     if location:
         lowered = re.sub(rf"\b{re.escape(location.name.lower())}\b", " ", lowered)
@@ -1176,8 +1283,8 @@ def _detect_negations(text: str) -> tuple[set[str], str]:
     return negated_keys, cleaned
 
 
-def extract(message: str) -> Requirements:
-    """Parse one message in isolation. Merging with history happens elsewhere."""
+def _rule_extract(message: str) -> Requirements:
+    """Rule-based parse of one message: the offline fallback and mechanical helper."""
     requirements = Requirements()
 
     role = _extract_role(message)
@@ -1188,6 +1295,16 @@ def extract(message: str) -> Requirements:
     negated_attrs, positive_text = _detect_negations(message)
     requirements.negated_attributes = negated_attrs
     working = _expand_multipliers(positive_text)
+
+    # Explicit category extraction from message (e.g. in category "Food & Beverages")
+    cat_match = re.search(r'\b(?:in\s+)?category\s*[:"]?\s*["\']?([^"\'\n,;]+)["\']?', working, re.IGNORECASE)
+    if cat_match:
+        cat_candidate = cat_match.group(1).strip()
+        working = working[: cat_match.start()] + " " + working[cat_match.end() :]
+        for standard_cat in learned_vocabulary.known_categories():
+            if cat_candidate.lower() in standard_cat.lower() or standard_cat.lower() in cat_candidate.lower():
+                requirements.category = standard_cat
+                break
 
     price, currency, per_unit, working = _extract_price(working)
     if price is None:
@@ -1233,10 +1350,82 @@ def extract(message: str) -> Requirements:
     requirements.attributes = extracted_attrs
     if pack_attrs:
         requirements.attributes.update(pack_attrs)
-    requirements.category = _infer_category(working)
+    if not requirements.category:
+        requirements.category = _infer_category(working)
     requirements.product = _extract_product(working, requirements.attributes, location=loc)
 
     return requirements
+
+
+
+def _requirements_from_ai(ai: query_grounding.AIParse, rules: Requirements, message: str) -> Requirements:
+    """AI understanding first; the rule parse only fills what the model left empty."""
+    merged = rules.model_copy(deep=True)
+    stated_role = ai.role or None
+    if stated_role is None:
+        stated_role = learned_vocabulary.role_for(message) or _extract_role(message)
+    merged.role = stated_role or RFQRole.BUYER
+
+    if ai.product:
+        merged.product = clean_product_phrase(ai.product) or rules.product
+    if ai.category:
+        merged.category = ai.category
+    elif not merged.category and merged.product:
+        merged.category = _infer_category(merged.product)
+
+    if ai.attributes:
+        merged.attributes = {**rules.attributes, **ai.attributes}
+    negated = {k for k in ai.negated_attributes} | set(rules.negated_attributes)
+    merged.negated_attributes = negated
+    for key in ai.negated_attributes:
+        merged.attributes.pop(key, None)
+
+    if ai.quantity_value is not None:
+        merged.quantity_value = ai.quantity_value
+        merged.quantity_unit = ai.quantity_unit or rules.quantity_unit
+    if ai.price_amount is not None:
+        merged.price_amount = ai.price_amount
+        merged.price_currency = ai.price_currency or rules.price_currency
+        merged.price_per_unit = ai.price_per_unit or rules.price_per_unit
+    if ai.deadline_days is not None:
+        merged.deadline_days = ai.deadline_days
+
+    if ai.location and not rules.city:
+        loc = find_location(ai.location)
+        if loc:
+            merged.city, merged.state, merged.country = loc.city, loc.state, loc.country
+            merged.currency_hint = loc.currency
+            merged.latitude = Decimal(str(loc.latitude))
+            merged.longitude = Decimal(str(loc.longitude))
+        else:
+            merged.city = ai.location
+    return merged
+
+
+def extract(message: str) -> Requirements:
+    """Parse one message in isolation. Merging with history happens elsewhere.
+
+    Sync callers run inside the event loop, so this never calls the network: it
+    reuses a model parse made earlier for the same message (see ``extract_async``)
+    and otherwise uses the rules.
+    """
+    rules = _rule_extract(message)
+    ai = ai_query_parser.cached(message)
+    if ai is None:
+        return rules
+    return _requirements_from_ai(ai, rules, message)
+
+
+async def extract_async(message: str) -> Requirements:
+    """AI-first parse with grounding, falling back to the rules, then learn from it."""
+    rules = _rule_extract(message)
+    ai = await ai_query_parser.understand(
+        message, known_categories=learned_vocabulary.known_categories()
+    )
+    if ai is None:
+        return rules
+    learned_vocabulary.learn_from(ai, message)
+    return _requirements_from_ai(ai, rules, message)
 
 
 def detect_role(message: str) -> Optional[RFQRole]:
@@ -1248,7 +1437,21 @@ def detect_role(message: str) -> Optional[RFQRole]:
     """
     if not message or not message.strip():
         return None
+    ai = ai_query_parser.cached(message)
+    if ai is not None and ai.role is not None:
+        return ai.role
+    learned = learned_vocabulary.role_for(message)
+    if learned is not None:
+        return learned
     return _extract_role(message)
+
+
+async def detect_role_async(message: str) -> Optional[RFQRole]:
+    """``detect_role`` after giving the model a chance to read the message."""
+    if not message or not message.strip():
+        return None
+    await extract_async(message)
+    return detect_role(message)
 
 
 def clean_product_phrase(phrase: Optional[str]) -> Optional[str]:
@@ -1345,7 +1548,7 @@ def parse_answer(field: str, message: str) -> Optional[Requirements]:
 
 def _bare_unit(message: str) -> Optional[str]:
     """A unit mentioned without a number, e.g. answering "pcs"."""
-    unit_alt = "|".join(sorted(_UNITS, key=len, reverse=True))
+    unit_alt = _unit_alternation()
     match = re.search(rf"\b({unit_alt})\b", message, flags=re.IGNORECASE)
     return match.group(1).lower() if match else None
 

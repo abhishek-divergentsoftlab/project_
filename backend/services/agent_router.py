@@ -101,12 +101,14 @@ Return ONLY valid JSON."""
                 data = json.loads(raw)
                 if isinstance(data, dict):
                     from services import query_extractor
-                    req = query_extractor.extract(clean_q)
-                    # Reconcile role only when the user stated one; req.role
-                    # defaults to BUYER and would overrule the model every time.
-                    stated_role = query_extractor.detect_role(clean_q)
-                    if stated_role:
-                        data["role"] = stated_role.value
+                    req = await query_extractor.extract_async(clean_q)
+                    # The model's own reading of the role wins; static cues only
+                    # fill the gap when it returned nothing (they miss new phrasings).
+                    if data.get("role") not in ("buyer", "seller"):
+                        data["role"] = None
+                        stated_role = query_extractor.detect_role(clean_q)
+                        if stated_role:
+                            data["role"] = stated_role.value
                     if not data.get("product") and req.product:
                         data["product"] = req.product
                     if not data.get("category"):
@@ -189,8 +191,8 @@ STRONG_DRAFTING_PATTERNS = [
     r"\b(i|we)\s+(want|wish|would\s+like|need|plan|am\s+looking|are\s+looking)\s+to\s+(buy|sell|purchase|procure|source|supply|export|import)\b",
     r"\b(i|we)\s+(am|are)\s+(buying|selling|supplying|sourcing|procuring|exporting)\b",
     r"\b(i'm|we're|im)\s+(buying|selling|supplying|sourcing|procuring|exporting)\b",
-    r"\b(i|we)\s+(sell|supply|manufacture|export)\s+\w+",
     r"\b(bechna|bechni|bechne|kharidna|kharidni|khareedna|lena|chahiye)\b.*\b(hai|hain|hoon|hu|chahta|chahti)\b",
+    r"(?:bechna|bechni|bechne|kharidna|kharidni|khareedna|lena|chahiye|खरीदना|खरीदने|बेचना|बेचने|चाहिए).*(?:hai|hain|hoon|hu|chahta|chahti|है|हूँ|हैं|चाहता|चाहती|चाहते)",
 ]
 
 # "please include delivery to Pune", "change the quantity to 500": edits to the draft.
@@ -490,7 +492,7 @@ async def route_query_to_agent_async(
     drafting_in_progress = bool(draft.get("role") or (draft.get("product_details") or {}).get("name"))
     if drafting_in_progress and intent in ("market_research", "price_analysis", "general", ""):
         from services import query_extractor
-        req = query_extractor.extract(clean_query)
+        req = await query_extractor.extract_async(clean_query)
         if req.quantity_value is not None or req.deadline_days is not None or req.price_amount is not None:
             intent, action_needed = "rfq_drafting", "update_draft"
 

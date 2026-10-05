@@ -236,7 +236,23 @@ async def accept_connection(
 async def reject_connection(
     db: AsyncSession, connection_id: uuid.UUID, user_id: uuid.UUID
 ) -> Connection:
-    return await _decide(db, connection_id, user_id, ConnectionStatus.REJECTED)
+    conn = await _decide(db, connection_id, user_id, ConnectionStatus.REJECTED)
+    # --- Notification: tell the sender their request was rejected ---
+    try:
+        from services import notification_service
+        rejecter = await db.get(User, user_id)
+        rejecter_profile = getattr(rejecter, "profile", None) if rejecter else None
+        rejecter_name = (
+            (getattr(rejecter_profile, "company_name", None) or getattr(rejecter_profile, "name", None))
+            if rejecter_profile else "Someone"
+        ) or "Someone"
+        await notification_service.notify_connection_rejected(
+            db, sender_id=conn.sender_id, rejecter_name=rejecter_name, connection_id=connection_id
+        )
+        await db.commit()
+    except Exception:
+        logging.getLogger(__name__).debug("Notification reject failed (non-fatal)", exc_info=True)
+    return conn
 
 
 async def send_message(

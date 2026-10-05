@@ -45,3 +45,6 @@ backend/uploads/
 uploads/
 .pids/
 .logs/
+
+# Runtime learned vocabulary written by the query parser.
+backend/data/

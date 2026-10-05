@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import case, func, select, or_, and_, desc
+from sqlalchemy import case, func, select, or_, and_, not_, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.connection import Connection, ConnectionMessage
@@ -77,10 +77,13 @@ async def get_dashboard_stats(db: AsyncSession, user_id: UUID) -> dict[str, Any]
     )
     quote = quote_counts.one()
 
-    # --- Message count ---
+    # --- Message count (exclude system escrow/dispute banners) ---
+    from services.escrow_service import SYSTEM_BANNER_TAGS
+    banner_conditions = [ConnectionMessage.content.contains(tag) for tag in SYSTEM_BANNER_TAGS]
     msg_count = await db.scalar(
         select(func.count()).select_from(ConnectionMessage).where(
-            ConnectionMessage.sender_id == user_id
+            ConnectionMessage.sender_id == user_id,
+            not_(or_(*banner_conditions))
         )
     ) or 0
 
@@ -126,6 +129,7 @@ async def get_activity_feed(
     db: AsyncSession, user_id: UUID, limit: int = 20
 ) -> list[dict[str, Any]]:
     """Return a chronological activity feed for the dashboard."""
+    limit = max(1, min(limit, 50))
     activities: list[dict[str, Any]] = []
 
     # Recent connections (last 20)
