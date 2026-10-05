@@ -461,6 +461,14 @@ async def market_price_stats(
 
     overall = _summary(amounts)
     users = len({r.user_id for r in rows})
+    from services import currency as _fx
+
+    fx_info = _fx.get_rates_info()
+    if norm["converted"] and fx_info["source"] == _fx.STATIC_SOURCE:
+        notes.append(
+            f"{norm['converted']} price(s) were converted using static baseline FX rates "
+            f"as of {fx_info['as_of']}, not live rates; treat converted figures as approximate."
+        )
     data: dict[str, Any] = {
         "n_listings": overall["n"],
         "n_distinct_users": users,
@@ -474,6 +482,8 @@ async def market_price_stats(
         "duplicates_removed": dupes,
         "excluded_price_count": norm["excluded"],
         "converted_currency_count": norm["converted"],
+        "fx_as_of": fx_info["as_of"],
+        "fx_source": fx_info["source"],
         "by_role": {
             r.value: _summary([a for role_, a in norm["included"] if role_ == r])
             for r in RFQRole

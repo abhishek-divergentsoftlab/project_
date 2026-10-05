@@ -83,8 +83,22 @@ def test_dynamic_vector_and_hsn_commodity_matching():
 
 
 @pytest.mark.asyncio
-async def test_live_fx_engine_and_universal_currencies():
-    # Test live rate fetching from European Central Bank feed
+async def test_live_fx_engine_and_universal_currencies(monkeypatch):
+    import httpx
+
+    class _Resp:
+        def raise_for_status(self): ...
+        def json(self): return {"rates": {"INR": 92.5, "EUR": 0.86}}
+
+    class _Client:
+        def __init__(self, *a, **k): ...
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def get(self, url, **k): return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)  # never hit the real internet
+    currency.reset_rates()
+    # Test live rate fetching (mocked European Central Bank / Frankfurter feed)
     live_updated = await currency.fetch_live_rates()
     assert live_updated is True
     assert currency._SOURCE == "live_ecb_frankfurter"
@@ -106,3 +120,4 @@ async def test_live_fx_engine_and_universal_currencies():
 
     # USDT to USD is parity
     assert currency.convert(500, "USDT", "USD") == 500.0
+    currency.reset_rates()

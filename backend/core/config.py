@@ -51,6 +51,11 @@ class Settings(BaseSettings):
     QUERY_AI_ENABLED: bool = True
     QUERY_AI_MODEL: str = ""
     QUERY_AI_TIMEOUT_SECONDS: float = 6.0
+    # Optional LLM HSN classification, used ONLY when a listing is saved (never in
+    # match scoring). Empty model = qwen2.5:1.5b.
+    HSN_AI_ENABLED: bool = True
+    HSN_AI_MODEL: str = ""
+    HSN_AI_TIMEOUT_SECONDS: float = 3.0
     # Vocabulary learned from grounded AI parses; relative paths resolve against backend/.
     LEARNED_VOCAB_PATH: str = "data/learned_vocab.json"
     # AI Conversational Business Assistant (Ollama)

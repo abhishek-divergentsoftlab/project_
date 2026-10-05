@@ -589,16 +589,41 @@ def test_currency_normalizer_misreads_weight_pounds():
     assert currency.normalize_currency("500 pounds of steel") != "GBP"
 
 
-async def test_currency_rates_as_of_is_process_start_not_live(client):
-    """Rates are refreshed by scheduler heartbeat job."""
-    import pathlib
-    root = pathlib.Path(currency.__file__).resolve().parent.parent
-    callers = [
-        p for p in root.rglob("*.py")
-        if ".venv" not in p.parts and "tests" not in p.parts and p.name != "currency.py"
-        and "update_rates(" in p.read_text(errors="ignore")
-    ]
-    assert callers, "no live FX refresh anywhere: RATES are static DEFAULT_RATES"
+async def test_currency_rates_as_of_is_process_start_not_live(client, monkeypatch):
+    """The scheduler's FX job really refreshes RATES and records live provenance;
+    a failed fetch keeps the last good rates. (The internet is mocked.)"""
+    import httpx
+
+    from services import scheduler
+
+    class Resp:
+        def raise_for_status(self): ...
+        def json(self): return {"rates": {"INR": 77.77}}
+
+    class Client:
+        fail = False
+        def __init__(self, *a, **k): ...
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def get(self, url, **k):
+            if Client.fail:
+                raise httpx.ConnectError("offline")
+            return Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", Client)
+    currency.reset_rates()
+    try:
+        before = currency.get_rates_info()
+        assert before["source"] == "static"
+        assert await scheduler.refresh_currency_rates_job(None) == 1
+        after = currency.get_rates_info()
+        assert after["rates"]["INR"] == 77.77 != before["rates"]["INR"]
+        assert after["source"] != "static" and after["as_of"] != before["as_of"]
+        Client.fail = True
+        assert await scheduler.refresh_currency_rates_job(None) == 0
+        assert currency.get_rates_info() == after
+    finally:
+        currency.reset_rates()
 
 
 # ============================ TRANSLATION ==================================

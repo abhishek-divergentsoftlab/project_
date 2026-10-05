@@ -40,6 +40,7 @@ settings.IMAGE_MODERATION_ENABLED = False
 # Never call Ollama or write the real learned vocabulary from tests; the
 # open-world extraction tests opt in explicitly with a mocked model call.
 settings.QUERY_AI_ENABLED = False
+settings.HSN_AI_ENABLED = False
 settings.LEARNED_VOCAB_PATH = os.path.join(
     __import__("tempfile").mkdtemp(prefix="learned_vocab_"), "learned_vocab.json"
 )
