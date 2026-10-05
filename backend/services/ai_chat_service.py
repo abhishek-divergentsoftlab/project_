@@ -49,6 +49,7 @@ SCOPE (Business & B2B Trade Only):
 - Marketplace listings analysis, price benchmarking, market condition comparisons, and commercial feasibility
 
 TRUTH RULES (marketplace facts):
+- When asking for missing details, never give example quantities or prices.
 - Use the data tools to look up any marketplace fact (listings, counts, prices, matches, freight, verification).
 - State ONLY numbers that came from a tool result or from the user's own message.
 - NEVER use outside knowledge for prices, rates, counts or sizes: no "typical" or "market" rates, no assumed pack sizes.
@@ -2098,6 +2099,7 @@ async def _run_chat_turn(
     window_messages, older_summary = build_sliding_window_messages(messages, max_history_turns=8)
     tool_cards: list[dict[str, Any]] = []
     cards_state: dict[str, list[dict[str, Any]]] = {"match_cards": []}
+    verification_meta: Optional[dict[str, Any]] = None  # set once the answer engine has run
 
     # ---- event helpers -------------------------------------------------
     def emit(chunk: dict[str, Any]) -> dict[str, Any]:
@@ -2163,6 +2165,7 @@ async def _run_chat_turn(
                         "created_rfq": created,
                         "counterparty_message": cp_msg,
                         "routed_agent": agent_state["info"],
+                        **({"verification": verification_meta} if verification_meta else {}),
                     },
                 )
                 await update_conversation_after_turn(
@@ -2299,6 +2302,9 @@ async def _run_chat_turn(
                     draft=lambda: runner.draft,
                     extra_allowed_text=_engine_allowed_text(matched_candidates, counterparty_context, last_counterparty_msg),
                     on_progress=lambda event: queue.put_nowait({"__progress": event}),
+                    drafting="update_rfq_draft" in allowed
+                    and chat_permissions.effective_intent(last_user_content, parsed_intent)
+                    in chat_permissions.DRAFTING_INTENTS,
                 ),
             )
         )
@@ -2332,6 +2338,7 @@ async def _run_chat_turn(
         total_content = engine_result.text
         thinking = engine_result.thinking or None
         tool_cards = _cards_from_tool_results(engine_result.tool_results)
+        verification_meta = dict(engine_result.diagnostics or {})
         cards_state["match_cards"] = await _match_payloads(db, user, engine_result.tool_results)
 
         # The badge follows the tools the assistant really used.

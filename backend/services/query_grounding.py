@@ -60,6 +60,24 @@ def normalise_text(text: str) -> str:
     return " ".join(cleaned.lower().split())
 
 
+_ELLIPSIS_RE = re.compile(r"\.{3,}|…|\s\.\.\s")
+
+
+def _evidence_grounded(evidence: str, lowered_message: str) -> bool:
+    """True when every fragment of ``evidence`` (split on ellipses) appears in the message, in order."""
+    fragments = [f.strip(" .,;:-") for f in _ELLIPSIS_RE.split(normalise_text(evidence))]
+    fragments = [f for f in fragments if len(f) >= 2]
+    if not fragments:
+        return False
+    pos = 0
+    for frag in fragments:
+        idx = lowered_message.find(frag, pos)
+        if idx < 0:
+            return False
+        pos = idx + len(frag)
+    return True
+
+
 def _clean_str(value: Any) -> Optional[str]:
     if value is None or isinstance(value, (dict, list, bool)):
         return None
@@ -184,7 +202,7 @@ def ground(raw: Any, message: str) -> AIParse:
 
     role = _clean_str(raw.get("role"))
     evidence = _clean_str(raw.get("role_evidence"))
-    if role and role.lower() in ("buyer", "seller") and evidence and normalise_text(evidence) in lowered:
+    if role and role.lower() in ("buyer", "seller") and evidence and _evidence_grounded(evidence, lowered):
         parse.role = RFQRole.BUYER if role.lower() == "buyer" else RFQRole.SELLER
         parse.role_evidence = normalise_text(evidence)
 

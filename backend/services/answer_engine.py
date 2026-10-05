@@ -23,12 +23,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import settings
 from models.user import User
-from services import answer_verifier, market_data_tools
+from services import answer_verifier, drafting_reply, market_data_tools, rfq_tool_service
 from services.answer_verifier import Verification
 
 logger = logging.getLogger(__name__)
 
 MAX_TOOL_ROUNDS = 4
+DRAFT_ACTION_TOOLS = frozenset({"update_rfq_draft", "create_rfq"})
 
 ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
 ProgressCallback = Callable[[dict[str, Any]], Union[None, Awaitable[None]]]
@@ -44,6 +45,8 @@ class AnswerContext:
     # Other text whose numbers the answer may quote (e.g. the matched-candidate cards in the prompt).
     extra_allowed_text: str = ""
     on_progress: Optional[ProgressCallback] = None
+    # True when the user is drafting an RFQ this turn (parser intent buy_request / sell_offer).
+    drafting: bool = False
 
 
 @dataclass
@@ -57,6 +60,8 @@ class AnswerResult:
     thinking: Optional[str] = None
     # True when the model could not be reached (the text is then only a facts-only rendering).
     llm_error: bool = False
+    # Why the answer was or was not shown as written: ok, retried, used_fallback, unverified, banned, llm_error.
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
 async def _progress(context: Optional[AnswerContext], event: dict[str, Any]) -> None:
@@ -163,12 +168,23 @@ def _verification_inputs(tool_results: list[dict[str, Any]], action_results: lis
     return list(tool_results) + [{"tool": a["tool"], "args": a["args"], "result": a["result"]} for a in action_results]
 
 
+def _diagnostics(check: Verification, retried: bool, used_fallback: bool, llm_error: bool) -> dict[str, Any]:
+    return {
+        "ok": bool(check.ok) and not used_fallback,
+        "retried": retried,
+        "used_fallback": used_fallback,
+        "unverified": [str(getattr(c, "text", c)) for c in check.unverified],
+        "banned": list(check.banned),
+        "llm_error": llm_error,
+    }
+
+
 def _retry_message(check: Verification) -> str:
     lines = ["Your answer cannot be shown yet. Problems:"]
     lines += [f"- {p}" for p in check.problems()]
     lines += [
         "Rewrite it. Remove every number that is not in a tool result or in the user's message, or fetch it with a "
-        "read tool. Do not use outside knowledge, typical rates or assumed pack sizes. If there is no data, say so "
+        "read tool. Remove example numbers: when asking for missing details, never give example quantities or prices. Do not use outside knowledge, typical rates or assumed pack sizes. If there is no data, say so "
         "plainly and suggest a next step.",
     ]
     return "\n".join(lines)
@@ -215,14 +231,26 @@ async def answer(
 
     def _fallback(text_when_actions: str = "", llm_error: bool = False) -> AnswerResult:
         # A turn that only performed actions has no data answer to replace; the caller words those.
-        if action_results and not tool_results:
+        drafting = bool(context and context.drafting) or any(
+            a.get("tool") in DRAFT_ACTION_TOOLS for a in action_results
+        )
+        if drafting:
+            draft_now = _current_draft() or {}
+            text = drafting_reply.build_drafting_reply(
+                draft_now, rfq_tool_service.evaluate_rfq_readiness(draft_now), user_message
+            )
+        elif action_results and not tool_results:
             text = text_when_actions
         else:
             text = answer_verifier.render_facts_answer(tool_results, user_message)
+        logger.warning(
+            "Answer engine used fallback (drafting=%s, retried=%s, llm_error=%s); unverified=%s banned=%s",
+            drafting, retried, llm_error, [str(c) for c in check.unverified], check.banned,
+        )
         return AnswerResult(
             text=text, tool_results=tool_results, verification=check, used_fallback=True,
             retried=retried, action_results=action_results, thinking="".join(thinking) or None,
-            llm_error=llm_error,
+            llm_error=llm_error, diagnostics=_diagnostics(check, retried, True, llm_error),
         )
 
     try:
@@ -237,6 +265,7 @@ async def answer(
             return AnswerResult(
                 text="", tool_results=tool_results, verification=check,
                 action_results=action_results, thinking="".join(thinking) or None,
+                diagnostics=_diagnostics(check, retried, False, False),
             )
 
         await _progress(context, {"event": "verifying"})
@@ -262,6 +291,7 @@ async def answer(
         return AnswerResult(
             text=text, tool_results=tool_results, verification=check, used_fallback=False,
             retried=retried, action_results=action_results, thinking="".join(thinking) or None,
+            diagnostics=_diagnostics(check, retried, False, False),
         )
     except Exception as exc:
         logger.error("Answer engine failed: %s", exc)

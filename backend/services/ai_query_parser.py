@@ -66,11 +66,8 @@ def _store(message: str, parse: AIParse) -> None:
 
 
 def _model_name() -> str:
-    return (
-        getattr(settings, "QUERY_AI_MODEL", "")
-        or getattr(settings, "AI_ROUTER_MODEL", None)
-        or "qwen2.5:1.5b"
-    )
+    """QUERY_AI_MODEL when set, else the main chat model (small routers misread Hinglish)."""
+    return getattr(settings, "QUERY_AI_MODEL", "") or settings.AI_CHAT_MODEL
 
 
 _SCHEMA: dict[str, Any] = {
@@ -119,15 +116,19 @@ Only report numbers that appear in the message. Never invent values."""
 
 async def _call_model(message: str, known_categories: list[str]) -> Optional[dict[str, Any]]:
     """POST to Ollama /api/generate and return the decoded JSON object, or None."""
+    # Same context as the chat model: a different num_ctx makes Ollama reload the resident model.
+    options: dict[str, Any] = {"temperature": 0}
+    if getattr(settings, "AI_CHAT_NUM_CTX", 0) > 0:
+        options["num_ctx"] = settings.AI_CHAT_NUM_CTX
     payload = {
         "model": _model_name(),
         "prompt": _build_prompt(message, known_categories),
         "stream": False,
         "format": _SCHEMA,
         "keep_alive": getattr(settings, "AI_ROUTER_KEEP_ALIVE", "30m"),
-        "options": {"temperature": 0, "num_ctx": 4096},
+        "options": options,
     }
-    timeout = float(getattr(settings, "QUERY_AI_TIMEOUT_SECONDS", 6.0))
+    timeout = float(getattr(settings, "QUERY_AI_TIMEOUT_SECONDS", 10.0))
     async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.post(f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/generate", json=payload)
     if resp.status_code != 200:

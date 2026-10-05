@@ -125,7 +125,7 @@ def _learn(parse: Any, message: str) -> None:
 
         evidence = (parse.role_evidence or "").strip().lower()
         if parse.role is not None and evidence and 2 <= len(evidence.split()) <= 6 \
-                and not re.search(r"\d", evidence):
+                and not re.search(r"\d", evidence) and ".." not in evidence and "…" not in evidence:
             changed |= _put(data["role_phrases"], evidence, parse.role.value)
 
         for key, value in (parse.attributes or {}).items():

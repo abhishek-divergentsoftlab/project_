@@ -47,12 +47,12 @@ class Settings(BaseSettings):
     # Use the LLM and prompt-based agent for conversational search
     DIRECT_SEARCH_LLM: bool = True
     # Open-world AI-first message understanding (services/ai_query_parser.py).
-    # Empty model = reuse the router model; failures fall back to the rule parser.
+    # Empty model = reuse AI_CHAT_MODEL (small router models misread Hinglish); failures fall back to the rule parser.
     QUERY_AI_ENABLED: bool = True
     QUERY_AI_MODEL: str = ""
-    QUERY_AI_TIMEOUT_SECONDS: float = 6.0
+    QUERY_AI_TIMEOUT_SECONDS: float = 10.0
     # Optional LLM HSN classification, used ONLY when a listing is saved (never in
-    # match scoring). Empty model = qwen2.5:1.5b.
+    # match scoring). Empty model = AI_CHAT_MODEL.
     HSN_AI_ENABLED: bool = True
     HSN_AI_MODEL: str = ""
     HSN_AI_TIMEOUT_SECONDS: float = 3.0

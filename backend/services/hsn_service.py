@@ -263,11 +263,7 @@ async def classify_hsn_with_ai(text: str) -> Optional[str]:
     try:
         import httpx
 
-        model = (
-            getattr(settings, "HSN_AI_MODEL", "")
-            or getattr(settings, "AI_ROUTER_MODEL", "")
-            or "qwen2.5:1.5b"
-        )
+        model = getattr(settings, "HSN_AI_MODEL", "") or settings.AI_CHAT_MODEL
         prompt = (
             "You are a World Customs Organization trade classifier. "
             "What is the standard 4-digit or 6-digit Harmonized System (HS / HSN) code "
