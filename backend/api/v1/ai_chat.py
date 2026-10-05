@@ -134,6 +134,7 @@ async def chat_message(
         matched_candidates=payload.matched_candidates,
         active_connection_id=payload.active_connection_id,
         agent=agent,
+        rfq_id=payload.rfq_id,
     )
     return AIChatResponse(
         reply=result["reply"],
@@ -170,6 +171,7 @@ async def chat_stream(
             matched_candidates=payload.matched_candidates,
             active_connection_id=payload.active_connection_id,
             agent=agent,
+            rfq_id=payload.rfq_id,
         ):
             yield f"data: {json.dumps(chunk)}\n\n"
 

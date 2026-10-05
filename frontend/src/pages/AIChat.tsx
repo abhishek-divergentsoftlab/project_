@@ -251,6 +251,9 @@ export function AIChat() {
   const urlConvId = searchParams.get("c");
   const isNewParam = searchParams.get("new");
   const urlPrompt = searchParams.get("prompt");
+  const urlRfqId = searchParams.get("rfq_id");
+  // The listing "Analyze this listing" was opened from; sent with the first message only.
+  const pendingRfqIdRef = useRef<string | null>(null);
 
   // Starts empty even when the URL names a conversation: the effect below
   // loads it only when the two differ, so seeding it from the URL meant a
@@ -381,11 +384,13 @@ export function AIChat() {
   useEffect(() => {
     if (urlPrompt && !activeConversationId && messages.length <= 1) {
       setInput(urlPrompt);
+      if (urlRfqId) pendingRfqIdRef.current = urlRfqId;
       const nextParams = new URLSearchParams(searchParams);
       nextParams.delete("prompt");
+      nextParams.delete("rfq_id");
       setSearchParams(nextParams, { replace: true });
     }
-  }, [urlPrompt, activeConversationId, messages.length, searchParams, setSearchParams]);
+  }, [urlPrompt, urlRfqId, activeConversationId, messages.length, searchParams, setSearchParams]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -663,6 +668,8 @@ export function AIChat() {
     abortControllerRef.current = abortController;
 
     let currentConvId = activeConversationIdRef.current || activeConversationId;
+    const firstMessageRfqId = pendingRfqIdRef.current;
+    pendingRfqIdRef.current = null;
 
     try {
       await aiChat.streamMessage(
@@ -739,6 +746,7 @@ export function AIChat() {
         activeMatchedCandidates.length > 0 ? activeMatchedCandidates : null,
         activeConnectionId,
         null, // Super Agent autonomously routes based on user intent
+        firstMessageRfqId,
       );
     } catch (err: unknown) {
       if (abortController.signal.aborted) {

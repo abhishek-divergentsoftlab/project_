@@ -263,7 +263,7 @@ async def test_tool_calls_not_offered_are_still_executed(client, db, make_actor,
     rfq = await make_rfq(buyer, role="buyer", title="Need rice")
     ollama = OllamaMock(_tool("close_rfq", rfq_id=rfq["id"]))
     await _chat(buyer, ollama, "shut down that listing I posted")
-    offered = {t["function"]["name"] for t in ollama.calls[-1].get("tools", [])}
+    offered = {t["function"]["name"] for t in ollama.calls[0].get("tools", [])}
     status = (await db.execute(text("select status from rfqs where id=:i"), {"i": rfq["id"]})).scalar_one()
     assert "close_rfq" in offered or status == "active", f"close_rfq not offered ({sorted(offered)}) yet RFQ is {status}"
 
@@ -501,14 +501,16 @@ async def test_verification_agent_prompt_has_no_real_kyc_data(client, db, make_a
     assert "unverified" in sp.lower(), f"agent={data['routed_agent']['id']}; no KYC fact in prompt"
 
 
-async def test_logistics_agent_prompt_has_no_freight_estimate(client, db, make_actor):
-    """Proves: freight questions get no logistics_service.estimate_freight_rates data;
-    the prompt only says 'Provide ... freight estimates', inviting invented rates."""
+async def test_logistics_agent_prompt_has_no_invented_freight_rates(client, db, make_actor):
+    """Freight figures must come from the estimate_freight tool, never from rates written into the prompt."""
     buyer = await make_actor("buyer")
     ollama = OllamaMock()
     await _chat(buyer, ollama, "what is the freight cost from Indore to Mumbai for 20 tonnes?")
     sp = ollama.system_prompt()
-    assert any(k in sp for k in ("INR/kg", "estimated freight", "FREIGHT ESTIMATE")), "no grounded freight data in prompt"
+    assert not any(k in sp for k in ("INR/kg", "Typical domestic road freight", "GROUNDED FREIGHT"))
+    assert "estimate_freight" in sp
+    offered = {t["function"]["name"] for t in ollama.calls[0].get("tools", [])}
+    assert "estimate_freight" in offered
 
 
 # =============================================================================

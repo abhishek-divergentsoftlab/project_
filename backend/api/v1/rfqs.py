@@ -50,6 +50,11 @@ async def create_rfq(
 ) -> RFQOut:
     try:
         rfq = await rfq_service.create_rfq(db, current_user, payload)
+    except rfq_service.DuplicateRFQError as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={"message": str(exc), "existing_rfq_id": str(exc.existing_id)},
+        ) from exc
     except RFQError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
     return rfq_service.to_out(rfq)

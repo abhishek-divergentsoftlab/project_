@@ -481,6 +481,7 @@ export const aiChat = {
     matchedCandidates?: MatchCandidate[] | null,
     activeConnectionId?: string | null,
     agentId?: string | null,
+    rfqId?: string | null,
   ): Promise<AIChatResponse> {
     const { data } = await api.post<AIChatResponse>("/ai-chat/message", {
       messages,
@@ -489,6 +490,7 @@ export const aiChat = {
       matched_candidates: matchedCandidates,
       active_connection_id: activeConnectionId,
       agent_id: agentId,
+      rfq_id: rfqId ?? undefined,
     });
     return data;
   },
@@ -502,6 +504,7 @@ export const aiChat = {
     matchedCandidates?: MatchCandidate[] | null,
     activeConnectionId?: string | null,
     agentId?: string | null,
+    rfqId?: string | null,
   ): Promise<void> {
     const token = tokenStore.access();
     const baseUrl = import.meta.env.VITE_API_BASE_URL || "/api/v1";
@@ -518,6 +521,7 @@ export const aiChat = {
         matched_candidates: matchedCandidates,
         active_connection_id: activeConnectionId,
         agent_id: agentId,
+        rfq_id: rfqId ?? undefined,
       }),
       signal,
     });

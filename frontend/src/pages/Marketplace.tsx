@@ -369,8 +369,8 @@ export function Marketplace() {
 
   function handleAskAI(item: CatalogItem) {
     const roleTerm = item.role === "seller" ? "supplier" : "buyer";
-    const prompt = `Analyze this ${roleTerm} listing for "${item.title}" in category "${item.category}". Price is ${formatPrice(item)}, quantity ${formatQuantity(item)}. How does this compare with typical market conditions?`;
-    navigate(`/ai-chat?prompt=${encodeURIComponent(prompt)}`);
+    const prompt = `Analyze this ${roleTerm} listing for "${item.title}" in category "${item.category}". Price is ${formatPrice(item)}, quantity ${formatQuantity(item)}. How does this compare with other listings on the platform?`;
+    navigate(`/ai-chat?prompt=${encodeURIComponent(prompt)}&rfq_id=${encodeURIComponent(item.id)}`);
   }
 
   async function handleToggleSave(item: CatalogItem) {

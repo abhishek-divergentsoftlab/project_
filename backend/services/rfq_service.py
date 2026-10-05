@@ -34,6 +34,46 @@ class RFQError(Exception):
     """Domain-level rejection, translated to a 4xx by the router."""
 
 
+class DuplicateRFQError(RFQError):
+    """The same user already has this exact active listing (HTTP 409).
+
+    Carries the existing listing so callers can point at it instead of
+    silently posting the same RFQ again (one user's listing once showed up as
+    five "market" data points).
+    """
+
+    def __init__(self, existing: "RFQ") -> None:
+        self.existing_id = existing.id
+        self.existing_title = existing.title
+        super().__init__(f"you already have this RFQ: {existing.title} ({existing.id})")
+
+
+DUPLICATE_WINDOW = timedelta(hours=24)
+
+
+def normalise_title(title: Optional[str]) -> str:
+    """Case/whitespace-insensitive title key shared by the duplicate guard and the data tools."""
+    return " ".join((title or "").lower().split())
+
+
+async def find_duplicate_rfq(db: AsyncSession, user: User, payload: RFQCreate) -> Optional["RFQ"]:
+    """An ACTIVE RFQ of this user with the same role, title, quantity and price made in the last 24h."""
+    if payload.status != RFQStatus.ACTIVE:
+        return None
+    qty = payload.quantity.value if payload.quantity else None
+    price = payload.price_target.amount if payload.price_target else None
+    stmt = select(RFQ).where(
+        RFQ.user_id == user.id,
+        RFQ.status == RFQStatus.ACTIVE,
+        RFQ.role == payload.role,
+        func.lower(func.regexp_replace(func.trim(RFQ.title), r"\s+", " ", "g")) == normalise_title(payload.title),
+        RFQ.created_at >= datetime.now(UTC) - DUPLICATE_WINDOW,
+        RFQ.quantity_value.is_(None) if qty is None else RFQ.quantity_value == qty,
+        RFQ.price_amount.is_(None) if price is None else RFQ.price_amount == price,
+    ).order_by(RFQ.created_at.desc()).limit(1)
+    return (await db.execute(stmt)).scalars().first()
+
+
 class RFQStateError(RFQError):
     """The RFQ's lifecycle state does not allow the operation (HTTP 409)."""
 
@@ -181,6 +221,10 @@ async def create_rfq(db: AsyncSession, user: User, payload: RFQCreate) -> RFQ:
         raise RFQError("a new RFQ may only be created as 'draft' or 'active'")
     if not user.can_post_as(payload.role):
         raise RFQError(f"this account is registered as '{user.role.value}' and cannot post a {payload.role.value} RFQ")
+
+    duplicate = await find_duplicate_rfq(db, user, payload)
+    if duplicate is not None:
+        raise DuplicateRFQError(duplicate)
 
     # AI Safety & Prohibited Items Moderation
     mod_check = await AIContentModerator.audit_and_verify(

@@ -378,9 +378,9 @@ async def test_catalog_hides_expired_closed_draft(make_actor, db):
     viewer = await make_actor("buyer")
     live = (await seller.post("/rfqs", json=rfq_body(role="seller"))).json()["id"]
     draft = (await seller.post("/rfqs", json=rfq_body(role="seller", status="draft"))).json()["id"]
-    closed = (await seller.post("/rfqs", json=rfq_body(role="seller"))).json()["id"]
+    closed = (await seller.post("/rfqs", json=rfq_body(role="seller", title="Closed listing"))).json()["id"]
     await seller.post(f"/rfqs/{closed}/close")
-    expired = (await seller.post("/rfqs", json=rfq_body(role="seller"))).json()["id"]
+    expired = (await seller.post("/rfqs", json=rfq_body(role="seller", title="Expired listing"))).json()["id"]
     await _expire(db, expired)
     ids = {i["id"] for i in (await viewer.get("/marketplace/catalog", params={"limit": 100})).json()["items"]}
     assert live in ids and not ({draft, closed, expired} & ids)
@@ -413,7 +413,7 @@ async def test_categories_are_normalized(make_actor):
     seller = await make_actor("seller")
     viewer = await make_actor("buyer")
     await seller.post("/rfqs", json=rfq_body(role="seller", category="Electronics"))
-    await seller.post("/rfqs", json=rfq_body(role="seller", category="electronic"))
+    await seller.post("/rfqs", json=rfq_body(role="seller", category="electronic", title="Second listing"))
     cats = [c["category"] for c in (await viewer.get("/marketplace/categories")).json()]
     filt = (await viewer.get("/marketplace/catalog", params={"category": "Electronics"})).json()
     assert cats == ["Electronics"] and filt["total"] == 2, (cats, filt["total"])

@@ -2,6 +2,8 @@
 
 from unittest.mock import AsyncMock, patch
 
+import uuid
+
 import pytest
 import httpx
 from httpx import AsyncClient
@@ -547,25 +549,10 @@ async def test_ai_chat_stream_persistence(client: AsyncClient, make_actor):
     """Streaming chat saves user and assistant messages to DB with conversation_id emitted."""
     actor = await make_actor("buyer")
 
-    async def fake_stream_lines():
-        lines = [
-            '{"message": {"role": "assistant", "content": "Payment terms "}, "done": false}',
-            '{"message": {"role": "assistant", "content": "can be LC 60 days."}, "done": true}',
-        ]
-        for l in lines:
-            yield l.encode("utf-8")
+    async def chat(messages, tools):
+        return {"role": "assistant", "content": "Payment terms can be LC at sight."}
 
-    mock_resp = AsyncMock()
-    mock_resp.status_code = 200
-    mock_resp.aiter_lines = fake_stream_lines
-
-    class MockStreamContext:
-        async def __aenter__(self):
-            return mock_resp
-        async def __aexit__(self, *args):
-            pass
-
-    with patch("httpx.AsyncClient.stream", return_value=MockStreamContext()):
+    with patch("services.answer_engine._chat", chat):
         res = await actor.post(
             "/ai-chat/stream",
             json={
@@ -595,7 +582,7 @@ async def test_ai_chat_stream_persistence(client: AsyncClient, make_actor):
     assert detail["messages"][0]["role"] == "user"
     assert "payment terms" in detail["messages"][0]["content"].lower()
     assert detail["messages"][1]["role"] == "assistant"
-    assert "LC 60 days" in detail["messages"][1]["content"]
+    assert "LC at sight" in detail["messages"][1]["content"]
 
 
 
@@ -788,29 +775,20 @@ async def test_ai_chat_payload_includes_num_ctx(client: AsyncClient, make_actor,
         options_zero = captured_payloads[1].get("options", {})
         assert "num_ctx" not in options_zero
 
-    # Test stream payload options
+    # The stream endpoint calls the model through the same (non-streaming) engine call.
     captured_stream_payloads = []
 
-    async def fake_stream_lines():
-        yield b'{"message": {"role": "assistant", "content": "Stream reply"}, "done": true}'
-
-    mock_resp = AsyncMock()
-    mock_resp.status_code = 200
-    mock_resp.aiter_lines = fake_stream_lines
-
-    class MockStreamContext:
-        async def __aenter__(self):
-            return mock_resp
-        async def __aexit__(self, *args):
-            pass
-
-    def mock_stream(self, method, url, *args, **kwargs):
+    async def mock_post_stream(self, url, *args, **kwargs):
         if "api/chat" in str(url):
             captured_stream_payloads.append(kwargs.get("json") or {})
-        return MockStreamContext()
+            resp = AsyncMock()
+            resp.status_code = 200
+            resp.json = lambda: {"message": {"role": "assistant", "content": "Stream reply"}, "done": True}
+            return resp
+        return await orig_post(self, url, *args, **kwargs)
 
     monkeypatch.setattr(settings, "AI_CHAT_NUM_CTX", 65536)
-    with patch.object(httpx.AsyncClient, "stream", mock_stream):
+    with patch.object(httpx.AsyncClient, "post", mock_post_stream):
         s_res = await actor.post(
             "/ai-chat/stream",
             json={"messages": [{"role": "user", "content": "Testing stream context size"}]},
@@ -1072,9 +1050,9 @@ async def test_counterparty_followup_deterministic_fallback(client: AsyncClient,
     model_text_reply = (
         "✉️ Updated Message Sent to Aurora Enterprises\n\n"
         "*\"Dear Aurora Enterprises,\n"
-        "Thank you for your quotation of 186 INR/kg for Fuji apples (Extra Class). "
-        "We are interested in procuring 1,299 kg. Please note that the location is 10 km away from Indore.\n\n"
-        "Could you kindly consider reducing the price to 180 INR per kg? We hope to finalize a mutually beneficial deal.\"*\n\n"
+        "Thank you for your quotation for Fuji apples (Extra Class). "
+        "Please note that the location is 10 km away from Indore.\n\n"
+        "Could you kindly reconsider the price? We hope to finalize a mutually beneficial deal.\"*\n\n"
         "The message has been dispatched — monitor replies in the seller chat pane."
     )
 
@@ -1231,8 +1209,8 @@ async def test_ai_chat_message_analysis_query_bypasses_tools(client: AsyncClient
             mock_resp.json = lambda: {
                 "message": {
                     "role": "assistant",
-                    "content": "The quoted price of TRY 159/pc is approx USD 4.80, which is higher than typical FOB benchmarks (USD 1.80–3.20).",
-                    "thinking": "Evaluated listing against textile benchmarks.",
+                    "content": "The quoted price of TRY 159 per pcs is your own figure; the platform has no listings to compare it with yet.",
+                    "thinking": "No comparable data.",
                 }
             }
             return mock_resp
@@ -1247,11 +1225,14 @@ async def test_ai_chat_message_analysis_query_bypasses_tools(client: AsyncClient
         data = res.json()
         assert "TRY 159" in data["reply"]
         assert len(captured_payloads) == 1
-        # Tools should be empty for analysis queries
-        assert "tools" not in captured_payloads[0] or captured_payloads[0]["tools"] == []
+        # Analysis turns offer only the read-only data tools, never an action tool.
+        offered = {t["function"]["name"] for t in captured_payloads[0].get("tools", [])}
+        assert "search_listings" in offered and "market_price_stats" in offered
+        assert not offered & {"create_rfq", "update_rfq_draft", "close_rfq", "draft_counterparty_message"}
         # Dynamic system prompt must contain analysis directive
         sys_msg = captured_payloads[0]["messages"][0]["content"]
         assert "MARKET ANALYSIS & BENCHMARKING DIRECTIVE" in sys_msg
+        assert "TRUTH RULES" in sys_msg and "GROUND TRUTH VERIFIED" not in sys_msg
         # RFQ draft is not populated with corrupted listing text
         assert data["rfq_draft"] == {}
 
@@ -1337,20 +1318,16 @@ async def test_context_sliding_window_memory():
 
 
 @pytest.mark.asyncio
-async def test_live_marketplace_database_aggregates(db: AsyncSession):
-    """Verify that live database marketplace aggregation returns real metrics without hallucination."""
-    from services.ai_chat_service import _fetch_live_marketplace_aggregates, format_marketplace_aggregates_prompt
+async def test_live_marketplace_data_tools_return_counts_without_inventing(db: AsyncSession, make_actor):
+    """The data tools report real counts (zero when empty) instead of pre-fetched prompt aggregates."""
+    from models.user import User
+    from services import market_data_tools
 
-    aggs = await _fetch_live_marketplace_aggregates(
-        db=db,
-        query_text="rice",
-        category="Agriculture",
-    )
-    assert isinstance(aggs, dict)
-    assert "total_active_marketplace" in aggs
-    assert "match_count" in aggs
-    prompt_str = format_marketplace_aggregates_prompt(aggs)
-    assert "LIVE MARKETPLACE DATABASE BENCHMARK" in prompt_str
+    actor = await make_actor("buyer")
+    user = await db.get(User, uuid.UUID(actor.id))
+    res = await market_data_tools.search_listings(db, user=user, product="rice", category="Agriculture")
+    assert res["ok"] and res["data"]["distinct_listings"] == 0
+    assert {"id", "label", "value"} <= set(res["facts"][0])
 
 
 @pytest.mark.asyncio

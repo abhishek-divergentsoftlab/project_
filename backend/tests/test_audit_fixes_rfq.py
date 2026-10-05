@@ -254,7 +254,7 @@ async def test_expire_due_rfqs_is_idempotent(make_actor, db):
 
     owner = await make_actor("buyer")
     live = (await owner.post("/rfqs", json=rfq_body())).json()["id"]
-    due = (await owner.post("/rfqs", json=rfq_body())).json()["id"]
+    due = (await owner.post("/rfqs", json=rfq_body(title="Due listing"))).json()["id"]
     draft = (await owner.post("/rfqs", json=rfq_body(status="draft"))).json()["id"]
     await _expire(db, due)
     await _expire(db, draft)
@@ -569,7 +569,7 @@ async def test_categories_are_normalized(make_actor):
     seller = await make_actor("seller")
     viewer = await make_actor("buyer")
     a = (await seller.post("/rfqs", json=rfq_body(role="seller", category="Electronics"))).json()
-    b = (await seller.post("/rfqs", json=rfq_body(role="seller", category="electronic"))).json()
+    b = (await seller.post("/rfqs", json=rfq_body(role="seller", category="electronic", title="Second listing"))).json()
     assert a["category"] == b["category"] == "Electronics"
     cats = [c["category"] for c in (await viewer.get("/marketplace/categories")).json()]
     assert cats == ["Electronics"]
@@ -582,7 +582,7 @@ async def test_legacy_unnormalized_rows_merge_in_facets_and_filter(make_actor, d
     seller = await make_actor("seller")
     viewer = await make_actor("buyer")
     rid = (await seller.post("/rfqs", json=rfq_body(role="seller", category="Electronics"))).json()["id"]
-    await seller.post("/rfqs", json=rfq_body(role="seller", category="Electronics"))
+    await seller.post("/rfqs", json=rfq_body(role="seller", category="Electronics", title="Second listing"))
     # Simulate a row written before normalization-on-write.
     await db.execute(text("UPDATE rfqs SET category = 'electronic' WHERE id = :i"), {"i": rid})
     await db.commit()
@@ -642,7 +642,7 @@ async def test_saved_ids_consistent_with_saved_list(make_actor, db, state):
     viewer = await make_actor("buyer")
     seller = await make_actor("seller")
     keep = (await seller.post("/rfqs", json=rfq_body(role="seller"))).json()["id"]
-    gone = (await seller.post("/rfqs", json=rfq_body(role="seller"))).json()["id"]
+    gone = (await seller.post("/rfqs", json=rfq_body(role="seller", title="Gone listing"))).json()["id"]
     await viewer.post(f"/rfqs/{keep}/save")
     await viewer.post(f"/rfqs/{gone}/save")
     if state == "closed":

@@ -41,6 +41,10 @@ class AIChatRequest(BaseModel):
         default=None,
         description="ID of the specialised agent to use (e.g. 'market_research', 'negotiation'). None = general assistant.",
     )
+    rfq_id: Optional[uuid.UUID] = Field(
+        default=None,
+        description="Listing the user is asking about (e.g. from 'Analyze this listing'); sent with the first message.",
+    )
 
 
 class AIChatResponse(BaseModel):

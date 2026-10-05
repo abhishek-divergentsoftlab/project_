@@ -182,21 +182,13 @@ def _sse_chunks(body: str) -> list[dict]:
 
 
 def _mock_stream(content: str):
-    async def lines():
-        yield json.dumps({"message": {"role": "assistant", "content": content}, "done": True}).encode()
+    """Script the model's one reply. The handlers no longer stream raw model tokens: the answer engine
+    calls Ollama non-streaming, verifies the text, then the handler sends it once."""
 
-    resp = AsyncMock()
-    resp.status_code = 200
-    resp.aiter_lines = lines
+    async def chat(messages, tools):
+        return {"role": "assistant", "content": content}
 
-    class Ctx:
-        async def __aenter__(self):
-            return resp
-
-        async def __aexit__(self, *args):
-            pass
-
-    return patch.object(httpx.AsyncClient, "stream", lambda self, method, url, *a, **k: Ctx())
+    return patch("services.answer_engine._chat", chat)
 
 
 @pytest.mark.asyncio

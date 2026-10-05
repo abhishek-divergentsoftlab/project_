@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from decimal import Decimal
+import asyncio
 import json
 import logging
 import re
@@ -24,7 +25,8 @@ from core.config import settings
 from models.conversation import Conversation, Message
 from models.enums import ConversationType, MessageRole, RFQRole, RFQStatus
 from models.user import User
-from services import rfq_tool_service
+from services import answer_engine, rfq_tool_service
+from services.answer_engine import AnswerContext
 from services.agent_registry import AgentDefinition, GENERAL_ASSISTANT
 from services.agent_router import route_query_to_agent, route_query_to_agent_async
 
@@ -44,8 +46,16 @@ SCOPE (Business & B2B Trade Only):
 - Supply chain logistics, freight, Incoterms, and packaging
 - Marketplace listings analysis, price benchmarking, market condition comparisons, and commercial feasibility
 
+TRUTH RULES (marketplace facts):
+- Use the data tools to look up any marketplace fact (listings, counts, prices, matches, freight, verification).
+- State ONLY numbers that came from a tool result or from the user's own message.
+- NEVER use outside knowledge for prices, rates, counts or sizes: no "typical" or "market" rates, no assumed pack sizes.
+- Do NOT do arithmetic that is not in tool output (e.g. no cases-per-bottle or per-kg conversions of your own).
+- If a tool returns no data, say so plainly (for example "There are no seller listings for X on the platform yet, so this price cannot be compared") and suggest a next step such as posting an RFQ or widening the location.
+- If a result has a sample_warning, say the sample is too small to be a market range. If duplicates_removed is above 0, say duplicates were removed.
+
 STRICT POLICY:
-- Always answer business inquiries, listing evaluations, market comparisons, and RFQ questions directly.
+- Always answer business inquiries, listing evaluations, market comparisons, and RFQ questions directly, using only tool-backed data.
 - ONLY if the query is completely unrelated to business, trade, or procurement (e.g., creative writing, pop culture, video games, casual gossip):
 Respond with ONLY: "I only assist with business, procurement, and B2B trade inquiries."
 """
@@ -127,7 +137,7 @@ async def _recover_from_false_refusal(
     fallback = (
         "I am here to assist with your B2B trade, procurement, and marketplace inquiries. "
         f"Regarding your request ('{last_user_content[:60]}'), please let me know your desired specifications, "
-        "quantity, target price, or delivery destination, and I will assist you with pricing benchmarks, "
+        "quantity, target price, or delivery destination, and I will assist you with comparing against platform listings, "
         "matching suppliers, or preparing your listing."
     )
     if not call_model:
@@ -273,315 +283,6 @@ def build_sliding_window_messages(
     return window_msgs, summary_text
 
 
-def _price_stats(values: list[Decimal]) -> Optional[dict[str, Any]]:
-    if not values:
-        return None
-    return {
-        "count": len(values),
-        "min": float(min(values)),
-        "max": float(max(values)),
-        "avg": float(sum(values) / len(values)),
-    }
-
-
-def _summarise_listing_prices(rows: list[Any]) -> dict[str, Any]:
-    """Benchmark prices on one comparable basis, split into sellers' asks and buyers' targets.
-
-    "tons", "MT", "kg" and "quintal" listings are all restated per tonne, and other
-    currencies are converted to the display currency, so no listing silently drops
-    out of the range. Listings that cannot be converted are counted as excluded.
-    """
-    from services import currency as currency_service
-    from services import unit_converter
-
-    empty = {
-        "currency": "INR",
-        "price_unit": "unit",
-        "min_price": None,
-        "max_price": None,
-        "avg_price": None,
-        "seller_prices": None,
-        "buyer_prices": None,
-        "priced_listing_count": len(rows),
-        "excluded_price_count": len(rows),
-        "converted_currency_count": 0,
-    }
-    if not rows:
-        return empty
-
-    currencies = [str(r.price_currency or "INR").upper() for r in rows]
-    display_currency = "INR" if "INR" in currencies else max(set(currencies), key=currencies.count)
-
-    # (basis, role, amount in display currency, was_converted)
-    normalised: list[tuple[str, Any, Decimal, bool]] = []
-    for r in rows:
-        source_currency = str(r.price_currency or "INR").upper()
-        amount = currency_service.convert(Decimal(r.price_amount), source_currency, display_currency)
-        if amount is None:
-            continue
-        unit = (r.price_per_unit or "unit").strip().lower()
-        if unit_converter.is_mass_unit(unit):
-            tonnes_per_unit = unit_converter.to_tonnes(Decimal(1), unit)
-            amount = amount / tonnes_per_unit
-            basis = "tonne"
-        else:
-            basis = unit
-        normalised.append((basis, r.role, amount, source_currency != display_currency))
-
-    if not normalised:
-        return empty
-
-    bases = [n[0] for n in normalised]
-    basis = max(set(bases), key=bases.count)
-    included = [n for n in normalised if n[0] == basis]
-
-    overall = _price_stats([n[2] for n in included])
-    return {
-        "currency": display_currency,
-        "price_unit": basis,
-        "min_price": overall["min"],
-        "max_price": overall["max"],
-        "avg_price": overall["avg"],
-        "seller_prices": _price_stats([n[2] for n in included if n[1] == RFQRole.SELLER]),
-        "buyer_prices": _price_stats([n[2] for n in included if n[1] == RFQRole.BUYER]),
-        "priced_listing_count": len(rows),
-        "excluded_price_count": len(rows) - len(included),
-        "converted_currency_count": sum(1 for n in included if n[3]),
-    }
-
-
-async def _fetch_live_marketplace_aggregates(
-    db: AsyncSession,
-    query_text: str,
-    category: Optional[str] = None,
-    product_name: Optional[str] = None,
-) -> dict[str, Any]:
-    """Query live PostgreSQL database for real marketplace listing metrics.
-    
-    Returns real listing counts, active buyers vs sellers, price ranges, and hubs.
-    Prevents LLM from hallucinating market statistics.
-    """
-    try:
-        from models.rfq import RFQ
-        from models.enums import RFQStatus, RFQRole
-
-        # 1. Total marketplace active count
-        total_active_res = await db.scalar(
-            select(func.count(RFQ.id)).where(RFQ.status == RFQStatus.ACTIVE)
-        )
-        total_active = total_active_res or 0
-
-        # 2. Targeted match query (same visibility rule as the marketplace catalog)
-        conditions = [
-            RFQ.status == RFQStatus.ACTIVE,
-            or_(RFQ.expires_at.is_(None), RFQ.expires_at > datetime.now(timezone.utc)),
-        ]
-        target_label = product_name or category
-
-        def _build_product_match_clauses(term: str) -> list[Any]:
-            clean_term = term.strip()
-            if not clean_term:
-                return []
-            escaped = re.escape(clean_term)
-            pattern = rf"\m{escaped}" if re.match(r"^\w", clean_term) else escaped
-            clauses = [
-                RFQ.title.op("~*")(pattern),
-            ]
-            boilerplate_words = {
-                "role", "category", "product", "quantity", "target", "price", "location", "deadline",
-                "attributes", "notes", "buyer", "seller", "units", "procurement", "listing", "listings",
-                "bottle", "bottles", "pcs", "piece", "pieces", "kg", "box", "boxes", "tin", "tins",
-                "pack", "packs", "food", "beverages", "order", "orders", "supply", "trade", "material",
-                "goods", "item", "items", "typical", "market", "condition", "conditions", "viable",
-                "viability", "fair", "high", "cheap", "expensive", "quote", "quotes",
-            }
-            if clean_term.lower() not in boilerplate_words:
-                clauses.append(RFQ.search_text.op("~*")(pattern))
-
-            meaningful_tokens = [
-                t.strip() for t in re.split(r"[^\w]+", clean_term.lower())
-                if len(t.strip()) >= 3 and t.strip() not in boilerplate_words
-            ]
-            if len(meaningful_tokens) > 1:
-                # Require ALL meaningful tokens to be present together (AND logic)
-                # to prevent cross-category token contamination (e.g. matching 'bottle' or 'food' across other products)
-                and_token_clauses = []
-                for t in meaningful_tokens:
-                    t_esc = re.escape(t)
-                    t_pat = rf"\m{t_esc}" if re.match(r"^\w", t) else t_esc
-                    and_token_clauses.append(or_(RFQ.title.op("~*")(t_pat), RFQ.search_text.op("~*")(t_pat)))
-                clauses.append(and_(*and_token_clauses))
-
-            return clauses
-
-        if product_name:
-            target_label = product_name.strip()
-            prod_clauses = _build_product_match_clauses(product_name)
-            if prod_clauses:
-                conditions.append(or_(*prod_clauses))
-            if category:
-                conditions.append(RFQ.category.ilike(f"%{category.strip()}%"))
-        elif category:
-            target_label = category.strip()
-            conditions.append(RFQ.category.ilike(f"%{category.strip()}%"))
-        elif query_text:
-            from services import query_extractor
-            req = await query_extractor.extract_async(query_text)
-            if req.product:
-                target_label = req.product
-                prod_clauses = _build_product_match_clauses(req.product)
-                if prod_clauses:
-                    conditions.append(or_(*prod_clauses))
-                if req.category:
-                    conditions.append(RFQ.category.ilike(f"%{req.category.strip()}%"))
-            elif req.category:
-                target_label = req.category
-                conditions.append(RFQ.category.ilike(f"%{req.category.strip()}%"))
-            else:
-                # No product or category in the message: there is nothing to benchmark.
-                # Reporting "0 listings for '<the whole sentence>'" would be a false claim.
-                return {}
-        else:
-            return {}
-
-        # 2. Match counts
-        counts_query = select(
-            func.count(RFQ.id).label("match_count"),
-            func.count(RFQ.id).filter(RFQ.role == RFQRole.SELLER).label("seller_count"),
-            func.count(RFQ.id).filter(RFQ.role == RFQRole.BUYER).label("buyer_count"),
-        ).where(*conditions)
-        counts_res = await db.execute(counts_query)
-        counts_row = counts_res.first()
-
-        match_count = counts_row.match_count if counts_row else 0
-        seller_count = counts_row.seller_count if counts_row else 0
-        buyer_count = counts_row.buyer_count if counts_row else 0
-
-        # 3. Currency-aware and unit-aware price stats, split by market side.
-        price_rows = (
-            await db.execute(
-                select(RFQ.role, RFQ.price_amount, RFQ.price_currency, RFQ.price_per_unit)
-                .where(*conditions, RFQ.price_amount.is_not(None))
-            )
-        ).all()
-        price_summary = _summarise_listing_prices(price_rows)
-
-        # 4. Top cities
-        cities_query = (
-            select(RFQ.location_city, func.count(RFQ.id).label("cnt"))
-            .where(*conditions, RFQ.location_city.is_not(None))
-            .group_by(RFQ.location_city)
-            .order_by(func.count(RFQ.id).desc())
-            .limit(3)
-        )
-        cities_res = await db.execute(cities_query)
-        city_rows = cities_res.all()
-        top_cities = [f"{r[0]} ({r[1]})" for r in city_rows if r[0]]
-
-        return {
-            "total_active_marketplace": total_active,
-            "target_label": target_label or "General Marketplace",
-            "match_count": match_count,
-            "seller_count": seller_count,
-            "buyer_count": buyer_count,
-            **price_summary,
-            "top_cities": top_cities,
-        }
-    except Exception as exc:
-        logger.warning("Failed to fetch live marketplace aggregates: %s", exc)
-        return {}
-
-
-def format_marketplace_aggregates_prompt(aggregates: dict[str, Any]) -> str:
-    """Format live PostgreSQL aggregate statistics into grounding context."""
-    if not aggregates:
-        return ""
-
-    match_cnt = aggregates.get("match_count", 0)
-    target = aggregates.get("target_label", "Marketplace")
-    total_active = aggregates.get("total_active_marketplace", 0)
-
-    if match_cnt > 0:
-        seller_cnt = aggregates.get("seller_count", 0)
-        buyer_cnt = aggregates.get("buyer_count", 0)
-        curr = aggregates.get("currency", "INR")
-        curr_sym = "₹" if curr == "INR" else f"{curr} "
-        p_unit = aggregates.get("price_unit") or "unit"
-        min_p = aggregates.get("min_price")
-        max_p = aggregates.get("max_price")
-        avg_p = aggregates.get("avg_price")
-        cities = aggregates.get("top_cities", [])
-
-        clean_unit = p_unit[4:].strip() if p_unit.lower().startswith("per ") else p_unit.strip()
-        unit_note = f"per {clean_unit}"
-        is_tonne = p_unit in ("tonne", "tons", "ton", "mt")
-
-        def _range_line(stats: Optional[dict[str, Any]]) -> str:
-            if not stats:
-                return "no priced listings"
-            if stats["min"] == stats["max"]:
-                kg_hint = f" (approx. {curr_sym}{stats['min']/1000:,.2f} per kg)" if is_tonne else ""
-                return f"{curr_sym}{stats['min']:,.2f} {unit_note}{kg_hint} ({stats['count']} listing(s))"
-            kg_hint = (
-                f" (approx. {curr_sym}{stats['min']/1000:,.2f} – {curr_sym}{stats['max']/1000:,.2f} per kg)"
-                if is_tonne else ""
-            )
-            return (
-                f"{curr_sym}{stats['min']:,.2f} to {curr_sym}{stats['max']:,.2f} {unit_note}{kg_hint} "
-                f"(Average: {curr_sym}{stats['avg']:,.2f} {unit_note}, {stats['count']} listings)"
-            )
-
-        if min_p is not None and max_p is not None and avg_p is not None:
-            overall_line = _range_line({"min": min_p, "max": max_p, "avg": avg_p, "count": match_cnt - aggregates.get("excluded_price_count", 0)})
-        else:
-            overall_line = "Price on request / varied across listings"
-        locations_line = ", ".join(cities) if cities else "Distributed across multiple trading hubs"
-
-        notes = []
-        if aggregates.get("converted_currency_count"):
-            notes.append(f"{aggregates['converted_currency_count']} listing(s) converted to {curr} at current rates")
-        if aggregates.get("excluded_price_count"):
-            notes.append(f"{aggregates['excluded_price_count']} listing(s) priced in a non-comparable unit are left out of the ranges")
-        notes_line = f"- Price Normalisation Notes: {'; '.join(notes)}\n" if notes else ""
-
-        buyer_rule = (
-            f"4. There ARE {buyer_cnt} active buyer RFQ(s) for '{target}'. Never say there are no buyers; "
-            f"mention buyers' target prices when advising a seller on price.\n"
-            if buyer_cnt else
-            f"4. There are 0 active buyer RFQs for '{target}'; say so plainly if asked about buyers.\n"
-        )
-
-        return (
-            f"\nLIVE MARKETPLACE DATABASE BENCHMARK (GROUND TRUTH VERIFIED DATA):\n"
-            f"- Segment / Query Filter: '{target}'\n"
-            f"- Product-Specific Matching Listings for '{target}': {match_cnt} (Active Sellers: {seller_cnt}, Active Buyers: {buyer_cnt})\n"
-            f"- Sellers' Asking Prices: {_range_line(aggregates.get('seller_prices'))}\n"
-            f"- Buyers' Target Prices: {_range_line(aggregates.get('buyer_prices'))}\n"
-            f"- All Listings Combined: {overall_line}\n"
-            f"{notes_line}"
-            f"- Key Regional Trading Hubs for '{target}': {locations_line}\n"
-            f"- Total Platform Active Inventory (Across ALL product categories combined): {total_active} listings nationwide\n"
-            f"MANDATORY ACCURACY INSTRUCTIONS:\n"
-            f"1. When reporting listing counts for '{target}', you MUST state {match_cnt} listings ({seller_cnt} sellers, {buyer_cnt} buyers). "
-            f"Do NOT confuse or report the total platform-wide inventory ({total_active}) as the count of '{target}'.\n"
-            f"2. Explicitly state the pricing unit: {unit_note}. Avoid calling wholesale/bulk prices 'per order'. "
-            f"Keep sellers' asking prices and buyers' target prices separate.\n"
-            f"3. Do NOT invent or hallucinate fake listing counts or contradictory price statistics.\n"
-            f"{buyer_rule}"
-        )
-    else:
-        return (
-            f"\nLIVE MARKETPLACE DATABASE BENCHMARK (GROUND TRUTH VERIFIED DATA):\n"
-            f"- Segment / Query Filter: '{target}'\n"
-            f"- Active Matching Listings: 0 active listings found in this marketplace database for '{target}'\n"
-            f"- Total Platform Active Inventory: {total_active} listings across other categories\n"
-            f"MANDATORY GROUNDING INSTRUCTION: You MUST explicitly inform the user that there are currently 0 active "
-            f"listings or registered sellers for '{target}' in this platform database. Do NOT invent fake seller counts, "
-            f"fake minimum/maximum prices, or pretend platform listings exist. If providing general agricultural/wholesale "
-            f"mandi benchmarks, explicitly state they are external market references, NOT active listings on this platform.\n"
-        )
-
-
 def _sanitize_untrusted_prompt_text(text: Any, max_len: int = 120) -> str:
     """Strip prompt injection directives, normalize whitespace, and bound length."""
     if not text:
@@ -606,7 +307,6 @@ def build_rfq_system_prompt(
     active_connection_id: Optional[Union[str, uuid.UUID]] = None,
     is_analysis_query: bool = False,
     routed_agent: Optional[AgentDefinition] = None,
-    live_marketplace_data: Optional[str] = None,
     older_history_summary: Optional[str] = None,
     counterparty_context: Optional[str] = None,
     user: Optional[User] = None,
@@ -662,13 +362,13 @@ def build_rfq_system_prompt(
         flow_directive = (
             "MARKET RESEARCH SPECIALIST DIRECTIVE:\n"
             "- You are the Market Research Specialist for the B2B procurement marketplace.\n"
-            "- Deliver concise, data-driven market intelligence, competitor density, and pricing benchmarks.\n"
-            "- Ground your findings strictly in the verified marketplace data provided below.\n"
+            "- Deliver concise market intelligence built only from the data tools (listing counts, distinct users, price statistics).\n"
+            "- Ground your findings strictly in tool results; call the data tools before stating any marketplace fact.\n"
             "- Present multi-supplier comparisons in structured markdown tables.\n"
             "- If the user requests to start an RFQ or buy/sell based on findings, assist them directly.\n\n"
             "MARKET ANALYSIS & BENCHMARKING DIRECTIVE:\n"
             "- The user is asking for market intelligence, price benchmarking, listing evaluation, or commercial analysis.\n"
-            "- Directly answer the user's business inquiry with concrete facts, pricing benchmarks, and concise data tables.\n"
+            "- Answer the user's business inquiry using only numbers returned by the data tools, in concise tables.\n"
             "- Do NOT prompt the user to specify Buy/Sell or create an RFQ unless they explicitly ask to create one."
         )
     elif routed_agent and routed_agent.id == "price_analyst":
@@ -680,7 +380,7 @@ def build_rfq_system_prompt(
             "- If the user asks to negotiate with or create an RFQ for a supplier, assist them directly.\n\n"
             "MARKET ANALYSIS & BENCHMARKING DIRECTIVE:\n"
             "- The user is asking for price benchmarking, listing evaluation, or commercial analysis.\n"
-            "- Directly answer the user's business inquiry with concrete facts, pricing benchmarks, and concise data tables.\n"
+            "- Answer the user's business inquiry using only numbers returned by the data tools, in concise tables.\n"
             "- Do NOT prompt the user to specify Buy/Sell or create an RFQ unless they explicitly ask to create one."
         )
     elif routed_agent and routed_agent.id == "negotiation":
@@ -695,14 +395,9 @@ def build_rfq_system_prompt(
         flow_directive = (
             "LOGISTICS ADVISOR SPECIALIST DIRECTIVE:\n"
             "- You are the Logistics Advisor Specialist for the B2B procurement marketplace.\n"
-            "- Provide structured advice on Incoterms (FOB, CIF, EXW, DDP), freight estimates, and customs.\n"
-            "- GROUNDED FREIGHT ESTIMATE DATA (from platform logistics service):\n"
-            "  * Typical domestic road freight rate: 3.5 - 6.5 INR/kg (depending on distance and truckload type)\n"
-            "  * Full truckload: estimated freight ~4.0 - 5.5 INR/kg\n"
-            "  * Part truckload (LTL): ~6.0 - 8.5 INR/kg\n"
-            "  * Rail freight: ~2.0 - 3.2 INR/kg\n"
-            "  * Air cargo: ~25 - 45 INR/kg\n"
-            "- Provide these estimated freight rates to the user clearly with breakdown.\n"
+            "- Provide structured advice on Incoterms (FOB, CIF, EXW, DDP), freight and customs.\n"
+            "- For any freight or distance figure call the `estimate_freight` tool and quote only what it returns, labelled as a platform estimate.\n"
+            "- If the tool says freight rates are not available (unknown place, no weight), say so and ask for the missing detail. Never quote freight rates from memory.\n"
             "- Use tables and structured bullet points."
         )
     elif routed_agent and routed_agent.id == "verification":
@@ -723,7 +418,7 @@ def build_rfq_system_prompt(
         flow_directive = (
             "MARKET ANALYSIS & BENCHMARKING DIRECTIVE:\n"
             "- The user is asking for market intelligence, price benchmarking, listing evaluation, or commercial analysis.\n"
-            "- Directly answer the user's business inquiry with concrete facts, pricing benchmarks, and concise data tables.\n"
+            "- Answer the user's business inquiry using only numbers returned by the data tools, in concise tables.\n"
             "- Do NOT prompt the user to specify Buy/Sell or create an RFQ unless they explicitly ask to create one."
         )
     elif not readiness["has_role"]:
@@ -858,10 +553,8 @@ def build_rfq_system_prompt(
             "  * INCLUDE the direct link to the recommended RFQ: e.g. `[View RFQ & Connect](/marketplace?rfq={rfq_id})` so the user can send a connection request immediately.",
             "- When the user asks to compare (e.g. 'compare prices', 'compare ratings'): provide a concise comparison breakdown, including each candidate's RFQ link.",
             "- DISTANCE AND PROXIMITY INTEGRITY:",
-            "  * Always quote the EXACT distance provided in candidate metadata (e.g. Distance: 480 km).",
-            "  * Never alter numbers or add zeros (e.g. 480 km is NOT 4,800 km).",
-            "  * 480 km IS within a 500 km radius. Surat is ~480 km from Indore.",
-            "  * Never contradict yourself by claiming a candidate is not within ~500 km when their metadata confirms 480 km.",
+            "  * Always quote the EXACT distance provided in candidate metadata.",
+            "  * Never alter numbers or add zeros; if no distance is given, say it is not available.",
             "- DO NOT call `update_rfq_draft` or `create_rfq` when answering questions about matched counterparties.",
         ])
         matches_section = "\n".join(match_lines)
@@ -886,7 +579,7 @@ def build_rfq_system_prompt(
         "\nNEGOTIATION & COUNTERPARTY MESSAGING DIRECTIVES:\n"
         "- When the user instructs to send a message to a seller or negotiate (e.g. 'send negotiation message to the counter user', 'message the supplier', 'ask for discount', 'negotiate with Himalaya Orchards'):\n"
         "  * ALWAYS adopt an exceptionally polite, courteous, and commercially persuasive tone on behalf of the user.\n"
-        "  * Formulate a complete, polite business communication stating appreciation for their quotation, referencing the order details (quantity, delivery location), and politely requesting the specific adjustment (e.g. price reduction to 180 INR per kg).\n"
+        "  * Formulate a complete, polite business communication stating appreciation for their quotation, referencing the order details (quantity, delivery location), and politely requesting the specific adjustment (the price change the user asked for).\n"
         "  * Call the `draft_counterparty_message` tool with `message`, `recipient_name`, and optional `proposed_price` / `proposed_currency`.\n"
         "  * IMPORTANT: The message is drafted for user review. Inform the user that you have drafted the negotiation proposal for their review, and invite them to click the Send button on the card to dispatch it.\n"
         "- When the user provides follow-up additions, notes, or amendments (e.g. 'also mention that...', 'tell them that...', 'aslo mantion that the location is not indore its 10kg away'):\n"
@@ -899,8 +592,6 @@ def build_rfq_system_prompt(
         SYSTEM_BUSINESS_PROMPT,
         f"\nACTIVE PROCUREMENT STATE SCRATCHPAD:\n{status_str}",
     ]
-    if live_marketplace_data:
-        prompt_parts.append(live_marketplace_data)
     if older_history_summary:
         prompt_parts.append(f"\nCONVERSATION HISTORICAL CONTEXT (Pruned older turns):\n- {older_history_summary}")
     if matches_section:
@@ -1017,6 +708,9 @@ async def execute_create_rfq_call(
                 "status": rfq.status.value,
                 "category": rfq.category,
             }, None
+        except rfq_service.DuplicateRFQError as exc:
+            # Never claim a new listing: point at the one that already exists.
+            return None, f"You already have this RFQ: {exc.existing_title} (id {exc.existing_id}). No new RFQ was created."
         except Exception as exc:
             logger.exception("Failed to create RFQ in database: %s", exc)
             return None, f"Failed to create RFQ: {str(exc)}"
@@ -2019,6 +1713,158 @@ def _extract_msg_fields(msg: Any) -> tuple[str, str]:
     return str(role), str(content)
 
 
+class _ActionRunner:
+    """Runs the router-provisioned action tools for the answer engine and remembers their side effects.
+
+    The engine calls this mid-loop (so the model sees the outcome), while the
+    handlers read the collected state afterwards to build the same replies,
+    cards and tool-step events they always did.
+    """
+
+    def __init__(
+        self,
+        *,
+        draft: dict[str, Any],
+        draft_guards: dict[str, Any],
+        db: Optional[AsyncSession],
+        user: Optional[User],
+        conversation: Optional[Conversation],
+        matched_candidates: Optional[list[dict[str, Any]]],
+        active_connection_id: Optional[Union[str, uuid.UUID]],
+        connection_hint: Any,
+        on_step: Optional[Any] = None,
+    ) -> None:
+        self.draft = draft
+        self.draft_guards = draft_guards
+        self.db = db
+        self.user = user
+        self.conversation = conversation
+        self.matched_candidates = matched_candidates
+        self.active_connection_id = active_connection_id
+        self.connection_hint = connection_hint
+        self.on_step = on_step
+        self.created_rfq_obj: Optional[dict[str, Any]] = None
+        self.closed_rfq_obj: Optional[dict[str, Any]] = None
+        self.counterparty_msg_obj: Optional[dict[str, Any]] = None
+        self.draft_msg_fallback: Optional[tuple[str, str]] = None
+        self.captured_tool_step: Optional[dict[str, Any]] = None
+        self.err_reply = ""
+        self.duplicate = False
+        self.touched = False
+
+    def _step(self, step: dict[str, Any], **extra: Any) -> None:
+        self.captured_tool_step = step
+        if self.on_step:
+            self.on_step({"tool_step": step, **extra})
+
+    async def __call__(self, name: str, raw_args: dict[str, Any]) -> dict[str, Any]:
+        self.touched = True
+        if name == "create_rfq":
+            if self.created_rfq_obj:
+                return {"ok": True, "note": "already created in this turn", "rfq": self.created_rfq_obj}
+            obj, err = await execute_create_rfq_call(self.draft, raw_args, db=self.db, user=self.user)
+            self.created_rfq_obj = obj
+            if err:
+                self.err_reply = f"⚠️ {err}"
+                self.duplicate = "already have this RFQ" in err
+            self._step(
+                {
+                    "name": "create_rfq",
+                    "title": "Creating Marketplace RFQ",
+                    "status": "completed" if obj else "failed",
+                    "args": {"title": obj["title"], "id": obj["id"]} if obj else {"error": err},
+                },
+                created_rfq=obj,
+            )
+            return {"ok": True, "rfq": obj} if obj else {"ok": False, "error": err}
+
+        if name in ("draft_counterparty_message", "send_counterparty_message"):
+            obj, err = await execute_draft_counterparty_message_call(
+                raw_args,
+                db=self.db,
+                user=self.user,
+                matched_candidates=self.matched_candidates,
+                active_connection_id=self.active_connection_id,
+                connection_hint=self.connection_hint,
+            )
+            self.counterparty_msg_obj = obj
+            c_name = obj.get("counterparty_name", "Counterparty") if obj else "Counterparty"
+            body = raw_args.get("message")
+            if err and not obj and body:
+                self.draft_msg_fallback = (body, err)
+                self.err_reply = f"📝 **Negotiation Message Draft:**\n\n> {body}\n\n⚠️ *Note: {err}*"
+            elif err and not obj:
+                self.err_reply = f"⚠️ {err}"
+            self._step(
+                {
+                    "name": "draft_counterparty_message",
+                    "title": f"Drafting Message for {c_name}" if obj else "Drafting Negotiation Message",
+                    "status": "completed" if (obj or body) else "failed",
+                    "args": (
+                        {"recipient": c_name, "message": obj["message"]}
+                        if obj
+                        else ({"recipient": "Counterparty", "message": body, "note": err} if body else {"error": err})
+                    ),
+                },
+                counterparty_message=obj,
+            )
+            return {"ok": bool(obj), "error": err} if err else {"ok": True, "drafted_for_user_review": True}
+
+        if name == "close_rfq":
+            obj, err = await execute_close_rfq_call(
+                rfq_id_str=raw_args.get("rfq_id"), conversation=self.conversation, db=self.db, user=self.user
+            )
+            self.closed_rfq_obj = obj
+            if obj:
+                self.err_reply = f"✅ **RFQ Closed:** '{obj['title']}' (ID: `{obj['id']}`) has been closed."
+            elif err:
+                self.err_reply = f"⚠️ {err}"
+            self._step(
+                {
+                    "name": "close_rfq",
+                    "title": "Closing Marketplace RFQ",
+                    "status": "completed" if obj else "failed",
+                    "args": {"title": obj["title"], "id": obj["id"]} if obj else {"error": err},
+                },
+            )
+            return {"ok": True, "closed": obj} if obj else {"ok": False, "error": err}
+
+        if name == "update_rfq_draft":
+            self.draft = _process_tool_call(
+                {"function": {"name": name, "arguments": raw_args}}, self.draft, **self.draft_guards
+            )
+            self._step(
+                {
+                    "name": "update_rfq_draft",
+                    "title": "Updating RFQ Preferences & Draft",
+                    "status": "completed",
+                    "args": raw_args,
+                },
+            )
+            return {"ok": True, "readiness": rfq_tool_service.evaluate_rfq_readiness(self.draft)}
+
+        return {"ok": False, "error": f"unknown action '{name}'"}
+
+
+def _engine_allowed_text(
+    matched_candidates: Optional[list[dict[str, Any]]],
+    counterparty_context: Optional[str],
+    last_counterparty_msg: Optional[dict[str, Any]] = None,
+) -> str:
+    """Prompt-supplied facts the answer may quote besides tool results (candidate cards, counterparty block)."""
+    parts: list[str] = []
+    if matched_candidates:
+        try:
+            parts.append(json.dumps(matched_candidates[:10], default=str, ensure_ascii=False))
+        except Exception:
+            pass
+    if counterparty_context:
+        parts.append(counterparty_context)
+    if last_counterparty_msg:
+        parts.append(str(last_counterparty_msg.get("message") or ""))
+    return "\n".join(parts)
+
+
 async def generate_business_chat_reply(
     messages: list[Any],
     current_rfq: Optional[dict[str, Any]] = None,
@@ -2028,6 +1874,7 @@ async def generate_business_chat_reply(
     matched_candidates: Optional[list[dict[str, Any]]] = None,
     active_connection_id: Optional[Union[str, uuid.UUID]] = None,
     agent: Optional[AgentDefinition] = None,
+    rfq_id: Optional[uuid.UUID] = None,
 ) -> dict[str, Any]:
     """Send conversation messages to local Ollama gpt-oss:20b with RFQ and counterparty negotiation tool calling."""
     # 1. Deterministic Preprocessing on the latest user message
@@ -2189,23 +2036,6 @@ async def generate_business_chat_reply(
 
     readiness = rfq_tool_service.evaluate_rfq_readiness(draft)
 
-    # 3. Live Marketplace RAG Aggregates (Real DB Metrics)
-    live_market_data = ""
-    if db is not None and (
-        routed_agent.id in ("market_research", "price_analyst")
-        or (is_match_query and focus["category"])
-        or any(w in last_user_content.lower() for w in ["market", "density", "how many", "suppliers", "competitor", "average price"])
-    ):
-        prod_hint = focus["product"] or (draft.get("product_details") or {}).get("name")
-        cat_hint = focus["category"] or draft.get("category")
-        aggs = await _fetch_live_marketplace_aggregates(
-            db=db,
-            query_text=last_user_content,
-            category=cat_hint,
-            product_name=prod_hint,
-        )
-        live_market_data = format_marketplace_aggregates_prompt(aggs)
-
     # 4. Context Sliding Window (Bounded Token Usage, No Memory Spikes)
     window_messages, older_summary = build_sliding_window_messages(messages, max_history_turns=8)
 
@@ -2272,7 +2102,6 @@ async def generate_business_chat_reply(
         active_connection_id=active_connection_id,
         is_analysis_query=is_analysis_query,
         routed_agent=routed_agent,
-        live_marketplace_data=live_market_data,
         older_history_summary=older_summary,
         counterparty_context=counterparty_context,
         user=user,
@@ -2327,26 +2156,45 @@ async def generate_business_chat_reply(
     tools = active_tools
     draft_guards = _draft_guards(messages, last_user_content, draft)
 
-    payload: dict[str, Any] = {
-        "model": settings.AI_CHAT_MODEL,
-        "messages": prepared_messages,
-        "stream": False,
-        "options": _build_ollama_options(),
-    }
-    if tools:
-        payload["tools"] = tools
-
-    url = f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/chat"
+    runner = _ActionRunner(
+        draft=draft,
+        draft_guards=draft_guards,
+        db=db,
+        user=user,
+        conversation=conversation,
+        matched_candidates=matched_candidates,
+        active_connection_id=active_connection_id,
+        connection_hint=_connection_hint(last_user_content, focus),
+    )
 
     try:
-        timeout = float(settings.AI_CHAT_TIMEOUT_SECONDS)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(url, json=payload)
+        engine_result = await answer_engine.answer(
+            db,
+            user,
+            history_messages=window_messages,
+            system_prompt=dynamic_system_prompt,
+            user_message=last_user_content,
+            extra_tools=tools,
+            tool_executor=runner,
+            context=AnswerContext(
+                rfq_id=str(rfq_id) if rfq_id else None,
+                draft=lambda: runner.draft,
+                extra_allowed_text=_engine_allowed_text(matched_candidates, counterparty_context, last_counterparty_msg),
+            ),
+        )
+        reply = engine_result.text
+        thinking = engine_result.thinking
+        if is_counterparty_msg and engine_result.used_fallback and not engine_result.tool_results:
+            # A letter is not a data answer; let the deterministic composer below build it.
+            reply = ""
+        draft = runner.draft
+        created_rfq_obj = runner.created_rfq_obj
+        closed_rfq_obj = runner.closed_rfq_obj
+        counterparty_msg_obj = runner.counterparty_msg_obj
 
-        if response.status_code != 200:
-            logger.error("Ollama chat returned status %d: %s", response.status_code, response.text)
+        if engine_result.llm_error and not engine_result.tool_results and not runner.touched:
             return await _finalize_response(
-                reply_text="⚠️ The business AI assistant service is temporarily unavailable.",
+                reply_text="⚠️ Connection to local AI assistant interrupted.",
                 thinking_text=None,
                 rfq_draft_data=draft,
                 readiness_data=readiness,
@@ -2354,75 +2202,14 @@ async def generate_business_chat_reply(
                 counterparty_message_data=None,
             )
 
-        data = response.json()
-        message_data = data.get("message") or {}
-        reply = (message_data.get("content") or "").strip()
-        thinking = message_data.get("thinking") or None
-
         # Guardrail recovery: If model mistakenly emitted the refusal string for a valid business query
         if is_false_positive_refusal(reply, last_user_content):
             reply = await _recover_from_false_refusal(prepared_messages, last_user_content) or ""
 
-        # Execute any tool calls
-        created_rfq_obj = None
-        closed_rfq_obj = None
-        counterparty_msg_obj = None
-        tool_calls = message_data.get("tool_calls") or []
-        offered_tool_names = {
-            t.get("function", {}).get("name") for t in (tools or []) if isinstance(t, dict)
-        }
-        for tc in tool_calls:
-            fn = tc.get("function") or {}
-            tc_name = fn.get("name")
-            if tc_name not in offered_tool_names:
-                logger.warning(
-                    "Skipping tool call '%s' not present in offered tools: %s",
-                    tc_name,
-                    offered_tool_names,
-                )
-                continue
-
-            raw_args = fn.get("arguments") or {}
-            if isinstance(raw_args, str):
-                try:
-                    raw_args = json.loads(raw_args)
-                except Exception:
-                    raw_args = {}
-
-            if tc_name == "create_rfq":
-                created_rfq_obj, err = await execute_create_rfq_call(draft, raw_args, db=db, user=user)
-                if err and not reply:
-                    reply = f"⚠️ {err}"
-            elif tc_name in ("draft_counterparty_message", "send_counterparty_message"):
-                counterparty_msg_obj, err = await execute_draft_counterparty_message_call(
-                    raw_args,
-                    db=db,
-                    user=user,
-                    matched_candidates=matched_candidates,
-                    active_connection_id=active_connection_id,
-                    connection_hint=_connection_hint(last_user_content, focus),
-                )
-                if err and not reply:
-                    msg_body = raw_args.get("message")
-                    if msg_body:
-                        reply = (
-                            f"📝 **Negotiation Message Draft:**\n\n"
-                            f"> {msg_body}\n\n"
-                            f"⚠️ *Note: {err}*"
-                        )
-                    else:
-                        reply = f"⚠️ {err}"
-            elif tc_name == "close_rfq":
-                rfq_arg = raw_args.get("rfq_id")
-                closed_rfq_obj, err = await execute_close_rfq_call(
-                    rfq_id_str=rfq_arg, conversation=conversation, db=db, user=user
-                )
-                if closed_rfq_obj and not reply:
-                    reply = f"✅ **RFQ Closed:** '{closed_rfq_obj['title']}' (ID: `{closed_rfq_obj['id']}`) has been closed."
-                elif err and not reply:
-                    reply = f"⚠️ {err}"
-            elif tc_name == "update_rfq_draft":
-                draft = _process_tool_call(tc, draft, **draft_guards)
+        # An action's failure text stands in for a missing reply; a duplicate-RFQ notice always wins
+        # so the user is never told a new listing exists.
+        if runner.err_reply and (not reply or runner.duplicate):
+            reply = runner.err_reply
 
         readiness = rfq_tool_service.evaluate_rfq_readiness(draft)
 
@@ -2524,6 +2311,7 @@ async def stream_business_chat_reply(
     matched_candidates: Optional[list[dict[str, Any]]] = None,
     active_connection_id: Optional[Union[str, uuid.UUID]] = None,
     agent: Optional[AgentDefinition] = None,
+    rfq_id: Optional[uuid.UUID] = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Stream conversation replies chunk-by-chunk using SSE with RFQ and counterparty negotiation tool calling."""
     # 1. Deterministic Preprocessing on the latest user message
@@ -2687,23 +2475,6 @@ async def stream_business_chat_reply(
 
     readiness = rfq_tool_service.evaluate_rfq_readiness(draft)
 
-    # 3. Live Marketplace RAG Aggregates (Real DB Metrics)
-    live_market_data = ""
-    if db is not None and (
-        routed_agent.id in ("market_research", "price_analyst")
-        or (is_match_query and focus["category"])
-        or any(w in last_user_content.lower() for w in ["market", "density", "how many", "suppliers", "competitor", "average price"])
-    ):
-        prod_hint = focus["product"] or (draft.get("product_details") or {}).get("name")
-        cat_hint = focus["category"] or draft.get("category")
-        aggs = await _fetch_live_marketplace_aggregates(
-            db=db,
-            query_text=last_user_content,
-            category=cat_hint,
-            product_name=prod_hint,
-        )
-        live_market_data = format_marketplace_aggregates_prompt(aggs)
-
     # 4. Context Sliding Window (Bounded Token Usage, No Memory Spikes)
     window_messages, older_summary = build_sliding_window_messages(messages, max_history_turns=8)
 
@@ -2769,7 +2540,6 @@ async def stream_business_chat_reply(
         active_connection_id=active_connection_id,
         is_analysis_query=is_analysis_query,
         routed_agent=routed_agent,
-        live_marketplace_data=live_market_data,
         older_history_summary=older_summary,
         counterparty_context=counterparty_context,
         user=user,
@@ -2920,240 +2690,130 @@ async def stream_business_chat_reply(
     tools = active_tools
     draft_guards = _draft_guards(messages, last_user_content, draft)
 
-    payload: dict[str, Any] = {
-        "model": settings.AI_CHAT_MODEL,
-        "messages": prepared_messages,
-        "stream": True,
-        "options": _build_ollama_options(),
-    }
-    if tools:
-        payload["tools"] = tools
-
-    url = f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/chat"
-
+    captured_tool_step = None
     try:
-        timeout = httpx.Timeout(
-            connect=30.0,
-            read=float(settings.AI_CHAT_TIMEOUT_SECONDS),
-            write=30.0,
-            pool=30.0,
-        )
         total_content = ""
         total_thinking = ""
         total_thinking_after = ""
-        has_tool_called = False
-        captured_tool_step = None
         created_rfq_obj = None
         counterparty_msg_obj = None
         draft_msg_fallback = None
-        # Set when the streamed text is wrong and the client must replace it.
+        # The answer is verified before any of it is shown, so it is sent once, whole.
         content_replaced = False
 
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            async with client.stream("POST", url, json=payload) as response:
-                if response.status_code != 200:
-                    unavail_reply = "⚠️ The business AI assistant service is temporarily unavailable."
-                    await _persist_stream_terminal(reply_content=unavail_reply)
-                    yield emit({
-                        "content": unavail_reply,
-                        "thinking": "",
-                        "thinking_after": "",
-                        "tool_step": None,
-                        "rfq_draft": draft,
-                        "readiness": readiness,
-                        "created_rfq": None,
-                        "counterparty_message": None,
-                        "done": True,
-                    })
-                    return
+        queue: asyncio.Queue = asyncio.Queue()
 
-                async for raw_line in response.aiter_lines():
-                    line = raw_line.strip()
-                    if not line:
-                        continue
-                    try:
-                        chunk = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
+        async def _on_progress(event: dict[str, Any]) -> None:
+            queue.put_nowait({"__progress": event})
 
-                    message_chunk = chunk.get("message") or {}
-                    content_delta = message_chunk.get("content") or ""
-                    thinking_delta = message_chunk.get("thinking") or ""
-                    is_done = bool(chunk.get("done", False))
+        runner = _ActionRunner(
+            draft=draft,
+            draft_guards=draft_guards,
+            db=db,
+            user=user,
+            conversation=conversation,
+            matched_candidates=matched_candidates,
+            active_connection_id=active_connection_id,
+            connection_hint=_connection_hint(last_user_content, focus),
+            on_step=queue.put_nowait,
+        )
 
-                    if content_delta:
-                        total_content += content_delta
-                    if thinking_delta:
-                        if has_tool_called:
-                            total_thinking_after += thinking_delta
-                        else:
-                            total_thinking += thinking_delta
+        def _status(text: str) -> dict[str, Any]:
+            return emit({
+                "content": "",
+                "thinking": text,
+                "thinking_after": "",
+                "tool_step": None,
+                "rfq_draft": runner.draft,
+                "readiness": rfq_tool_service.evaluate_rfq_readiness(runner.draft),
+                "created_rfq": None,
+                "counterparty_message": None,
+                "done": False,
+            })
 
-                    # Tool calls from chunk
-                    tool_calls = message_chunk.get("tool_calls") or []
-                    offered_tool_names = {
-                        t.get("function", {}).get("name") for t in (tools or []) if isinstance(t, dict)
-                    }
-                    for tc in tool_calls:
-                        fn = tc.get("function") or {}
-                        tc_name = fn.get("name")
-                        if tc_name not in offered_tool_names:
-                            logger.warning(
-                                "Skipping tool call '%s' not present in offered tools: %s",
-                                tc_name,
-                                offered_tool_names,
-                            )
-                            continue
+        yield _status("Looking up verified marketplace data...\n")
+        task = asyncio.create_task(
+            answer_engine.answer(
+                db,
+                user,
+                history_messages=window_messages,
+                system_prompt=dynamic_system_prompt,
+                user_message=last_user_content,
+                extra_tools=tools,
+                tool_executor=runner,
+                context=AnswerContext(
+                    rfq_id=str(rfq_id) if rfq_id else None,
+                    draft=lambda: runner.draft,
+                    extra_allowed_text=_engine_allowed_text(matched_candidates, counterparty_context, last_counterparty_msg),
+                    on_progress=_on_progress,
+                ),
+            )
+        )
+        try:
+            while not task.done() or not queue.empty():
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=0.25)
+                except asyncio.TimeoutError:
+                    continue
+                if "__progress" in item:
+                    event = item["__progress"]
+                    if event.get("event") == "verifying":
+                        yield _status("Checking every number against the data...\n")
+                    elif event.get("name") in answer_engine.market_data_tools.READ_TOOL_NAMES:
+                        yield _status(f"Looking up: {str(event['name']).replace('_', ' ')}\n")
+                    continue
+                yield emit({
+                    "content": "",
+                    "thinking": "",
+                    "thinking_after": "",
+                    "tool_step": item.get("tool_step"),
+                    "rfq_draft": runner.draft,
+                    "readiness": rfq_tool_service.evaluate_rfq_readiness(runner.draft),
+                    "created_rfq": item.get("created_rfq"),
+                    "counterparty_message": item.get("counterparty_message"),
+                    "done": False,
+                })
+        finally:
+            if not task.done():
+                task.cancel()
+        engine_result = task.result()
 
-                        raw_args = fn.get("arguments") or {}
-                        if isinstance(raw_args, str):
-                            try:
-                                raw_args = json.loads(raw_args)
-                            except Exception:
-                                pass
-                        has_tool_called = True
+        draft = runner.draft
+        readiness = rfq_tool_service.evaluate_rfq_readiness(draft)
+        created_rfq_obj = runner.created_rfq_obj
+        counterparty_msg_obj = runner.counterparty_msg_obj
+        draft_msg_fallback = runner.draft_msg_fallback
+        captured_tool_step = runner.captured_tool_step
+        total_content = engine_result.text
+        total_thinking = engine_result.thinking or ""
+        if is_counterparty_msg and engine_result.used_fallback and not engine_result.tool_results:
+            total_content = ""
 
-                        if tc_name == "create_rfq":
-                            created_rfq_obj, err = await execute_create_rfq_call(draft, raw_args, db=db, user=user)
-                            captured_tool_step = {
-                                "name": "create_rfq",
-                                "title": "Creating Marketplace RFQ",
-                                "status": "completed" if created_rfq_obj else "failed",
-                                "args": (
-                                    {"title": created_rfq_obj["title"], "id": created_rfq_obj["id"]}
-                                    if created_rfq_obj
-                                    else {"error": err}
-                                ),
-                            }
-                            yield emit({
-                                "content": "",
-                                "thinking": "",
-                                "thinking_after": "",
-                                "tool_step": captured_tool_step,
-                                "rfq_draft": draft,
-                                "readiness": readiness,
-                                "created_rfq": created_rfq_obj,
-                                "counterparty_message": None,
-                                "done": False,
-                            })
-                        elif tc_name in ("draft_counterparty_message", "send_counterparty_message"):
-                            counterparty_msg_obj, err = await execute_draft_counterparty_message_call(
-                                raw_args,
-                                db=db,
-                                user=user,
-                                matched_candidates=matched_candidates,
-                                active_connection_id=active_connection_id,
-                                connection_hint=_connection_hint(last_user_content, focus),
-                            )
-                            c_name = counterparty_msg_obj.get("counterparty_name", "Counterparty") if counterparty_msg_obj else "Counterparty"
-                            draft_msg_text = raw_args.get("message")
-                            if err and not counterparty_msg_obj and draft_msg_text:
-                                draft_msg_fallback = (draft_msg_text, err)
-                            captured_tool_step = {
-                                "name": "draft_counterparty_message",
-                                "title": f"Drafting Message for {c_name}" if counterparty_msg_obj else "Drafting Negotiation Message",
-                                "status": "completed" if (counterparty_msg_obj or draft_msg_text) else "failed",
-                                "args": (
-                                    {"recipient": c_name, "message": counterparty_msg_obj["message"]}
-                                    if counterparty_msg_obj
-                                    else ({"recipient": "Counterparty", "message": draft_msg_text, "note": err} if draft_msg_text else {"error": err})
-                                ),
-                            }
-                            yield emit({
-                                "content": "",
-                                "thinking": "",
-                                "thinking_after": "",
-                                "tool_step": captured_tool_step,
-                                "rfq_draft": draft,
-                                "readiness": readiness,
-                                "created_rfq": None,
-                                "counterparty_message": counterparty_msg_obj,
-                                "done": False,
-                            })
-                        elif tc_name == "close_rfq":
-                            rfq_arg = raw_args.get("rfq_id")
-                            closed_rfq_obj, err = await execute_close_rfq_call(
-                                rfq_id_str=rfq_arg, conversation=conversation, db=db, user=user
-                            )
-                            captured_tool_step = {
-                                "name": "close_rfq",
-                                "title": "Closing Marketplace RFQ",
-                                "status": "completed" if closed_rfq_obj else "failed",
-                                "args": (
-                                    {"title": closed_rfq_obj["title"], "id": closed_rfq_obj["id"]}
-                                    if closed_rfq_obj
-                                    else {"error": err}
-                                ),
-                            }
-                            yield emit({
-                                "content": "",
-                                "thinking": "",
-                                "thinking_after": "",
-                                "tool_step": captured_tool_step,
-                                "rfq_draft": draft,
-                                "readiness": readiness,
-                                "created_rfq": None,
-                                "counterparty_message": None,
-                                "done": False,
-                            })
-                        elif tc_name == "update_rfq_draft":
-                            draft = _process_tool_call(tc, draft, **draft_guards)
-                            captured_tool_step = {
-                                "name": "update_rfq_draft",
-                                "title": "Updating RFQ Preferences & Draft",
-                                "status": "completed",
-                                "args": raw_args,
-                            }
-                            readiness = rfq_tool_service.evaluate_rfq_readiness(draft)
-                            yield emit({
-                                "content": "",
-                                "thinking": "",
-                                "thinking_after": "",
-                                "tool_step": captured_tool_step,
-                                "rfq_draft": draft,
-                                "readiness": readiness,
-                                "created_rfq": None,
-                                "counterparty_message": None,
-                                "done": False,
-                            })
+        if engine_result.llm_error and not engine_result.tool_results and not runner.touched:
+            unavail_reply = "\n\n⚠️ [Connection to local AI assistant interrupted.]"
+            await _persist_stream_terminal(reply_content=unavail_reply)
+            yield emit({
+                "content": unavail_reply,
+                "thinking": "",
+                "thinking_after": "",
+                "tool_step": None,
+                "rfq_draft": draft,
+                "readiness": readiness,
+                "created_rfq": None,
+                "counterparty_message": None,
+                "done": True,
+            })
+            return
 
-                    readiness = rfq_tool_service.evaluate_rfq_readiness(draft)
-
-                    if content_delta or thinking_delta:
-                        yield emit({
-                            "content": content_delta,
-                            "thinking": thinking_delta if not has_tool_called else "",
-                            "thinking_after": thinking_delta if has_tool_called else "",
-                            "tool_step": None,
-                            "rfq_draft": draft,
-                            "readiness": readiness,
-                            "created_rfq": None,
-                            "counterparty_message": counterparty_msg_obj,
-                            "done": False,
-                        })
-
-                    if is_done:
-                        if draft_msg_fallback and not total_content:
-                            draft_msg_text, draft_err = draft_msg_fallback
-                            formatted_reply = (
-                                f"📝 **Negotiation Message Draft:**\n\n"
-                                f"> {draft_msg_text}\n\n"
-                                f"⚠️ *Note: {draft_err}*"
-                            )
-                            total_content = formatted_reply
-                            content_replaced = True
-                            yield emit({
-                                "content": formatted_reply,
-                                "thinking": "",
-                                "thinking_after": "",
-                                "tool_step": None,
-                                "rfq_draft": draft,
-                                "readiness": readiness,
-                                "created_rfq": None,
-                                "counterparty_message": None,
-                                "done": False,
-                            })
-                        break
+        if runner.err_reply and (not total_content or runner.duplicate):
+            total_content = runner.err_reply
+        if draft_msg_fallback and not total_content:
+            draft_msg_text, draft_err = draft_msg_fallback
+            total_content = (
+                f"📝 **Negotiation Message Draft:**\n\n"
+                f"> {draft_msg_text}\n\n"
+                f"⚠️ *Note: {draft_err}*"
+            )
 
         # Guardrail recovery: the model refused a legitimate business request.
         # Recover before the fallbacks below reuse the text as a counterparty letter.
@@ -3281,7 +2941,7 @@ async def stream_business_chat_reply(
                     except Exception as exc:
                         logger.warning("Could not update truncated message in DB: %s", exc)
 
-        if content_replaced:
+        if total_content.strip() and not created_rfq_obj:
             yield emit({
                 "content": total_content,
                 "replace_content": True,

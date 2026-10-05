@@ -11,6 +11,8 @@ Adversarial testing covering:
 
 import json
 
+import uuid
+
 import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,10 +20,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from models.enums import RFQRole, RFQStatus
 from models.rfq import RFQ
 from services.agent_router import route_query_to_agent, route_query_to_agent_async
-from services.ai_chat_service import (
-    _fetch_live_marketplace_aggregates,
-    format_marketplace_aggregates_prompt,
-)
+from models.user import User
+from services import market_data_tools
+from services.answer_verifier import render_facts_answer
 from services.catalog_service import get_catalog
 from services.query_extractor import extract
 from tests.conftest import rfq_body
@@ -66,25 +67,19 @@ async def test_qa_unlisted_product_reports_zero_listings(db: AsyncSession, make_
         "and how many sellers are there can you analyze the market and tell me suitable price"
     )
 
-    # 1. Test aggregate fetching directly
-    aggs = await _fetch_live_marketplace_aggregates(
-        db=db,
-        query_text=query,
-        category="Agriculture",
-        product_name="banana",
-    )
+    viewer = await make_actor("buyer")
+    viewer_user = await db.get(User, uuid.UUID(viewer.id))
 
-    assert aggs["match_count"] == 0, f"Expected 0 matches for banana, got {aggs['match_count']}"
-    assert aggs["seller_count"] == 0
-    assert aggs["buyer_count"] == 0
-    assert aggs["min_price"] is None
-    assert aggs["max_price"] is None
+    # 1. The data tools report zero, never pulling in unrelated listings
+    found = await market_data_tools.run_tool(db, viewer_user, "search_listings", {"product": "banana", "category": "Agriculture"})
+    assert found["data"]["distinct_listings"] == 0
+    assert found["data"]["by_role"] == {"buyer": 0, "seller": 0}
+    stats = await market_data_tools.run_tool(db, viewer_user, "market_price_stats", {"product": "banana", "category": "Agriculture"})
+    assert stats["ok"] and stats["data"]["n_listings"] == 0 and "median" not in stats["data"]
 
-    # 2. Test LLM grounding prompt instruction
-    prompt_grounding = format_marketplace_aggregates_prompt(aggs)
-    assert "0 active listings found in this marketplace database for 'banana'" in prompt_grounding
-    assert "You MUST explicitly inform the user that there are currently 0 active listings" in prompt_grounding
-    assert "Do NOT invent fake seller counts" in prompt_grounding
+    # 2. The deterministic answer says so plainly and invents nothing
+    answer = render_facts_answer([found, stats], query)
+    assert "no matching data on the platform" in answer.lower()
 
 
 # =============================================================================
@@ -265,28 +260,23 @@ async def test_qa_rice_benchmark_normalises_units_and_splits_market_sides(db: As
     target price must be reported separately from sellers' asking prices."""
     await _seed_rice_market(make_actor)
 
-    aggs = await _fetch_live_marketplace_aggregates(
-        db=db, query_text=SUPPLY_RICE_QUERY, category="Agriculture", product_name="rice"
-    )
+    viewer = await make_actor("buyer")
+    viewer_user = await db.get(User, uuid.UUID(viewer.id))
 
-    assert aggs["seller_count"] == 3
-    assert aggs["buyer_count"] == 1
-    assert aggs["price_unit"] == "tonne"
-    assert aggs["excluded_price_count"] == 0
-    assert aggs["seller_prices"] == {"count": 3, "min": 64353.0, "max": 92000.0, "avg": pytest.approx(75451.0)}
-    assert aggs["buyer_prices"]["min"] == 95000.0
+    sellers = await market_data_tools.market_price_stats(db, user=viewer_user, product="rice", role="seller")
+    d = sellers["data"]
+    assert d["n_listings"] == 3
+    assert d["unit_basis"] == "tonne" and d["excluded_price_count"] == 0
+    assert (d["min"], d["max"]) == (64353.0, 92000.0)
+    assert d["median"] == 70000.0  # the kg listing is restated per tonne
+    # all three come from one account: too thin to call a market range
+    assert d["n_distinct_users"] == 1 and "sample_warning" in d
 
-    prompt = format_marketplace_aggregates_prompt(aggs)
-    assert "Buyers' Target Prices: ₹95,000.00 per tonne" in prompt
-    assert "There ARE 1 active buyer RFQ(s) for 'rice'" in prompt
+    buyers = await market_data_tools.market_price_stats(db, user=viewer_user, product="rice", role="buyer")
+    assert buyers["data"]["n_listings"] == 1 and buyers["data"]["min"] == 95000.0
 
-
-@pytest.mark.asyncio
-async def test_qa_aggregates_skip_messages_without_a_product(db: AsyncSession):
-    """A follow-up with no product must not be benchmarked as "0 listings for '<sentence>'"."""
-    aggs = await _fetch_live_marketplace_aggregates(db=db, query_text=BUYER_FOLLOWUP_QUERY)
-    assert aggs == {}
-    assert format_marketplace_aggregates_prompt(aggs) == ""
+    counts = await market_data_tools.search_listings(db, user=viewer_user, product="rice")
+    assert counts["data"]["by_role"] == {"buyer": 1, "seller": 3}
 
 
 def test_qa_buyer_details_followup_is_not_a_product():

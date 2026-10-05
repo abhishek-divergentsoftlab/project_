@@ -225,9 +225,11 @@ class ConversationalQAEvaluationEngine:
                 found_bad = [t for t in bad_tokens if t in extracted_prod.lower()]
 
                 # Test DB Aggregates with extracted product
-                aggs = await ai_chat_service._fetch_live_marketplace_aggregates(db, query_text=user_msg, product_name=req.product)
-                match_count = aggs.get("match_count", 0)
-                avg_price = aggs.get("avg_price")
+                from services import market_data_tools
+
+                stats = await market_data_tools.market_price_stats(db, user=None, product=req.product)
+                match_count = stats["data"].get("n_listings", 0)
+                avg_price = stats["data"].get("median")
 
                 # Sanity: if the product is Appy Fizz (price ~18), average price MUST NOT be thousands
                 price_distortion = False
