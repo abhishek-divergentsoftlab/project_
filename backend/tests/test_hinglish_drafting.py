@@ -160,3 +160,21 @@ async def test_moong_without_tool_call_still_gets_drafting_fallback(client, make
     assert FACTS_ONLY not in data["reply"]
     assert data["rfq_draft"]["role"] == "buyer"
     assert "kharidna" in data["reply"]
+
+
+# ---- product grounding through synonyms --------------------------------------
+
+def _prod(product, message, as_written=None):
+    return ground({"product": product, "product_as_written": as_written}, message).product
+
+
+def test_local_word_grounds_english_product_without_as_written():
+    assert _prod("turmeric", "hamare paas 200 bori haldi padi hai, bechni hai") == "turmeric"
+
+
+def test_sabut_moong_to_moong_beans_is_kept():
+    assert _prod("moong beans", MOONG) == "moong beans"
+
+
+def test_invented_product_is_still_dropped():
+    assert _prod("saffron", "hamare paas 200 bori haldi padi hai, bechni hai") is None

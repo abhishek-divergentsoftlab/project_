@@ -90,7 +90,7 @@ _SCHEMA: dict[str, Any] = {
         "deadline_days": {"type": ["integer", "null"]},
         "unknown_terms": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["role", "role_evidence", "intent", "product", "category"],
+    "required": ["role", "role_evidence", "intent", "product", "product_as_written", "category"],
 }
 
 
@@ -105,7 +105,7 @@ Return ONE JSON object with these fields (null when the message does not say):
 - role: "seller" if the user has goods to offer/sell/clear, "buyer" if they want to buy/source/get a quote, else null.
 - role_evidence: the EXACT words copied from the message that show the role, else null.
 - intent: short free label such as search, sell_offer, buy_request, price_check, market_research, logistics, verification, negotiation, chitchat, other.
-- product: canonical English name of the goods; product_as_written: the span exactly as written in the message.
+- product: canonical English name of the goods; product_as_written: the span exactly as written in the message. product_as_written is REQUIRED whenever product is set: the exact words from the message.
 - category: known categories: {json.dumps(known_categories, ensure_ascii=False)}. Choose one if it fits, otherwise propose a short new category name.
 - attributes: object of any key to value (color, material, grade, size, certification, packaging, origin, anything stated).
 - negated_attributes: attributes the user rejected ("not red", "no plastic").

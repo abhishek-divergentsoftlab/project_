@@ -174,7 +174,16 @@ def _product_grounded(product: str, as_written: Optional[str], message: str) -> 
     if written and written in lowered:
         return True
     msg_tokens = _tokens(message)
-    return bool((_tokens(as_written or "") | _tokens(product)) & msg_tokens)
+    if (_tokens(as_written or "") | _tokens(product)) & msg_tokens:
+        return True
+    # A known local word for the product ("haldi" for "turmeric") grounds it too.
+    from services import product_synonyms
+
+    canon_tokens = _tokens(product_synonyms.canonicalise_text(message))
+    product_tokens = _tokens(product)
+    if product_tokens and product_tokens <= canon_tokens:
+        return True
+    return bool({v for t in [product, *product.split()] for v in product_synonyms.variants(t)} & (msg_tokens | canon_tokens))
 
 
 def _attribute_key(key: Any) -> Optional[str]:
