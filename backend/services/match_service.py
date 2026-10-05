@@ -36,7 +36,7 @@ from models.user import User
 from schemas.common import DeadlineOut, Location, Money, Quantity
 from schemas.match import Counterparty, MatchCandidate, MatchResponse, MatchScore
 from core.config import settings
-from services import categories, match_scoring, product_synonyms, qdrant_index
+from services import hsn_service, categories, match_scoring, product_synonyms, qdrant_index
 from services.embeddings import embed_one
 from services.query_extractor import is_broad_product
 from services.rfq_indexing import build_match_text
@@ -599,8 +599,8 @@ def _score(
 
         # Dynamic Open-World Commodity Resolution (HSN + Vector Embedding Fallback)
         hsn_or_dynamic_match = False
-        r_hsn = (rfq.product_details or {}).get("hsn_code") or (rfq.product_details or {}).get("hsn")
-        c_hsn = (candidate.product_details or {}).get("hsn_code") or (candidate.product_details or {}).get("hsn")
+        r_hsn = hsn_service.resolve_hsn(rfq.product_details, req_prod)
+        c_hsn = hsn_service.resolve_hsn(candidate.product_details, cand_name)
         if r_hsn and c_hsn:
             h_sim = match_scoring.hsn_score(str(r_hsn), str(c_hsn))
             if h_sim is not None and h_sim >= 0.85:

@@ -179,3 +179,15 @@ async def test_find_matches_runs_and_finds_the_counterparty(db, make_actor):
     res = await tools.find_matches(db, user=me, rfq_id=str(wanted.id))
     assert res["ok"], res["notes"]
     assert res["data"]["total_matches"] >= 1
+
+
+async def test_price_stats_expose_fx_provenance_and_static_note(db, make_actor):
+    viewer = await make_actor("buyer")
+    for cur, p in (("INR", 100), ("USD", 2)):
+        seller = await make_actor("seller")
+        await seed(db, seller, title="Fx widget lot", role=RFQRole.SELLER, price=p, per_unit="pcs", qty=10, currency=cur)
+    stats = await tools.market_price_stats(db, user=await _user(db, viewer), product="fx widget")
+    assert stats["data"]["fx_source"] == "static"
+    assert stats["data"]["fx_as_of"]
+    assert stats["data"]["converted_currency_count"] >= 1
+    assert any("static baseline FX" in n for n in stats["notes"])

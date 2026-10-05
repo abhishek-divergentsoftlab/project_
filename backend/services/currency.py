@@ -1,9 +1,10 @@
 """Currency conversion: the single FX table used across the platform.
 
-The rates below are a static baseline table; there is no live FX feed wired in
-yet. ``get_rates_info`` says so honestly: ``source`` is ``"static"`` and
-``as_of`` is the date the baseline was compiled, until something calls
-``update_rates`` (which records its own timestamp and source).
+The rates below are a static baseline table, refreshed from the ECB-based
+Frankfurter feed by the scheduler (``fetch_live_rates``). ``get_rates_info``
+says honestly where they came from: ``source`` is ``"static"`` and ``as_of`` is
+the date the baseline was compiled until a refresh succeeds; ``update_rates``
+records its own timestamp and source.
 Conversion is deliberately explicit: an unknown currency returns None rather
 than being assumed to be the base.
 """
@@ -260,7 +261,7 @@ def update_rates(
     for code, rate in new_rates.items():
         try:
             val = Decimal(str(rate))
-            if val > 0 and val.is_finite():
+            if val.is_finite() and val > 0:
                 RATES[code.upper()] = val
                 changed = True
         except Exception:
@@ -313,30 +314,34 @@ def convert(amount: Any, source: str, target: str) -> Optional[Decimal]:
 
 
 async def fetch_live_rates() -> bool:
-    """Fetch live exchange rates from European Central Bank / Frankfurter public feed.
+    """Fetch ECB-based rates (Frankfurter) and apply them with ``update_rates``.
 
-    Updates working RATES table dynamically without blocking or failing if offline.
+    On any failure (network, HTTP status, bad payload) the last good rates and
+    their as_of/source are left untouched and False is returned.
     """
-    import asyncio
-    import json
     import logging
-    import urllib.request
-    
-    url = "https://api.frankfurter.app/latest?from=USD"
-    req = urllib.request.Request(url, headers={"User-Agent": "B2BMarketplace/1.0"})
-    
-    def _fetch_sync():
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            return json.loads(resp.read())
 
+    import httpx
+
+    log = logging.getLogger(__name__)
     try:
-        data = await asyncio.to_thread(_fetch_sync)
-        live_rates = data.get("rates", {})
-        if live_rates:
-            update_rates(live_rates, source="live_ecb_frankfurter")
-            return True
+        async with httpx.AsyncClient(timeout=5.0, headers={"User-Agent": "B2BMarketplace/1.0"}) as client:
+            resp = await client.get("https://api.frankfurter.app/latest?from=USD")
+            resp.raise_for_status()
+            live_rates = resp.json().get("rates") or {}
+        valid: dict[str, Decimal] = {}
+        for code, rate in live_rates.items():
+            try:
+                val = Decimal(str(rate))
+            except Exception:
+                continue
+            if val.is_finite() and val > 0 and isinstance(code, str) and len(code) == 3:
+                valid[code.upper()] = val
+        if not valid:
+            log.warning("FX refresh returned no usable rates; keeping previous rates")
+            return False
+        update_rates(valid, source="live_ecb_frankfurter")
+        return True
     except Exception as exc:
-        # Gracefully preserve cached/baseline rates if network is offline
-        pass
-    return False
-
+        log.warning("FX refresh failed (%s); keeping previous rates", exc)
+        return False

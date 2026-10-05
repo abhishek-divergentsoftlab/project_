@@ -20,7 +20,7 @@ Mathematical Compatibility:
 import json
 import logging
 import re
-import urllib.request
+from collections import OrderedDict
 from functools import lru_cache
 from typing import Any, Optional
 
@@ -221,46 +221,90 @@ _COMMON_HEADING_KEYWORDS: dict[str, str] = {
 
 @lru_cache(maxsize=10000)
 def predict_hsn_from_text(text: str) -> Optional[str]:
-    """Dynamically predict the 4-digit or 6-digit HSN code from text.
+    """Deterministic HSN prediction from the keyword table only: no network, no LLM.
 
-    1. Checks fast keyword pattern table.
-    2. Falls back to local Ollama LLM customs classifier when available.
+    Safe to call from match scoring. For open-world products use
+    ``classify_hsn_with_ai`` at listing-save time and store the result.
     """
     if not text:
         return None
     cleaned = text.strip().lower()
-
-    # 1. Fast keyword detection (match longer, more specific phrases first)
+    # Longer, more specific phrases first.
     for kw in sorted(_COMMON_HEADING_KEYWORDS.keys(), key=len, reverse=True):
         if re.search(rf"\b{re.escape(kw)}\b", cleaned):
             return _COMMON_HEADING_KEYWORDS[kw]
-
-    # 2. Dynamic Local LLM Zero-Shot Classifier
-    try:
-        prompt = (
-            f"You are a World Customs Organization trade classifier. "
-            f"What is the standard 4-digit or 6-digit Harmonized System (HS / HSN) code "
-            f"for this product: '{text[:200]}'? "
-            f"Respond with ONLY a JSON object: {{\"hsn_code\": \"<digits_only>\"}}"
-        )
-        req = urllib.request.Request(
-            f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/generate",
-            data=json.dumps({
-                "model": "qwen2.5:1.5b",
-                "prompt": prompt,
-                "stream": False,
-                "format": "json",
-                "options": {"temperature": 0.0},
-            }).encode(),
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            data = json.loads(resp.read())
-            raw_res = json.loads(data.get("response", "{}"))
-            hsn = normalize_hsn(raw_res.get("hsn_code"))
-            if hsn and len(hsn) >= 4:
-                return hsn
-    except Exception as exc:
-        logger.debug("dynamic LLM HSN prediction skipped: %s", exc)
-
     return None
+
+
+_AI_HSN_CACHE_SIZE = 2000
+_ai_hsn_cache: "OrderedDict[str, Optional[str]]" = OrderedDict()
+
+
+def valid_ai_hsn(raw: Any) -> Optional[str]:
+    """A model-proposed HSN is kept only if it is 4+ digits and its chapter exists."""
+    hsn = normalize_hsn(raw)
+    if not hsn or len(hsn) < 4 or hsn[:2] not in HS_CHAPTERS:
+        return None
+    return hsn
+
+
+async def classify_hsn_with_ai(text: str) -> Optional[str]:
+    """LLM HSN classification via local Ollama. Never raises; None when unsure or disabled.
+
+    Results (including misses) are cached in an LRU. Not for use in scoring.
+    """
+    if not text or not text.strip() or not getattr(settings, "HSN_AI_ENABLED", False):
+        return None
+    key = text.strip().lower()[:200]
+    if key in _ai_hsn_cache:
+        _ai_hsn_cache.move_to_end(key)
+        return _ai_hsn_cache[key]
+    result: Optional[str] = None
+    try:
+        import httpx
+
+        model = (
+            getattr(settings, "HSN_AI_MODEL", "")
+            or getattr(settings, "AI_ROUTER_MODEL", "")
+            or "qwen2.5:1.5b"
+        )
+        prompt = (
+            "You are a World Customs Organization trade classifier. "
+            "What is the standard 4-digit or 6-digit Harmonized System (HS / HSN) code "
+            f"for this product: '{key}'? "
+            'Respond with ONLY a JSON object: {"hsn_code": "<digits_only>"}'
+        )
+        timeout = float(getattr(settings, "HSN_AI_TIMEOUT_SECONDS", 3.0))
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(
+                f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/generate",
+                json={
+                    "model": model, "prompt": prompt, "stream": False,
+                    "format": "json", "options": {"temperature": 0.0},
+                },
+            )
+            resp.raise_for_status()
+            raw_res = json.loads(resp.json().get("response", "{}"))
+        result = valid_ai_hsn(raw_res.get("hsn_code"))
+    except Exception as exc:
+        logger.debug("AI HSN classification skipped: %s", exc)
+        return None  # transient failure: do not cache
+    _ai_hsn_cache[key] = result
+    if len(_ai_hsn_cache) > _AI_HSN_CACHE_SIZE:
+        _ai_hsn_cache.popitem(last=False)
+    return result
+
+
+def stored_hsn(product_details: Optional[dict]) -> Optional[str]:
+    """The HSN already stored on a listing (``hsn_code`` or ``hsn``), if valid."""
+    pd = product_details or {}
+    for key in ("hsn_code", "hsn"):
+        hsn = normalize_hsn(pd.get(key)) if pd.get(key) else None
+        if hsn and len(hsn) >= 4:
+            return hsn
+    return None
+
+
+def resolve_hsn(product_details: Optional[dict], text: str) -> Optional[str]:
+    """Stored HSN first, else the deterministic keyword prediction. Never the LLM."""
+    return stored_hsn(product_details) or predict_hsn_from_text(text)

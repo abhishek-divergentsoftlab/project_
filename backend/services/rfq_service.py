@@ -8,6 +8,8 @@ hold on every single write:
    the row can never be silently out of step with the vector index.
 """
 
+import asyncio
+import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Optional, Sequence
@@ -20,7 +22,7 @@ from models.rfq import RFQ
 from models.user import User
 from schemas.common import DeadlineOut, Location, Money, Quantity
 from schemas.rfq import RFQCreate, RFQOut, RFQUpdate
-from services import locations, qdrant_index
+from services import hsn_service, locations, qdrant_index
 from services.categories import normalize_category
 from services.embeddings import embed_one
 from services.moderation_service import AIContentModerator
@@ -216,6 +218,29 @@ def _geocode(rfq: RFQ) -> None:
         rfq.location_country = city.country
 
 
+logger = logging.getLogger(__name__)
+HSN_AI_TIMEOUT = 3.0
+
+
+async def _ensure_hsn(rfq: RFQ) -> None:
+    """Best-effort: store an AI-classified HSN on a listing that has none.
+
+    Never raises and never blocks longer than a short timeout; on any failure
+    nothing is stored. The result is marked ``hsn_source = "ai"``.
+    """
+    try:
+        pd = rfq.product_details or {}
+        # A user-supplied HSN is never overwritten; an earlier AI one is refreshed.
+        if hsn_service.stored_hsn(pd) and pd.get("hsn_source") != "ai":
+            return
+        text = " ".join(p for p in (rfq.title, rfq.description) if p)[:200]
+        hsn = await asyncio.wait_for(hsn_service.classify_hsn_with_ai(text), timeout=HSN_AI_TIMEOUT)
+        if hsn:
+            rfq.product_details = {**(rfq.product_details or {}), "hsn_code": hsn, "hsn_source": "ai"}
+    except Exception as exc:  # includes timeout
+        logger.debug("HSN auto-classification skipped: %s", exc)
+
+
 async def create_rfq(db: AsyncSession, user: User, payload: RFQCreate) -> RFQ:
     if payload.status not in (RFQStatus.DRAFT, RFQStatus.ACTIVE):
         raise RFQError("a new RFQ may only be created as 'draft' or 'active'")
@@ -254,6 +279,7 @@ async def create_rfq(db: AsyncSession, user: User, payload: RFQCreate) -> RFQ:
     rfq.expires_at = rfq.deadline_at or datetime.now(UTC) + timedelta(days=DEFAULT_TTL_DAYS)
 
     refresh_index_fields(rfq)
+    await _ensure_hsn(rfq)
 
     db.add(rfq)
     await db.commit()
@@ -329,6 +355,7 @@ async def update_rfq(db: AsyncSession, rfq: RFQ, payload: RFQUpdate) -> RFQ:
     # Any edit can change what the embedding should encode, so it is always
     # recomputed rather than guessed at field by field.
     refresh_index_fields(rfq)
+    await _ensure_hsn(rfq)
 
     await db.commit()
     await db.refresh(rfq)

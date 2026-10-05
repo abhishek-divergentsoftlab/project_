@@ -24,6 +24,10 @@ try:  # ISO 4217 registry instead of a hand-kept currency list.
     import pycountry
 except Exception:  # pragma: no cover - optional dependency
     pycountry = None
+    logger.warning(
+        "pycountry is not installed: currency codes are only shape-checked (3 letters), "
+        "not validated against ISO 4217. Install pycountry for strict validation."
+    )
 
 
 class AIParse(BaseModel):
