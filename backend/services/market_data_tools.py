@@ -583,17 +583,15 @@ async def estimate_freight(
     mode: Optional[str] = None,
     **_: Any,
 ) -> dict[str, Any]:
-    """Distance and the platform freight calculator's output, labelled as an estimate.
+    """Route distance only; the platform has no verified freight rates.
 
-    ``logistics_service.estimate_freight_rates`` is the platform's own formula
-    (the same one behind its freight-estimate endpoint), not a carrier quote or
-    market data. Without a weight only the distance is returned; unknown places
-    are refused rather than guessed.
+    ``logistics_service.estimate_freight_rates`` prices freight from typed-in
+    constants, not carrier data, so its numbers must never reach a user as
+    fact. Weight and mode are accepted so the model can ask, but the answer is
+    always "no verified rates; request a quote". Unknown places are refused.
     """
-    from fastapi import HTTPException
-
-    from schemas.logistics import FreightEstimateRequest
     from services import logistics_service
+    from services.match_scoring import haversine_km
 
     args = _query_args(origin=origin, destination=destination, weight_kg=weight_kg, mode=mode)
     if not origin or not destination:
@@ -603,52 +601,19 @@ async def estimate_freight(
         o_lat, o_lon = logistics_service._get_city_coords(origin, "")
         d_lat, d_lon = logistics_service._get_city_coords(destination, "")
     except logistics_service.UnknownLocationError as exc:
-        return _error("estimate_freight", args, f"{exc}; freight not available for places the platform cannot locate")
-    from services.match_scoring import haversine_km
+        return _error("estimate_freight", args, f"{exc}; distance not available for places the platform cannot locate")
 
     distance = max(50.0, haversine_km(o_lat, o_lon, d_lat, d_lon) * 1.25)
     facts = _Facts()
-    facts.add("route distance (platform estimate)", round(distance), "km")
-    data: dict[str, Any] = {"origin": origin, "destination": destination, "distance_km": round(distance)}
-    notes = ["Distance is straight-line x1.25 as computed by the platform, not a driving route."]
-
-    weight = _num(weight_kg)
-    if weight is None or weight <= 0:
-        notes.append("No weight given, so no freight rate was calculated; freight rates not available without a weight.")
-        return _result("estimate_freight", args, data=data, facts=facts, notes=notes)
-
-    try:
-        estimate = logistics_service.estimate_freight_rates(
-            FreightEstimateRequest(
-                origin_city=origin, destination_city=destination,
-                origin_country="India", destination_country="India",
-                weight_kg=Decimal(str(weight)), currency="INR",
-            )
-        )
-    except HTTPException as exc:
-        return _error("estimate_freight", args, f"freight not available: {exc.detail}")
-    except Exception as exc:  # validation or unexpected: surface, never invent
-        return _error("estimate_freight", args, f"freight rates not available on platform ({exc})")
-
-    options = []
-    for opt in estimate.rate_options:
-        if mode and (opt.mode or "").lower() != mode.strip().lower():
-            continue
-        options.append({
-            "mode": opt.mode, "name": opt.mode_name, "amount": float(opt.rate_amount),
-            "currency": opt.currency, "transit_days_min": opt.transit_days_min,
-            "transit_days_max": opt.transit_days_max, "basis": opt.basis,
-        })
-        facts.add(f"{opt.mode} freight estimate for {weight:g} kg", float(opt.rate_amount), opt.currency)
-        facts.add(f"{opt.mode} transit days (min)", opt.transit_days_min, "days")
-        facts.add(f"{opt.mode} transit days (max)", opt.transit_days_max, "days")
-    data["weight_kg"] = weight
-    data["options"] = options
-    notes.append(
-        "Rates are the platform's formula-based estimates for a domestic (India) route, not carrier quotes."
-    )
-    if mode and not options:
-        notes.append(f"No '{mode}' option is produced for this route.")
+    facts.add("approximate route distance", round(distance), "km")
+    data: dict[str, Any] = {
+        "origin": origin, "destination": destination, "distance_km": round(distance),
+        "freight_rates_available": False,
+    }
+    notes = [
+        "Distance is straight-line x1.25, not a driving route.",
+        "No verified freight rates on the platform; ask a logistics partner or carrier for a quote.",
+    ]
     return _result("estimate_freight", args, data=data, facts=facts, notes=notes)
 
 
@@ -771,8 +736,8 @@ READ_TOOL_SCHEMAS: list[dict[str, Any]] = [
     ),
     _fn(
         "estimate_freight",
-        "Distance between two places and the platform's formula-based freight estimate for a weight. Returns "
-        "'not available' if the places or weight are unknown. Not a carrier quote.",
+        "Approximate route distance between two places. The platform has no verified freight rates, so this "
+        "never returns a price; tell the user to request a quote from a logistics partner.",
         {"origin": _S, "destination": _S, "weight_kg": {"type": "number"}, "mode": {**_S, "enum": ["road", "ocean", "air"]}},
         ["origin", "destination"],
     ),

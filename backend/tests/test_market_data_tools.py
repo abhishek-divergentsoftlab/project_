@@ -157,9 +157,12 @@ async def test_freight_never_invents_unknown_places(db, make_actor):
     me_user = await _user(db, me)
     res = await tools.estimate_freight(db, user=me_user, origin="Qwertyville", destination="Indore", weight_kg=100)
     assert res["ok"] is False
-    dist_only = await tools.estimate_freight(db, user=me_user, origin="Indore", destination="Pune")
+    # Even with a weight, only distance comes back: the platform has no verified rates.
+    dist_only = await tools.estimate_freight(db, user=me_user, origin="Indore", destination="Pune", weight_kg=500)
     assert dist_only["ok"] and "options" not in dist_only["data"]
-    assert any("weight" in n for n in dist_only["notes"])
+    assert dist_only["data"]["freight_rates_available"] is False
+    assert {f["unit"] for f in dist_only["facts"]} == {"km"}
+    assert any("quote" in n for n in dist_only["notes"])
 
 
 async def test_schemas_cover_every_tool():

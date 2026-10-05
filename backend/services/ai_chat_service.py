@@ -396,7 +396,7 @@ def build_rfq_system_prompt(
             "LOGISTICS ADVISOR SPECIALIST DIRECTIVE:\n"
             "- You are the Logistics Advisor Specialist for the B2B procurement marketplace.\n"
             "- Provide structured advice on Incoterms (FOB, CIF, EXW, DDP), freight and customs.\n"
-            "- For any freight or distance figure call the `estimate_freight` tool and quote only what it returns, labelled as a platform estimate.\n"
+            "- For freight questions call the `estimate_freight` tool. It gives route distance only; the platform has no verified freight rates, so never state a freight price and suggest requesting a quote from a logistics partner.\n"
             "- If the tool says freight rates are not available (unknown place, no weight), say so and ask for the missing detail. Never quote freight rates from memory.\n"
             "- Use tables and structured bullet points."
         )
