@@ -589,8 +589,9 @@ async def test_ai_chat_stream_persistence(client: AsyncClient, make_actor):
 
 @pytest.mark.asyncio
 async def test_match_query_intent_detection():
-    """Verify match query intent detector correctly identifies counterparty inquiry phrases."""
-    from services.rfq_tool_service import check_match_query_intent, preprocess_message_to_rfq
+    """Counterparty look-ups are information requests (outage fallback labels them), never RFQ details."""
+    from services.chat_permissions import is_information_request as check_match_query_intent
+    from services.rfq_tool_service import preprocess_message_to_rfq
 
     # Positive matches
     assert check_match_query_intent("give me mail id of top three") is True
@@ -1116,8 +1117,9 @@ def test_is_truncated_message_detection():
 
 
 def test_analysis_query_intent_detection():
-    """Verify check_analysis_query_intent catches listing analysis, price benchmark, and advisory queries."""
-    from services.rfq_tool_service import check_analysis_query_intent, preprocess_message_to_rfq
+    """Listing analysis, price benchmark and advisory queries are information requests, never RFQ drafts."""
+    from services.chat_permissions import is_information_request as check_analysis_query_intent
+    from services.rfq_tool_service import preprocess_message_to_rfq
 
     analysis_prompts = [
         'Analyze this buyer listing for "Need 115,300 pcs of white cotton t-shirt — 140, cotton-poly 60/40" in category "Textiles". Price is TRY 159 / pcs, quantity 115,300 pcs. How does this compare with typical market conditions?',
@@ -1127,9 +1129,11 @@ def test_analysis_query_intent_detection():
         "How competitive is the corrugated box market? Show me supplier density by region.",
         "What is the difference between FOB, CIF, and EXW shipping terms?",
         "What are the key supplier KYC and verification checks?",
-        "How can I negotiate better payment terms with a supplier?",
         "Is my asking price competitive compared to similar listings?",
     ]
+
+    # Advice on negotiating is labelled "negotiation", not a lookup, but must still not pollute the draft.
+    assert preprocess_message_to_rfq("How can I negotiate better payment terms with a supplier?") == {}
 
     for p in analysis_prompts:
         assert check_analysis_query_intent(p) is True, f"Failed for prompt: {p}"
@@ -1150,7 +1154,7 @@ def test_analysis_query_intent_detection():
 
 
 def test_analysis_query_system_prompt_directive():
-    """Verify build_rfq_system_prompt provides market analysis directive when is_analysis_query=True."""
+    """Without the draft tool the prompt answers from data; with it, it collects RFQ details."""
     from services.ai_chat_service import build_rfq_system_prompt
     from services.rfq_tool_service import evaluate_rfq_readiness
 
@@ -1158,13 +1162,13 @@ def test_analysis_query_system_prompt_directive():
     readiness = evaluate_rfq_readiness(empty_draft)
 
     # Standard non-analysis prompt demands Buy or Sell role
-    standard_prompt = build_rfq_system_prompt(empty_draft, readiness, is_analysis_query=False)
-    assert "Ask the user in ONE brief sentence whether they want to BUY or SELL goods" in standard_prompt
+    standard_prompt = build_rfq_system_prompt(empty_draft, readiness, allowed_tools={"update_rfq_draft"})
+    assert "Ask in ONE brief sentence whether the user wants to BUY or SELL goods" in standard_prompt
 
     # Analysis prompt gives market analysis directive without forcing Buy/Sell
-    analysis_prompt = build_rfq_system_prompt(empty_draft, readiness, is_analysis_query=True)
-    assert "MARKET ANALYSIS & BENCHMARKING DIRECTIVE" in analysis_prompt
-    assert "Do NOT prompt the user to specify Buy/Sell or create an RFQ" in analysis_prompt
+    analysis_prompt = build_rfq_system_prompt(empty_draft, readiness, allowed_tools=set())
+    assert "Do not ask whether they want to buy or sell" in analysis_prompt
+    assert "update_rfq_draft" not in analysis_prompt
     assert "Market Analysis / Advisory Inquiry" in analysis_prompt
 
 
@@ -1231,68 +1235,56 @@ async def test_ai_chat_message_analysis_query_bypasses_tools(client: AsyncClient
         assert not offered & {"create_rfq", "update_rfq_draft", "close_rfq", "draft_counterparty_message"}
         # Dynamic system prompt must contain analysis directive
         sys_msg = captured_payloads[0]["messages"][0]["content"]
-        assert "MARKET ANALYSIS & BENCHMARKING DIRECTIVE" in sys_msg
+        assert "Do not ask whether they want to buy or sell" in sys_msg
         assert "TRUTH RULES" in sys_msg and "GROUND TRUTH VERIFIED" not in sys_msg
         # RFQ draft is not populated with corrupted listing text
         assert data["rfq_draft"] == {}
 
 
-@pytest.mark.asyncio
-async def test_super_agent_autonomous_routing():
-    """Verify the Super Agent router accurately identifies intents and provisions correct delegates and tools."""
-    from services.agent_router import route_query_to_agent
+def test_super_agent_autonomous_routing():
+    """Intent picks the shown agent (outage fallback here, parser disabled); the gate grants only explicit writes."""
+    from services.agent_router import _fallback_intent, agent_for_intent
+    from services.chat_permissions import allowed_action_tools
 
-    # 1. Market Research routing
-    agent, tools, meta = route_query_to_agent("What does the rice market look like? How many active sellers exist?")
-    assert agent.id == "market_research"
-    assert meta["action_intents"]["is_pure_analysis"] is True
-    assert tools == []
+    def route(msg):
+        return agent_for_intent(_fallback_intent(msg))[0], allowed_action_tools(msg, None, None, None)
 
-    # 2. Logistics routing
-    agent, tools, meta = route_query_to_agent("Explain FOB vs CIF shipping terms for export to Dubai")
-    assert agent.id == "logistics"
-    assert meta["action_intents"]["is_pure_analysis"] is True
-    assert tools == []
+    # 1-3. Lookups and advice: right badge, no write tools
+    for msg, agent_id in [
+        ("What does the rice market look like? How many active sellers exist?", "market_research"),
+        ("Explain FOB vs CIF shipping terms for export to Dubai", "logistics"),
+        ("What KYC documents and GST checks should I verify?", "verification"),
+    ]:
+        agent, allowed = route(msg)
+        assert agent.id == agent_id
+        assert allowed == set()
 
-    # 3. Verification routing
-    agent, tools, meta = route_query_to_agent("What KYC documents and GST checks should I verify?")
-    assert agent.id == "verification"
-    assert meta["action_intents"]["is_pure_analysis"] is True
-    assert tools == []
-
-    # 4. Negotiation routing
-    agent, tools, meta = route_query_to_agent("Help me compose a counter-offer to negotiate a 15% discount on price")
+    # 4. Negotiation: asking for help composing an offer does not unlock the message tool...
+    agent, allowed = route("Help me compose a counter-offer to negotiate a 15% discount on price")
     assert agent.id == "negotiation"
-    tool_names = [t["function"]["name"] for t in tools]
-    assert "draft_counterparty_message" in tool_names
+    assert "create_rfq" not in allowed
+    # ...but telling the assistant to write to the counterparty does.
+    assert "draft_counterparty_message" in allowed_action_tools("Send a message to the seller asking for 15% off", None, None, None)
 
-    # 5. RFQ Drafting routing
-    agent, tools, meta = route_query_to_agent("I want to buy 500 tons of Basmati rice in Indore")
-    assert agent.id == "rfq_drafting"
-    tool_names = [t["function"]["name"] for t in tools]
-    assert "update_rfq_draft" in tool_names
-    assert "create_rfq" not in tool_names
+    # 5. RFQ drafting: details unlock the draft tool but never create
+    agent, allowed = route("I want to buy 500 tons of Basmati rice in Indore")
+    assert agent.id in ("rfq_drafting", "market_research")
+    assert "update_rfq_draft" in allowed and "create_rfq" not in allowed
 
-    # Explicit creation request provisions create_rfq
-    agent_pub, tools_pub, meta_pub = route_query_to_agent("Please publish and create the RFQ now")
-    tool_names_pub = [t["function"]["name"] for t in tools_pub]
-    assert "create_rfq" in tool_names_pub
+    # Explicit creation request unlocks create_rfq
+    assert "create_rfq" in route("Please publish and create the RFQ now")[1]
 
 
 @pytest.mark.asyncio
 async def test_combined_action_intent_preserves_rfq_tools():
-    """Verify that combined queries (e.g. price analysis + create RFQ) preserve RFQ tools and do not dead-end."""
-    from services.agent_router import route_query_to_agent
+    """A combined request (compare, then create an RFQ) keeps the create and draft tools; it does not dead-end."""
+    from services.agent_router import _fallback_intent, agent_for_intent
+    from services.chat_permissions import allowed_action_tools
 
-    agent, tools, meta = route_query_to_agent(
-        "Compare the top 3 suppliers and create an RFQ for the cheapest one",
-        matched_candidates=[{"rfq_id": "test-1"}, {"rfq_id": "test-2"}],
-    )
-    assert agent.id == "price_analyst"
-    tool_names = [t["function"]["name"] for t in tools]
-    assert "create_rfq" in tool_names
-    assert "update_rfq_draft" in tool_names
-    assert meta["action_intents"]["requires_create_rfq"] is True
+    msg = "Compare the top 3 suppliers and create an RFQ for the cheapest one"
+    allowed = allowed_action_tools(msg, None, None, None)
+    assert "create_rfq" in allowed and "update_rfq_draft" in allowed
+    assert agent_for_intent(_fallback_intent(msg))[0].id in ("price_analyst", "market_research")
 
 
 @pytest.mark.asyncio

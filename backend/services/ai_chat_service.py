@@ -14,7 +14,8 @@ import asyncio
 import json
 import logging
 import re
-from typing import Any, Optional, Union
+from dataclasses import dataclass
+from typing import Any, AsyncIterator, Optional, Union
 import uuid
 
 import httpx
@@ -28,7 +29,8 @@ from models.user import User
 from services import answer_engine, rfq_tool_service
 from services.answer_engine import AnswerContext
 from services.agent_registry import AgentDefinition, GENERAL_ASSISTANT
-from services.agent_router import route_query_to_agent, route_query_to_agent_async
+from services import ai_query_parser, chat_permissions
+from services.agent_router import agent_for_intent, agent_for_tools, agent_info
 
 logger = logging.getLogger(__name__)
 
@@ -299,13 +301,25 @@ def _sanitize_untrusted_prompt_text(text: Any, max_len: int = 120) -> str:
     return s
 
 
+_AGENT_ROLE_HINTS: dict[str, str] = {
+    "market_research": "Focus: marketplace research. Compare listings in short tables built from tool results.",
+    "price_analyst": "Focus: price comparison. Normalise currencies and per-unit cost from tool results only.",
+    "negotiation": "Focus: negotiation. Keep a polite, commercially persuasive tone.",
+    "logistics": (
+        "Focus: shipping, Incoterms and customs. For freight call `estimate_freight`: it gives route distance only, "
+        "so never state a freight price; suggest requesting a quote from a logistics partner."
+    ),
+    "rfq_drafting": "Focus: collecting RFQ details.",
+}
+
+
 def build_rfq_system_prompt(
     draft: dict[str, Any],
     readiness: dict[str, Any],
     matched_candidates: Optional[list[dict[str, Any]]] = None,
     last_counterparty_message: Optional[dict[str, Any]] = None,
     active_connection_id: Optional[Union[str, uuid.UUID]] = None,
-    is_analysis_query: bool = False,
+    allowed_tools: Optional[set[str]] = None,
     routed_agent: Optional[AgentDefinition] = None,
     older_history_summary: Optional[str] = None,
     counterparty_context: Optional[str] = None,
@@ -342,7 +356,7 @@ def build_rfq_system_prompt(
     if opts:
         status_lines.append("- Optional details captured: " + "; ".join(opts))
 
-    if is_analysis_query and not draft.get("role") and not draft.get("product_details", {}).get("name") and not draft.get("category"):
+    if allowed_tools is not None and "update_rfq_draft" not in allowed_tools and not draft.get("role") and not draft.get("product_details", {}).get("name") and not draft.get("category"):
         status_str = "- No active RFQ being drafted (Market Analysis / Advisory Inquiry)"
     else:
         status_str = "\n".join(status_lines)
@@ -357,91 +371,42 @@ def build_rfq_system_prompt(
     if not draft.get("deadline"):
         missing_opts.append("delivery deadline")
 
-    # Sequence directive
-    if routed_agent and routed_agent.id == "market_research":
-        flow_directive = (
-            "MARKET RESEARCH SPECIALIST DIRECTIVE:\n"
-            "- You are the Market Research Specialist for the B2B procurement marketplace.\n"
-            "- Deliver concise market intelligence built only from the data tools (listing counts, distinct users, price statistics).\n"
-            "- Ground your findings strictly in tool results; call the data tools before stating any marketplace fact.\n"
-            "- Present multi-supplier comparisons in structured markdown tables.\n"
-            "- If the user requests to start an RFQ or buy/sell based on findings, assist them directly.\n\n"
-            "MARKET ANALYSIS & BENCHMARKING DIRECTIVE:\n"
-            "- The user is asking for market intelligence, price benchmarking, listing evaluation, or commercial analysis.\n"
-            "- Answer the user's business inquiry using only numbers returned by the data tools, in concise tables.\n"
-            "- Do NOT prompt the user to specify Buy/Sell or create an RFQ unless they explicitly ask to create one."
-        )
-    elif routed_agent and routed_agent.id == "price_analyst":
-        flow_directive = (
-            "PRICE ANALYST SPECIALIST DIRECTIVE:\n"
-            "- You are the Price Analyst Specialist for the B2B procurement marketplace.\n"
-            "- Compare prices across matched suppliers, normalise currencies, and calculate per-unit costs.\n"
-            "- Highlight the best value deal with a ⭐.\n"
-            "- If the user asks to negotiate with or create an RFQ for a supplier, assist them directly.\n\n"
-            "MARKET ANALYSIS & BENCHMARKING DIRECTIVE:\n"
-            "- The user is asking for price benchmarking, listing evaluation, or commercial analysis.\n"
-            "- Answer the user's business inquiry using only numbers returned by the data tools, in concise tables.\n"
-            "- Do NOT prompt the user to specify Buy/Sell or create an RFQ unless they explicitly ask to create one."
-        )
-    elif routed_agent and routed_agent.id == "negotiation":
-        flow_directive = (
-            "NEGOTIATION COACH SPECIALIST DIRECTIVE:\n"
-            "- You are the Negotiation Coach Specialist for the B2B procurement marketplace.\n"
-            "- Formulate persuasive, highly professional counter-offer proposals and deal terms.\n"
-            "- Call draft_counterparty_message when the user wants to compose or amend an offer.\n"
-            "- Maintain an exceptionally polite, commercially persuasive tone referencing order specs."
-        )
-    elif routed_agent and routed_agent.id == "logistics":
-        flow_directive = (
-            "LOGISTICS ADVISOR SPECIALIST DIRECTIVE:\n"
-            "- You are the Logistics Advisor Specialist for the B2B procurement marketplace.\n"
-            "- Provide structured advice on Incoterms (FOB, CIF, EXW, DDP), freight and customs.\n"
-            "- For freight questions call the `estimate_freight` tool. It gives route distance only; the platform has no verified freight rates, so never state a freight price and suggest requesting a quote from a logistics partner.\n"
-            "- If the tool says freight rates are not available (unknown place, no weight), say so and ask for the missing detail. Never quote freight rates from memory.\n"
-            "- Use tables and structured bullet points."
-        )
-    elif routed_agent and routed_agent.id == "verification":
+    # A short role hint only. Correct behaviour comes from the tools and the verifier, not from this text.
+    drafting = allowed_tools is None or "update_rfq_draft" in allowed_tools
+    agent_id = routed_agent.id if routed_agent else "general"
+    if agent_id == "verification":
         kyc_val = "unverified"
         if user:
             prof = getattr(user, "profile", None)
             if prof and getattr(prof, "kyc_status", None):
                 raw_k = getattr(prof.kyc_status, "value", str(prof.kyc_status))
                 kyc_val = raw_k.lower()
+        role_hint = f"Focus: counterparty trust and verification. The user's own KYC status is '{kyc_val}'."
+    else:
+        role_hint = _AGENT_ROLE_HINTS.get(agent_id, "")
+    if drafting and not readiness["has_role"]:
+        flow_directive = "RFQ DRAFT: role is missing. Ask in ONE brief sentence whether the user wants to BUY or SELL goods."
+    elif drafting and not readiness["has_product"]:
         flow_directive = (
-            "SUPPLIER VERIFICATION SPECIALIST DIRECTIVE:\n"
-            "- You are the Supplier Verification Specialist for the B2B procurement marketplace.\n"
-            f"- USER ACCOUNT & VERIFICATION FACT: Current user KYC status is '{kyc_val}'.\n"
-            "- Evaluate counterparty trust, KYC status (GST, PAN), certifications, and flag risk signals.\n"
-            "- Provide structured checklists and clear risk ratings (🔴 High / 🟡 Medium / 🟢 Low)."
+            f"RFQ DRAFT: role is {str(draft.get('role', '')).upper()}. Ask which specific PRODUCT they want to buy/sell. Keep it short."
         )
-    elif is_analysis_query:
+    elif drafting and missing_opts:
         flow_directive = (
-            "MARKET ANALYSIS & BENCHMARKING DIRECTIVE:\n"
-            "- The user is asking for market intelligence, price benchmarking, listing evaluation, or commercial analysis.\n"
-            "- Answer the user's business inquiry using only numbers returned by the data tools, in concise tables.\n"
-            "- Do NOT prompt the user to specify Buy/Sell or create an RFQ unless they explicitly ask to create one."
+            f"RFQ DRAFT: role and product are recorded. Captured: {'; '.join(opts) if opts else 'none yet'}. "
+            f"Still missing: {', '.join(missing_opts)}. Acknowledge what was captured and ask if they want to add the rest, or create the RFQ."
         )
-    elif not readiness["has_role"]:
+    elif drafting:
         flow_directive = (
-            "1. STEP 1 (REQUIRED): Role is missing. Ask the user in ONE brief sentence whether they want to BUY or SELL goods."
-        )
-    elif not readiness["has_product"]:
-        flow_directive = (
-            f"2. STEP 2 (REQUIRED): Role is {draft.get('role', '').upper()}. Now ask what specific PRODUCT they want to buy/sell. Keep it short."
-        )
-    elif missing_opts:
-        flow_directive = (
-            f"3. STEP 3 (REQUIRED COMPLETE): Role and Product are recorded. "
-            f"Captured optional details: {'; '.join(opts) if opts else 'None yet'}. "
-            f"Still missing optional fields: {', '.join(missing_opts)}. "
-            f"Acknowledge the captured fields and ask if the user wants to specify {', '.join(missing_opts)}, or proceed to create the RFQ."
+            "RFQ DRAFT: all key details are captured. Acknowledge the draft concisely and ask about technical "
+            "specifications or whether they are ready to create the RFQ."
         )
     else:
         flow_directive = (
-            "3. STEP 3 (ALL KEY DETAILS CAPTURED): All required and key commercial terms "
-            "(Role, Product, Quantity, Price Target, Location, Deadline) are captured! "
-            "Acknowledge the complete RFQ draft concisely, and ask if they have any technical specifications or if they are ready to proceed to create the RFQ."
+            "Answer the user's question using only numbers returned by the data tools. "
+            "Do not ask whether they want to buy or sell, and do not offer to create an RFQ, unless they ask for it."
         )
+    if role_hint:
+        flow_directive = f"{role_hint}\n{flow_directive}"
 
     matches_section = ""
     if matched_candidates:
@@ -588,6 +553,9 @@ def build_rfq_system_prompt(
         "  * The `message` argument in `draft_counterparty_message` MUST contain the full and complete letter from start to finish. Never truncate the tool argument mid-sentence.\n"
     ) + active_thread_section
 
+    if allowed_tools is not None and "draft_counterparty_message" not in allowed_tools:
+        negotiation_directive = ""
+
     prompt_parts = [
         SYSTEM_BUSINESS_PROMPT,
         f"\nACTIVE PROCUREMENT STATE SCRATCHPAD:\n{status_str}",
@@ -603,14 +571,20 @@ def build_rfq_system_prompt(
 
     prompt_parts.append(f"\nSPECIALIST DIRECTIVE & FLOW:\n{flow_directive}")
 
-    rules = (
-        "\nIMPORTANT OPERATIONAL RULES:\n"
-        "- As the Super Agent orchestrator, answer directly and use tools when actions are requested.\n"
-        "- Call `update_rfq_draft(**kwargs)` when procurement specifications or details are provided.\n"
-        "- Call `create_rfq(...)` when user confirms creation (e.g. 'create rfq', 'yes create it', 'proceed') and Role and Product are known.\n"
-        "- Call `draft_counterparty_message(...)` when user asks to compose or send negotiation proposals.\n"
-        "- Keep responses concise, data-rich, and directly actionable."
-    )
+    rule_lines = ["\nIMPORTANT OPERATIONAL RULES:"]
+    tool_rules = {
+        "update_rfq_draft": "- Call `update_rfq_draft(**kwargs)` when procurement specifications or details are provided.",
+        "create_rfq": "- Call `create_rfq(...)` only because the user asked to create or confirmed it, and Role and Product are known.",
+        "draft_counterparty_message": "- Call `draft_counterparty_message(...)` to compose the negotiation message the user asked for.",
+        "close_rfq": "- Call `close_rfq(...)` only because the user asked to close or cancel their RFQ.",
+    }
+    for name, line in tool_rules.items():
+        if allowed_tools is None or name in allowed_tools:
+            rule_lines.append(line)
+    if allowed_tools is not None:
+        rule_lines.append("- Actions not listed above are not available this turn; never claim to have performed them.")
+    rule_lines.append("- Keep responses concise, data-rich, and directly actionable.")
+    rules = "\n".join(rule_lines)
     prompt_parts.append(rules)
     return "\n".join(prompt_parts)
 
@@ -731,8 +705,14 @@ async def execute_close_rfq_call(
     conversation: Optional[Conversation] = None,
     db: Optional[AsyncSession] = None,
     user: Optional[User] = None,
+    require_unambiguous: bool = False,
 ) -> tuple[Optional[dict[str, Any]], Optional[str]]:
-    """Close an active RFQ in the database."""
+    """Close an active RFQ in the database.
+
+    With ``require_unambiguous`` (a typed command that names no listing), the
+    fallback to "the newest active RFQ" is only taken when the user has exactly
+    one; otherwise nothing is closed and the user is asked which one.
+    """
     if db is None or user is None:
         return None, "Database session not available."
 
@@ -789,10 +769,13 @@ async def execute_close_rfq_call(
             select(RFQ)
             .where(RFQ.user_id == user.id, RFQ.status == RFQStatus.ACTIVE)
             .order_by(RFQ.created_at.desc())
-            .limit(1)
+            .limit(5 if require_unambiguous else 1)
         )
-        res = await db.execute(recent_stmt)
-        target_rfq = res.scalar_one_or_none()
+        candidates = (await db.execute(recent_stmt)).scalars().all()
+        if require_unambiguous and len(candidates) > 1:
+            titles = "; ".join(f"'{c.title}'" for c in candidates)
+            return None, f"You have several active RFQs ({titles}). Tell me which one to close, for example \"close my cotton RFQ\"."
+        target_rfq = candidates[0] if candidates else None
 
     if not target_rfq:
         return None, "No active RFQ was found to close. You can view all your listings under My RFQs."
@@ -1398,98 +1381,6 @@ def _remember_market_focus(conversation: Optional[Conversation], focus: dict[str
     setattr(conversation, "_pending_market_focus", mf)
 
 
-def _candidates_are_stale(
-    candidates: list[dict[str, Any]], focus: dict[str, Any], message: str
-) -> bool:
-    """True when auto-fetched candidates were for another product or market side.
-
-    Candidates supplied by the matching engine carry no ``search_product`` and are
-    kept as they are.
-    """
-    auto_fetched = [c for c in candidates if c.get("search_product")]
-    if not auto_fetched:
-        return False
-    if focus.get("product") and any(c["search_product"] != focus["product"] for c in auto_fetched):
-        return True
-    requested_side = _requested_listing_side(message)
-    return bool(requested_side and any(c.get("role") != requested_side for c in auto_fetched))
-
-
-async def _fetch_catalog_candidates_for_query(
-    db: AsyncSession,
-    user: User,
-    focus: dict[str, Any],
-) -> list[dict[str, Any]]:
-    """Fetch active marketplace RFQ listings for the product and market side in focus.
-
-    Returns an empty list when there is no product to search for or nothing
-    matches. Unrelated listings must never be presented as counterparties.
-    """
-    search_query = focus.get("product")
-    if not search_query:
-        return []
-    listing_role = focus.get("listing_role")
-    target_role = RFQRole(listing_role) if listing_role in ("buyer", "seller") else None
-    try:
-        from services import catalog_service
-        cat_out = await catalog_service.get_catalog(
-            db,
-            user,
-            q=search_query,
-            role=target_role,
-            sort_by="newest",
-            limit=5,
-        )
-
-        candidates: list[dict[str, Any]] = []
-        if cat_out and cat_out.items:
-            for idx, it in enumerate(cat_out.items):
-                candidates.append({
-                    "rfq_id": str(it.id),
-                    "title": it.title,
-                    "search_product": search_query,
-                    "role": it.role.value if hasattr(it.role, "value") else str(it.role),
-                    "category": it.category,
-                    "counterparty": {
-                        "company_name": it.counterparty.company_name,
-                        "contact_name": it.counterparty.contact_name,
-                        "city": it.counterparty.city,
-                        "country": it.counterparty.country,
-                        "trust_score": it.counterparty.trust_score,
-                        "kyc_status": it.counterparty.kyc_status.value if hasattr(it.counterparty.kyc_status, "value") else str(it.counterparty.kyc_status),
-                        "connection_id": str(it.counterparty.connection_id) if it.counterparty.connection_id else None,
-                        "connection_status": it.counterparty.connection_status,
-                        "connection_direction": it.counterparty.connection_direction,
-                        "gst_verified": (it.counterparty.kyc_status.value == "verified") if hasattr(it.counterparty.kyc_status, "value") else False,
-                    },
-                    # Plain floats: these dicts are persisted to the JSONB conversation state.
-                    "price": {
-                        "amount": float(it.price_target.amount) if it.price_target.amount is not None else None,
-                        "currency": it.price_target.currency,
-                        "per_unit": it.price_target.per_unit,
-                    } if it.price_target else None,
-                    "quantity": {
-                        "value": float(it.quantity.value) if it.quantity.value is not None else None,
-                        "unit": it.quantity.unit,
-                    } if it.quantity else None,
-                    "location": {
-                        "city": it.location.city,
-                        "state": it.location.state,
-                        "country": it.location.country,
-                    } if it.location else None,
-                    "distance_km": it.distance_km,
-                    # No match scoring runs on this path, so no score is reported.
-                    "score": None,
-                    "rank": idx + 1,
-                })
-        return candidates
-    except Exception as exc:
-        logger.warning("Could not auto-fetch catalog candidates: %s", exc)
-        return []
-
-
-
-
 async def get_or_create_conversation(
     db: AsyncSession,
     user_id: uuid.UUID,
@@ -1865,444 +1756,124 @@ def _engine_allowed_text(
     return "\n".join(parts)
 
 
-async def generate_business_chat_reply(
-    messages: list[Any],
-    current_rfq: Optional[dict[str, Any]] = None,
-    db: Optional[AsyncSession] = None,
-    user: Optional[User] = None,
-    conversation_id: Optional[uuid.UUID] = None,
-    matched_candidates: Optional[list[dict[str, Any]]] = None,
-    active_connection_id: Optional[Union[str, uuid.UUID]] = None,
-    agent: Optional[AgentDefinition] = None,
-    rfq_id: Optional[uuid.UUID] = None,
-) -> dict[str, Any]:
-    """Send conversation messages to local Ollama gpt-oss:20b with RFQ and counterparty negotiation tool calling."""
-    # 1. Deterministic Preprocessing on the latest user message
-    last_user_content = ""
-    for msg in reversed(messages):
-        r, c = _extract_msg_fields(msg)
-        if r == "user":
-            last_user_content = c
-            break
+# ---------------------------------------------------------------------------
+# One chat turn. /message and /stream both run `_run_chat_turn`; they differ
+# only in whether the events are forwarded or folded into one response.
+# ---------------------------------------------------------------------------
 
-    conversation = None
-    if db is not None and user is not None:
-        try:
-            conversation = await get_or_create_conversation(
-                db, user.id, conversation_id=conversation_id, initial_title=last_user_content
-            )
-            if last_user_content.strip():
-                await save_message_to_conversation(
-                    db, conversation.id, role="user", content=last_user_content
-                )
-                await db.commit()
-        except Exception as exc:
-            logger.exception("Failed to initialize conversation in generate_business_chat_reply: %s", exc)
+_HELLO_REPLY = "Hello! I am your B2B Marketplace Business Assistant. Are you looking to BUY or SELL goods?"
+_CONNECTION_LOST = "\n\n⚠️ [Connection to local AI assistant interrupted.]"
+_TIMED_OUT = "\n\n⏳ [Response timed out. Please try asking a more concise question.]"
+_DISPATCH_REPLY_RE = re.compile(r"(✉️|📝|message\s+sent\s+to|dispatched|drafted|dear\s+[\w\s]+,)", re.IGNORECASE)
+_SENT_MARKERS = ("message sent to", "dispatched", "✉️", "dear ")
 
-    # Restore persisted draft if client omitted current_rfq
-    if not current_rfq and conversation and conversation.state:
-        saved_draft = conversation.state.get("rfq_draft")
-        if isinstance(saved_draft, dict) and saved_draft:
-            current_rfq = dict(saved_draft)
 
-    client_supplied_cands = bool(matched_candidates)
+@dataclass
+class TurnResult:
+    """What a finished turn produced; the /message response is built from this."""
 
-    last_counterparty_msg = None
-    if conversation and conversation.state:
-        if not active_connection_id and conversation.state.get("active_connection_id"):
-            active_connection_id = conversation.state.get("active_connection_id")
-        last_counterparty_msg = conversation.state.get("last_counterparty_message")
+    reply: str
+    thinking: Optional[str]
+    rfq_draft: dict[str, Any]
+    readiness: dict[str, Any]
+    created_rfq: Optional[dict[str, Any]]
+    counterparty_message: Optional[dict[str, Any]]
+    conversation_id: Optional[uuid.UUID]
+    routed_agent: dict[str, Any]
 
-    has_prev_counterparty = bool(last_counterparty_msg)
-    if not has_prev_counterparty:
-        for m in reversed(messages):
-            r, c = _extract_msg_fields(m)
-            if r == "assistant" and any(k in c.lower() for k in ["message sent to", "dispatched", "✉️", "dear "]):
-                has_prev_counterparty = True
-                break
-
-    # Warm the AI parse cache so the sync extract()/detect_role() calls below reuse it.
-    from services import query_extractor as _qx
-    await _qx.extract_async(last_user_content)
-
-    is_counterparty_msg = rfq_tool_service.check_counterparty_message_intent(
-        last_user_content,
-        has_active_connection=bool(active_connection_id),
-        has_previous_counterparty_msg=has_prev_counterparty,
-    )
-
-    draft = rfq_tool_service.preprocess_message_to_rfq(
-        last_user_content,
-        current_rfq,
-        has_active_connection=bool(active_connection_id),
-        has_previous_counterparty_msg=has_prev_counterparty,
-    )
-    readiness = rfq_tool_service.evaluate_rfq_readiness(draft)
-
-    # Restore matched_candidates from conversation state only if relevant to current turn
-    if not client_supplied_cands and conversation and conversation.state:
-        saved_cands = conversation.state.get("matched_candidates")
-        if saved_cands and (rfq_tool_service.check_match_query_intent(last_user_content) or is_counterparty_msg):
-            matched_candidates = saved_cands
-        else:
-            matched_candidates = None
-
-    is_match_query = (not is_counterparty_msg) and (
-        rfq_tool_service.check_match_query_intent(last_user_content) or (
-            bool(matched_candidates) and any(
-                w in last_user_content.lower()
-                for w in [
-                    "mail", "email", "top", "three", "two", "five", "best", "suit", "suits",
-                    "which", "who", "compare", "candidate", "supplier", "buyer", "seller",
-                    "cheapest", "rating", "contact", "phone",
-                ]
-            )
-        )
-    )
-
-    is_analysis_query = (not is_counterparty_msg) and (not is_match_query) and (
-        rfq_tool_service.check_analysis_query_intent(last_user_content)
-        or (agent is not None and agent.id in ("market_research", "price_analyst", "logistics", "verification"))
-    )
-
-    previous_focus = (conversation.state or {}).get("market_focus") if conversation else None
-    focus = _resolve_market_focus(last_user_content, previous_focus)
-
-    if db and user and is_match_query and (
-        not matched_candidates or _candidates_are_stale(matched_candidates, focus, last_user_content)
-    ):
-        matched_candidates = await _fetch_catalog_candidates_for_query(db, user, focus)
-
-    # "send the message to this buyer": work out who "this buyer" is before the model writes to them.
-    counterparty_context = None
-    if is_counterparty_msg and db is not None and user is not None:
-        counterparty_context, resolved_conn_id = await _resolve_counterparty_context(
-            db, user, last_user_content, focus, active_connection_id
-        )
-        if resolved_conn_id and not active_connection_id:
-            active_connection_id = resolved_conn_id
-
-    # 2. Autonomous Super Agent Routing (AI Semantic Intent & Role Resolution)
-    routed_agent, active_tools, routing_meta = await route_query_to_agent_async(
-        user_query=last_user_content,
-        current_draft=draft,
-        matched_candidates=matched_candidates,
-        active_connection_id=active_connection_id,
-        last_counterparty_msg=last_counterparty_msg,
-        explicit_agent_id=agent.id if agent else None,
-    )
-    routed_agent_info = {
-        "id": routed_agent.id,
-        "name": routed_agent.name,
-        "icon": routed_agent.icon,
-        "short_description": routed_agent.short_description,
-    }
-
-    # Extract dynamic AI entities if available
-    sem_ext = routing_meta.get("semantic_extraction") or {}
-    ai_prod = sem_ext.get("product")
-    ai_cat = sem_ext.get("category")
-    ai_loc = sem_ext.get("location")
-
-    from services import query_extractor
-    req_linguistic = query_extractor.extract(last_user_content)
-    focus = _resolve_market_focus(last_user_content, previous_focus, sem_ext)
-    _remember_market_focus(conversation, focus)
-    resolved_role = focus["role"]
-
-    effective_prod = _grounded_ai_product(ai_prod, last_user_content) or req_linguistic.product
-    effective_cat = req_linguistic.category or ai_cat or (query_extractor._infer_category(effective_prod) if effective_prod else None)
-
-    if not is_analysis_query:
-        stated_role = query_extractor.detect_role(last_user_content)
-        if resolved_role:
-            if not draft.get("role") or (stated_role and draft.get("role") != stated_role.value):
-                draft["role"] = resolved_role
-
-        if effective_prod and not (draft.get("product_details") or {}).get("name"):
-            if "product_details" not in draft or not isinstance(draft["product_details"], dict):
-                draft["product_details"] = {}
-            draft["product_details"]["name"] = effective_prod
-
-        if effective_cat and not draft.get("category"):
-            draft["category"] = effective_cat
-
-        if ai_loc and not (draft.get("location") or {}).get("city"):
-            raw_city = ai_loc.split(",")[0].strip()
-            city_name = _clean_city_name(raw_city) or raw_city
-            draft["location"] = {"city": city_name, "country": "India"}
-        elif req_linguistic.city and not (draft.get("location") or {}).get("city"):
-            draft["location"] = {"city": _clean_city_name(req_linguistic.city) or req_linguistic.city, "country": req_linguistic.country or "India"}
-
-    readiness = rfq_tool_service.evaluate_rfq_readiness(draft)
-
-    # 4. Context Sliding Window (Bounded Token Usage, No Memory Spikes)
-    window_messages, older_summary = build_sliding_window_messages(messages, max_history_turns=8)
-
-    async def _finalize_response(
-        reply_text: str,
-        thinking_text: Optional[str] = None,
-        rfq_draft_data: Optional[dict[str, Any]] = None,
-        readiness_data: Optional[dict[str, Any]] = None,
-        created_rfq_data: Optional[dict[str, Any]] = None,
-        counterparty_message_data: Optional[dict[str, Any]] = None,
-    ) -> dict[str, Any]:
-        if is_match_query and matched_candidates and reply_text and "/marketplace?rfq=" not in reply_text and not reply_text.startswith("⚠️"):
-            link_appendix = build_rfq_link_appendix(matched_candidates)
-            if link_appendix:
-                reply_text += link_appendix
-
-        if db is not None and conversation is not None:
-            try:
-                meta = {
-                    "thinking": thinking_text,
-                    "created_rfq": created_rfq_data,
-                    "counterparty_message": counterparty_message_data,
-                    "routed_agent": routed_agent_info,
-                }
-                await save_message_to_conversation(
-                    db, conversation.id, role="assistant", content=reply_text, metadata=meta
-                )
-                rfq_uuid = (
-                    uuid.UUID(created_rfq_data["id"])
-                    if created_rfq_data and created_rfq_data.get("id")
-                    else None
-                )
-                await update_conversation_after_turn(
-                    db,
-                    conversation,
-                    draft=rfq_draft_data or draft,
-                    readiness=readiness_data or readiness,
-                    rfq_id=rfq_uuid,
-                    user_prompt=last_user_content,
-                    matched_candidates=matched_candidates,
-                    active_connection_id=active_connection_id,
-                    last_counterparty_message=counterparty_message_data or last_counterparty_msg,
-                )
-            except Exception as exc:
-                logger.exception("Failed to persist assistant reply in _finalize_response: %s", exc)
-
+    def as_response(self) -> dict[str, Any]:
         return {
-            "reply": reply_text,
-            "thinking": thinking_text,
-            "rfq_draft": rfq_draft_data or draft,
-            "readiness": readiness_data or readiness,
-            "created_rfq": created_rfq_data,
-            "counterparty_message": counterparty_message_data,
-            "conversation_id": conversation.id if conversation else None,
-            "routed_agent": routed_agent_info,
+            "reply": self.reply,
+            "thinking": self.thinking,
+            "rfq_draft": self.rfq_draft,
+            "readiness": self.readiness,
+            "created_rfq": self.created_rfq,
+            "counterparty_message": self.counterparty_message,
+            "conversation_id": self.conversation_id,
+            "routed_agent": self.routed_agent,
         }
 
-    # 5. Build dynamic system prompt
-    dynamic_system_prompt = build_rfq_system_prompt(
-        draft,
-        readiness,
-        matched_candidates=matched_candidates,
-        last_counterparty_message=last_counterparty_msg,
-        active_connection_id=active_connection_id,
-        is_analysis_query=is_analysis_query,
-        routed_agent=routed_agent,
-        older_history_summary=older_summary,
-        counterparty_context=counterparty_context,
-        user=user,
-    )
-    prepared_messages: list[dict[str, Any]] = [
-        {"role": "system", "content": dynamic_system_prompt}
-    ]
-    prepared_messages.extend(window_messages)
 
-    if len(prepared_messages) == 1:
-        return await _finalize_response(
-            reply_text="Hello! I am your B2B Marketplace Business Assistant. Are you looking to BUY or SELL goods?",
-            thinking_text=None,
-            rfq_draft_data=draft,
-            readiness_data=readiness,
-            created_rfq_data=None,
-            counterparty_message_data=None,
-        )
+@dataclass
+class ChatEvent:
+    """One step of a turn. ``chunk`` is exactly the JSON object the SSE stream sends.
 
-    # Immediate handling when user explicitly asks to create/proceed with RFQ
-    if not is_match_query and not is_analysis_query and not is_counterparty_msg and rfq_tool_service.check_create_rfq_intent(last_user_content):
-        if readiness["has_role"] and readiness["has_product"]:
-            created_rfq_obj, err = await execute_create_rfq_call(draft, {}, db=db, user=user)
-            if created_rfq_obj:
-                reply = format_created_rfq_text(created_rfq_obj)
-            else:
-                reply = f"⚠️ {err or 'Failed to create RFQ.'}"
-            return await _finalize_response(
-                reply_text=reply,
-                thinking_text="Validated required fields and submitted RFQ to marketplace database.",
-                rfq_draft_data=draft,
-                readiness_data=readiness,
-                created_rfq_data=created_rfq_obj,
-                counterparty_message_data=None,
-            )
-        else:
-            missing = []
-            if not readiness["has_role"]:
-                missing.append("Role (Buyer or Seller)")
-            if not readiness["has_product"]:
-                missing.append("Product name")
-            return await _finalize_response(
-                reply_text=f"To create your RFQ, we still need {' and '.join(missing)}. Are you looking to BUY or SELL goods, and what product?",
-                thinking_text=None,
-                rfq_draft_data=draft,
-                readiness_data=readiness,
-                created_rfq_data=None,
-                counterparty_message_data=None,
-            )
+    ``kind`` is one of status, tool_step, replace_content, final or error.
+    ``result`` is set on the last event (final or error) only.
+    """
 
-    # Tools are provisioned dynamically by the Super Agent router, ensuring action tools are never stripped
-    tools = active_tools
-    draft_guards = _draft_guards(messages, last_user_content, draft)
-
-    runner = _ActionRunner(
-        draft=draft,
-        draft_guards=draft_guards,
-        db=db,
-        user=user,
-        conversation=conversation,
-        matched_candidates=matched_candidates,
-        active_connection_id=active_connection_id,
-        connection_hint=_connection_hint(last_user_content, focus),
-    )
-
-    try:
-        engine_result = await answer_engine.answer(
-            db,
-            user,
-            history_messages=window_messages,
-            system_prompt=dynamic_system_prompt,
-            user_message=last_user_content,
-            extra_tools=tools,
-            tool_executor=runner,
-            context=AnswerContext(
-                rfq_id=str(rfq_id) if rfq_id else None,
-                draft=lambda: runner.draft,
-                extra_allowed_text=_engine_allowed_text(matched_candidates, counterparty_context, last_counterparty_msg),
-            ),
-        )
-        reply = engine_result.text
-        thinking = engine_result.thinking
-        if is_counterparty_msg and engine_result.used_fallback and not engine_result.tool_results:
-            # A letter is not a data answer; let the deterministic composer below build it.
-            reply = ""
-        draft = runner.draft
-        created_rfq_obj = runner.created_rfq_obj
-        closed_rfq_obj = runner.closed_rfq_obj
-        counterparty_msg_obj = runner.counterparty_msg_obj
-
-        if engine_result.llm_error and not engine_result.tool_results and not runner.touched:
-            return await _finalize_response(
-                reply_text="⚠️ Connection to local AI assistant interrupted.",
-                thinking_text=None,
-                rfq_draft_data=draft,
-                readiness_data=readiness,
-                created_rfq_data=None,
-                counterparty_message_data=None,
-            )
-
-        # Guardrail recovery: If model mistakenly emitted the refusal string for a valid business query
-        if is_false_positive_refusal(reply, last_user_content):
-            reply = await _recover_from_false_refusal(prepared_messages, last_user_content) or ""
-
-        # An action's failure text stands in for a missing reply; a duplicate-RFQ notice always wins
-        # so the user is never told a new listing exists.
-        if runner.err_reply and (not reply or runner.duplicate):
-            reply = runner.err_reply
-
-        readiness = rfq_tool_service.evaluate_rfq_readiness(draft)
-
-        # Check deterministic user intent to create if tool was not called explicitly
-        if not is_match_query and not is_analysis_query and not is_counterparty_msg and not created_rfq_obj and rfq_tool_service.check_create_rfq_intent(last_user_content):
-            if readiness["has_role"] and readiness["has_product"]:
-                created_rfq_obj, err = await execute_create_rfq_call(draft, {}, db=db, user=user)
-                if err and not reply:
-                    reply = f"⚠️ {err}"
-
-        # Deterministic fallback for counterparty message if tool was not called explicitly
-        is_dispatch_reply = bool(re.search(r"(✉️|📝|message\s+sent\s+to|dispatched|drafted|dear\s+[\w\s]+,)", reply, re.IGNORECASE))
-        if not counterparty_msg_obj and (is_counterparty_msg or is_dispatch_reply):
-            msg_to_send = extract_or_compose_counterparty_message(
-                reply_text=reply,
-                user_instruction=last_user_content,
-                last_counterparty_info=last_counterparty_msg,
-                draft=draft,
-            )
-            recipient_name = extract_recipient_name(
-                reply_text=reply,
-                last_counterparty_info=last_counterparty_msg,
-                matched_candidates=matched_candidates,
-            )
-            counterparty_msg_obj, err = await execute_draft_counterparty_message_call(
-                tool_args={"message": msg_to_send, "recipient_name": recipient_name},
-                db=db,
-                user=user,
-                matched_candidates=matched_candidates,
-                active_connection_id=active_connection_id,
-                connection_hint=_connection_hint(last_user_content, focus),
-            )
-            if counterparty_msg_obj and not reply:
-                reply = format_counterparty_message_text(counterparty_msg_obj)
-
-        # Check if counterparty_msg_obj message was truncated and reply has the full message
-        if counterparty_msg_obj and is_truncated_message(counterparty_msg_obj.get("message", "")):
-            complete_letter = extract_or_compose_counterparty_message(
-                reply_text=reply,
-                user_instruction=last_user_content,
-                last_counterparty_info=last_counterparty_msg,
-                draft=draft,
-            )
-            if complete_letter and not is_truncated_message(complete_letter):
-                counterparty_msg_obj["message"] = complete_letter
-                if counterparty_msg_obj.get("message_id") and db:
-                    try:
-                        from models.connection import ConnectionMessage
-                        msg_uuid = uuid.UUID(str(counterparty_msg_obj["message_id"]))
-                        db_msg = await db.get(ConnectionMessage, msg_uuid)
-                        if db_msg:
-                            db_msg.content = complete_letter
-                            await db.commit()
-                    except Exception as exc:
-                        logger.warning("Could not update truncated message in DB: %s", exc)
-
-        # Never let the model announce an RFQ that was not actually created.
-        if not created_rfq_obj and claims_rfq_created(reply):
-            logger.warning("Model claimed RFQ creation without a create_rfq call; correcting reply.")
-            reply = unbacked_creation_reply(draft, readiness)
-
-        if counterparty_msg_obj:
-            if not reply:
-                reply = format_counterparty_message_text(counterparty_msg_obj)
-        elif created_rfq_obj:
-            reply = format_created_rfq_text(created_rfq_obj)
-        elif not reply and thinking:
-            reply = thinking
-            thinking = None
-        elif not reply:
-            reply = format_rfq_summary_text(draft, readiness)
-
-        return await _finalize_response(
-            reply_text=reply,
-            thinking_text=thinking,
-            rfq_draft_data=draft,
-            readiness_data=readiness,
-            created_rfq_data=created_rfq_obj,
-            counterparty_message_data=counterparty_msg_obj,
-        )
-
-    except Exception as exc:
-        logger.error("Ollama chat error: %s", exc)
-        return await _finalize_response(
-            reply_text="⚠️ Connection to local AI assistant interrupted.",
-            thinking_text=None,
-            rfq_draft_data=draft,
-            readiness_data=readiness,
-            created_rfq_data=None,
-        )
+    kind: str
+    chunk: dict[str, Any]
+    result: Optional[TurnResult] = None
 
 
-async def stream_business_chat_reply(
+def _action_tool_specs(names: set[str]) -> list[dict[str, Any]]:
+    """Tool schemas for the action tools the permission gate allowed, in a fixed order."""
+    table = {
+        "update_rfq_draft": rfq_tool_service.UPDATE_RFQ_DRAFT_TOOL,
+        "create_rfq": rfq_tool_service.CREATE_RFQ_TOOL,
+        "draft_counterparty_message": rfq_tool_service.DRAFT_COUNTERPARTY_MESSAGE_TOOL,
+        "close_rfq": rfq_tool_service.CLOSE_RFQ_TOOL,
+    }
+    return [table[n] for n in chat_permissions.ALL_ACTION_TOOLS if n in names]
+
+
+def _cards_from_tool_results(tool_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Listing cards (id, title, price, ...) built from what search_listings/find_matches returned this turn.
+
+    They back the "Direct RFQ links" appendix and let a follow-up such as "message the
+    first one" find the listing. Only real tool rows are used.
+    """
+    cards: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for res in tool_results or []:
+        data = res.get("data") or {}
+        rows = data.get("matches") if res.get("tool") == "find_matches" else data.get("samples")
+        if res.get("tool") not in ("find_matches", "search_listings") or not rows:
+            continue
+        for row in rows:
+            rid = str(row.get("id") or "")
+            if not rid or rid in seen:
+                continue
+            seen.add(rid)
+            score_pct = row.get("match_score_pct")
+            cards.append({
+                "rfq_id": rid,
+                "title": row.get("title"),
+                "role": row.get("role"),
+                "price": {
+                    "amount": row.get("price"),
+                    "currency": row.get("currency"),
+                    "per_unit": row.get("price_per_unit"),
+                } if row.get("price") is not None else None,
+                "quantity": {"value": row.get("quantity"), "unit": row.get("quantity_unit")} if row.get("quantity") is not None else None,
+                "location": {"city": row.get("city")} if row.get("city") else None,
+                "score": score_pct / 100 if isinstance(score_pct, (int, float)) else None,
+                "rank": len(cards) + 1,
+            })
+    return cards[:10]
+
+
+def _last_user_and_previous_assistant(messages: list[Any]) -> tuple[str, str]:
+    """The newest user message and the assistant text that came right before it."""
+    last_user_idx = -1
+    for i in range(len(messages) - 1, -1, -1):
+        if _extract_msg_fields(messages[i])[0] == "user":
+            last_user_idx = i
+            break
+    if last_user_idx < 0:
+        return "", ""
+    last_user = _extract_msg_fields(messages[last_user_idx])[1]
+    for j in range(last_user_idx - 1, -1, -1):
+        role, content = _extract_msg_fields(messages[j])
+        if role == "assistant":
+            return last_user, content
+        if role == "user":
+            break
+    return last_user, ""
+
+
+async def _run_chat_turn(
     messages: list[Any],
     current_rfq: Optional[dict[str, Any]] = None,
     db: Optional[AsyncSession] = None,
@@ -2312,15 +1883,17 @@ async def stream_business_chat_reply(
     active_connection_id: Optional[Union[str, uuid.UUID]] = None,
     agent: Optional[AgentDefinition] = None,
     rfq_id: Optional[uuid.UUID] = None,
-) -> AsyncGenerator[dict[str, Any], None]:
-    """Stream conversation replies chunk-by-chunk using SSE with RFQ and counterparty negotiation tool calling."""
-    # 1. Deterministic Preprocessing on the latest user message
-    last_user_content = ""
-    for msg in reversed(messages):
-        role, content = _extract_msg_fields(msg)
-        if role == "user":
-            last_user_content = content
-            break
+) -> AsyncIterator[ChatEvent]:
+    """Run one chat turn and yield its events. The only place a turn's logic and persistence live.
+
+    Order: persist the user message, read the AI parse of the message (intent,
+    product, location), ask ``chat_permissions`` which action tools may be used,
+    then either take an explicit-command shortcut (create / close) or let the
+    answer engine run its read tools plus the allowed action tools. Afterwards the
+    reply is guarded (false refusal, unbacked "RFQ created", counterparty letter),
+    persisted once and emitted as the final event.
+    """
+    last_user_content, previous_assistant = _last_user_and_previous_assistant(messages)
 
     conversation = None
     if db is not None and user is not None:
@@ -2329,46 +1902,45 @@ async def stream_business_chat_reply(
                 db, user.id, conversation_id=conversation_id, initial_title=last_user_content
             )
             if last_user_content.strip():
-                await save_message_to_conversation(
-                    db, conversation.id, role="user", content=last_user_content
-                )
+                await save_message_to_conversation(db, conversation.id, role="user", content=last_user_content)
                 await db.commit()
         except Exception as exc:
-            logger.exception("Failed to initialize conversation for stream: %s", exc)
+            logger.exception("Failed to initialize conversation: %s", exc)
 
-    # Restore persisted draft if client omitted current_rfq
-    if not current_rfq and conversation and conversation.state:
-        saved_draft = conversation.state.get("rfq_draft")
-        if isinstance(saved_draft, dict) and saved_draft:
-            current_rfq = dict(saved_draft)
+    state = (conversation.state or {}) if conversation else {}
+    if not current_rfq and isinstance(state.get("rfq_draft"), dict) and state["rfq_draft"]:
+        current_rfq = dict(state["rfq_draft"])
 
-    stream_client_cands = bool(matched_candidates)
-
-    last_counterparty_msg = None
-    if conversation and conversation.state:
-        if not active_connection_id and conversation.state.get("active_connection_id"):
-            active_connection_id = conversation.state.get("active_connection_id")
-        last_counterparty_msg = conversation.state.get("last_counterparty_message")
-
-    has_prev_counterparty = bool(last_counterparty_msg)
-    if not has_prev_counterparty:
-        for m in reversed(messages):
-            r, c = _extract_msg_fields(m)
-            if r == "assistant" and any(k in c.lower() for k in ["message sent to", "dispatched", "✉️", "dear "]):
-                has_prev_counterparty = True
-                break
-
+    client_cands = list(matched_candidates or [])
+    last_counterparty_msg = state.get("last_counterparty_message") if conversation else None
+    if conversation and not active_connection_id and state.get("active_connection_id"):
+        active_connection_id = state.get("active_connection_id")
+    has_prev_counterparty = bool(last_counterparty_msg) or any(
+        _extract_msg_fields(m)[0] == "assistant" and any(k in _extract_msg_fields(m)[1].lower() for k in _SENT_MARKERS)
+        for m in messages
+    )
     active_conv_id = str(conversation.id) if conversation else None
 
-    # Warm the AI parse cache so the sync extract()/detect_role() calls below reuse it.
-    from services import query_extractor as _qx
-    await _qx.extract_async(last_user_content)
+    # One model call reads the message (intent, role, product, location). It is cached,
+    # so the sync extract()/detect_role() calls below reuse it.
+    from services import query_extractor
 
-    is_counterparty_msg = rfq_tool_service.check_counterparty_message_intent(
+    await query_extractor.extract_async(last_user_content)
+    parse = ai_query_parser.cached(last_user_content)
+    parsed_intent = parse.intent if parse else None
+
+    allowed = chat_permissions.allowed_action_tools(
         last_user_content,
-        has_active_connection=bool(active_connection_id),
-        has_previous_counterparty_msg=has_prev_counterparty,
+        current_rfq,
+        {
+            "previous_assistant": previous_assistant,
+            "active_connection_id": active_connection_id,
+            "last_counterparty_message": last_counterparty_msg,
+            "has_previous_counterparty_msg": has_prev_counterparty,
+        },
+        parsed_intent,
     )
+    is_counterparty_msg = "draft_counterparty_message" in allowed
 
     draft = rfq_tool_service.preprocess_message_to_rfq(
         last_user_content,
@@ -2376,43 +1948,16 @@ async def stream_business_chat_reply(
         has_active_connection=bool(active_connection_id),
         has_previous_counterparty_msg=has_prev_counterparty,
     )
-    readiness = rfq_tool_service.evaluate_rfq_readiness(draft)
 
-    # Restore matched_candidates from conversation state only if relevant to current turn
-    if not stream_client_cands and conversation and conversation.state:
-        saved_cands = conversation.state.get("matched_candidates")
-        if saved_cands and (rfq_tool_service.check_match_query_intent(last_user_content) or is_counterparty_msg):
-            matched_candidates = saved_cands
-        else:
-            matched_candidates = None
+    if not client_cands and is_counterparty_msg and isinstance(state.get("matched_candidates"), list):
+        matched_candidates = state["matched_candidates"]  # "message the first one" needs last turn's listings
+    else:
+        matched_candidates = client_cands or None
 
-    is_match_query = (not is_counterparty_msg) and (
-        rfq_tool_service.check_match_query_intent(last_user_content) or (
-            bool(matched_candidates) and any(
-                w in last_user_content.lower()
-                for w in [
-                    "mail", "email", "top", "three", "two", "five", "best", "suit", "suits",
-                    "which", "who", "compare", "candidate", "supplier", "buyer", "seller",
-                    "cheapest", "rating", "contact", "phone",
-                ]
-            )
-        )
-    )
+    previous_focus = state.get("market_focus") if conversation else None
+    sem_ext = {"product": parse.product, "category": parse.category, "location": parse.location} if parse else {}
+    focus = _resolve_market_focus(last_user_content, previous_focus, sem_ext)
 
-    is_analysis_query = (not is_counterparty_msg) and (not is_match_query) and (
-        rfq_tool_service.check_analysis_query_intent(last_user_content)
-        or (agent is not None and agent.id in ("market_research", "price_analyst", "logistics", "verification"))
-    )
-
-    previous_focus = (conversation.state or {}).get("market_focus") if conversation else None
-    focus = _resolve_market_focus(last_user_content, previous_focus)
-
-    if db and user and is_match_query and (
-        not matched_candidates or _candidates_are_stale(matched_candidates, focus, last_user_content)
-    ):
-        matched_candidates = await _fetch_catalog_candidates_for_query(db, user, focus)
-
-    # "send the message to this buyer": work out who "this buyer" is before the model writes to them.
     counterparty_context = None
     if is_counterparty_msg and db is not None and user is not None:
         counterparty_context, resolved_conn_id = await _resolve_counterparty_context(
@@ -2421,294 +1966,214 @@ async def stream_business_chat_reply(
         if resolved_conn_id and not active_connection_id:
             active_connection_id = resolved_conn_id
 
-    # 2. Autonomous Super Agent Routing (AI Semantic Intent & Role Resolution)
-    routed_agent, active_tools, routing_meta = await route_query_to_agent_async(
-        user_query=last_user_content,
-        current_draft=draft,
-        matched_candidates=matched_candidates,
-        active_connection_id=active_connection_id,
-        last_counterparty_msg=last_counterparty_msg,
+    # The shown specialist is cosmetic: parser intent now, the tools actually used later.
+    routed_agent, _why = agent_for_intent(
+        parsed_intent or chat_permissions.effective_intent(last_user_content),
+        draft=draft,
         explicit_agent_id=agent.id if agent else None,
     )
-    routed_agent_info = {
-        "id": routed_agent.id,
-        "name": routed_agent.name,
-        "icon": routed_agent.icon,
-        "short_description": routed_agent.short_description,
-    }
-
-    # Extract dynamic AI entities if available
-    sem_ext = routing_meta.get("semantic_extraction") or {}
-    ai_prod = sem_ext.get("product")
-    ai_cat = sem_ext.get("category")
-    ai_loc = sem_ext.get("location")
-
-    from services import query_extractor
-    req_linguistic = query_extractor.extract(last_user_content)
-    focus = _resolve_market_focus(last_user_content, previous_focus, sem_ext)
+    agent_state = {"info": agent_info(routed_agent)}
     _remember_market_focus(conversation, focus)
-    resolved_role = focus["role"]
 
-    effective_prod = _grounded_ai_product(ai_prod, last_user_content) or req_linguistic.product
-    effective_cat = req_linguistic.category or ai_cat or (query_extractor._infer_category(effective_prod) if effective_prod else None)
-
-    if not is_analysis_query:
+    req_linguistic = query_extractor.extract(last_user_content)
+    effective_prod = _grounded_ai_product(sem_ext.get("product"), last_user_content) or req_linguistic.product
+    effective_cat = req_linguistic.category or sem_ext.get("category") or (
+        query_extractor._infer_category(effective_prod) if effective_prod else None
+    )
+    if "update_rfq_draft" in allowed:
         stated_role = query_extractor.detect_role(last_user_content)
-        if resolved_role:
-            if not draft.get("role") or (stated_role and draft.get("role") != stated_role.value):
-                draft["role"] = resolved_role
-
+        if focus["role"] and (not draft.get("role") or (stated_role and draft.get("role") != stated_role.value)):
+            draft["role"] = focus["role"]
         if effective_prod and not (draft.get("product_details") or {}).get("name"):
-            if "product_details" not in draft or not isinstance(draft["product_details"], dict):
+            if not isinstance(draft.get("product_details"), dict):
                 draft["product_details"] = {}
             draft["product_details"]["name"] = effective_prod
-
         if effective_cat and not draft.get("category"):
             draft["category"] = effective_cat
-
+        ai_loc = sem_ext.get("location")
         if ai_loc and not (draft.get("location") or {}).get("city"):
             raw_city = ai_loc.split(",")[0].strip()
-            city_name = _clean_city_name(raw_city) or raw_city
-            draft["location"] = {"city": city_name, "country": "India"}
+            draft["location"] = {"city": _clean_city_name(raw_city) or raw_city, "country": "India"}
         elif req_linguistic.city and not (draft.get("location") or {}).get("city"):
-            draft["location"] = {"city": _clean_city_name(req_linguistic.city) or req_linguistic.city, "country": req_linguistic.country or "India"}
-
+            draft["location"] = {
+                "city": _clean_city_name(req_linguistic.city) or req_linguistic.city,
+                "country": req_linguistic.country or "India",
+            }
     readiness = rfq_tool_service.evaluate_rfq_readiness(draft)
-
-    # 4. Context Sliding Window (Bounded Token Usage, No Memory Spikes)
     window_messages, older_summary = build_sliding_window_messages(messages, max_history_turns=8)
+    tool_cards: list[dict[str, Any]] = []
 
+    # ---- event helpers -------------------------------------------------
     def emit(chunk: dict[str, Any]) -> dict[str, Any]:
         if active_conv_id:
             chunk["conversation_id"] = active_conv_id
-        if "routed_agent" not in chunk:
-            chunk["routed_agent"] = routed_agent_info
-        if matched_candidates and chunk.get("done") and "matched_candidates" not in chunk:
-            chunk["matched_candidates"] = matched_candidates
+        chunk.setdefault("routed_agent", agent_state["info"])
+        if client_cands and chunk.get("done") and "matched_candidates" not in chunk:
+            chunk["matched_candidates"] = client_cands
         return chunk
 
-    async def _persist_stream_terminal(
-        reply_content: str,
-        thinking_val: Optional[str] = None,
-        thinking_after_val: Optional[str] = None,
-        tool_step_val: Optional[dict[str, Any]] = None,
-        created_rfq_val: Optional[dict[str, Any]] = None,
-        counterparty_message_val: Optional[dict[str, Any]] = None,
-    ):
+    def wire(
+        *,
+        content: str = "",
+        thinking: str = "",
+        tool_step: Optional[dict[str, Any]] = None,
+        created: Optional[dict[str, Any]] = None,
+        cp_msg: Optional[dict[str, Any]] = None,
+        done: bool = False,
+        replace: bool = False,
+        draft_now: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        d = draft if draft_now is None else draft_now
+        chunk: dict[str, Any] = {"content": content}
+        if replace:
+            chunk["replace_content"] = True
+        chunk.update({
+            "thinking": thinking,
+            "thinking_after": "",
+            "tool_step": tool_step,
+            "rfq_draft": d,
+            "readiness": rfq_tool_service.evaluate_rfq_readiness(d) if draft_now is not None else readiness,
+            "created_rfq": created,
+            "counterparty_message": cp_msg,
+            "done": done,
+        })
+        return emit(chunk)
+
+    async def finish(
+        *,
+        kind: str = "final",
+        reply: str,
+        wire_content: Optional[str] = None,
+        thinking: Optional[str] = None,
+        tool_step: Optional[dict[str, Any]] = None,
+        created: Optional[dict[str, Any]] = None,
+        cp_msg: Optional[dict[str, Any]] = None,
+        cards: Optional[list[dict[str, Any]]] = None,
+    ) -> ChatEvent:
+        """Persist the turn once and build its last event."""
+        persisted = reply.strip() if kind == "error" else reply
         if db is not None and conversation is not None:
             try:
-                metadata = {
-                    "thinking": thinking_val or None,
-                    "thinking_after": thinking_after_val or None,
-                    "tool_step": tool_step_val,
-                    "created_rfq": created_rfq_val,
-                    "counterparty_message": counterparty_message_val,
-                    "routed_agent": routed_agent_info,
-                }
                 await save_message_to_conversation(
                     db,
                     conversation.id,
                     role="assistant",
-                    content=reply_content,
-                    metadata=metadata,
-                )
-                rfq_uuid = (
-                    uuid.UUID(created_rfq_val["id"])
-                    if created_rfq_val and created_rfq_val.get("id")
-                    else None
+                    content=persisted,
+                    metadata={
+                        "thinking": thinking or None,
+                        "thinking_after": None,
+                        "tool_step": tool_step,
+                        "created_rfq": created,
+                        "counterparty_message": cp_msg,
+                        "routed_agent": agent_state["info"],
+                    },
                 )
                 await update_conversation_after_turn(
                     db,
                     conversation,
                     draft=draft,
                     readiness=readiness,
-                    rfq_id=rfq_uuid,
+                    rfq_id=uuid.UUID(created["id"]) if created and created.get("id") else None,
                     user_prompt=last_user_content,
-                    matched_candidates=matched_candidates,
+                    matched_candidates=cards or matched_candidates,
                     active_connection_id=active_connection_id,
-                    last_counterparty_message=counterparty_message_val or last_counterparty_msg,
+                    last_counterparty_message=cp_msg or last_counterparty_msg,
                 )
             except Exception as exc:
-                logger.exception("Failed to persist stream turn: %s", exc)
+                logger.exception("Failed to persist turn: %s", exc)
+        chunk = wire(
+            content=reply if wire_content is None else wire_content,
+            tool_step=tool_step, created=created, cp_msg=cp_msg, done=True,
+        )
+        result = TurnResult(
+            reply=persisted, thinking=thinking or None, rfq_draft=draft, readiness=readiness,
+            created_rfq=created, counterparty_message=cp_msg,
+            conversation_id=conversation.id if conversation else None, routed_agent=agent_state["info"],
+        )
+        return ChatEvent(kind, chunk, result)
 
-    # 5. Build dynamic system prompt
+    def create_step(created: Optional[dict[str, Any]], err: Optional[str]) -> dict[str, Any]:
+        return {
+            "name": "create_rfq",
+            "title": "Creating Marketplace RFQ",
+            "status": "completed" if created else "failed",
+            "args": {"title": created["title"], "id": created["id"]} if created else {"error": err},
+        }
+
+    # ---- prompt --------------------------------------------------------
     dynamic_system_prompt = build_rfq_system_prompt(
         draft,
         readiness,
         matched_candidates=matched_candidates,
         last_counterparty_message=last_counterparty_msg,
         active_connection_id=active_connection_id,
-        is_analysis_query=is_analysis_query,
+        allowed_tools=allowed,
         routed_agent=routed_agent,
         older_history_summary=older_summary,
         counterparty_context=counterparty_context,
         user=user,
     )
-    prepared_messages: list[dict[str, Any]] = [
-        {"role": "system", "content": dynamic_system_prompt}
-    ]
-    prepared_messages.extend(window_messages)
+    prepared_messages: list[dict[str, Any]] = [{"role": "system", "content": dynamic_system_prompt}, *window_messages]
 
     if len(prepared_messages) == 1:
-        hello_reply = "Hello! I am your B2B Marketplace Business Assistant. Are you looking to BUY or SELL goods?"
-        await _persist_stream_terminal(reply_content=hello_reply)
-        yield emit({
-            "content": hello_reply,
-            "thinking": "",
-            "thinking_after": "",
-            "tool_step": None,
-            "rfq_draft": draft,
-            "readiness": readiness,
-            "created_rfq": None,
-            "counterparty_message": None,
-            "done": True,
-        })
+        yield await finish(reply=_HELLO_REPLY)
         return
 
-    # Immediate handling when user explicitly asks to create/proceed with RFQ
-    if not is_match_query and not is_analysis_query and not is_counterparty_msg and rfq_tool_service.check_create_rfq_intent(last_user_content):
+    # ---- explicit-command shortcuts (create / close) --------------------
+    if "create_rfq" in allowed:
+        agent_state["info"] = agent_info(agent_for_tools(["create_rfq"]) or routed_agent)
         if readiness["has_role"] and readiness["has_product"]:
-            # Initial thinking step
-            yield emit({
-                "content": "",
-                "thinking": "User requested to finalize and publish RFQ. Validating required fields and submitting listing to marketplace database...",
-                "thinking_after": "",
-                "tool_step": None,
-                "rfq_draft": draft,
-                "readiness": readiness,
-                "created_rfq": None,
-                "counterparty_message": None,
-                "done": False,
-            })
-            created_rfq_obj, err = await execute_create_rfq_call(draft, {}, db=db, user=user)
-            tool_step = {
-                "name": "create_rfq",
-                "title": "Creating Marketplace RFQ",
-                "status": "completed" if created_rfq_obj else "failed",
-                "args": (
-                    {"title": created_rfq_obj["title"], "id": created_rfq_obj["id"]}
-                    if created_rfq_obj
-                    else {"error": err}
-                ),
-            }
-            yield emit({
-                "content": "",
-                "thinking": "",
-                "thinking_after": "",
-                "tool_step": tool_step,
-                "rfq_draft": draft,
-                "readiness": readiness,
-                "created_rfq": created_rfq_obj,
-                "counterparty_message": None,
-                "done": False,
-            })
-            if created_rfq_obj:
-                reply_text = format_created_rfq_text(created_rfq_obj)
-            else:
-                reply_text = f"⚠️ {err or 'Failed to create RFQ.'}"
-
-            await _persist_stream_terminal(
-                reply_content=reply_text,
-                tool_step_val=tool_step,
-                created_rfq_val=created_rfq_obj,
-                counterparty_message_val=None,
+            yield ChatEvent("status", wire(
+                thinking="User requested to finalize and publish RFQ. Validating required fields and submitting listing to marketplace database..."
+            ))
+            created, err = await execute_create_rfq_call(draft, {}, db=db, user=user)
+            step = create_step(created, err)
+            yield ChatEvent("tool_step", wire(tool_step=step, created=created))
+            reply = format_created_rfq_text(created) if created else f"⚠️ {err or 'Failed to create RFQ.'}"
+            yield await finish(
+                reply=reply, tool_step=step, created=created,
+                thinking="Validated required fields and submitted RFQ to marketplace database.",
             )
-            yield emit({
-                "content": reply_text,
-                "thinking": "",
-                "thinking_after": "",
-                "tool_step": tool_step,
-                "rfq_draft": draft,
-                "readiness": readiness,
-                "created_rfq": created_rfq_obj,
-                "counterparty_message": None,
-                "done": True,
-            })
-            return
         else:
             missing = []
             if not readiness["has_role"]:
                 missing.append("Role (Buyer or Seller)")
             if not readiness["has_product"]:
                 missing.append("Product name")
-            missing_str = " and ".join(missing)
-            missing_reply = f"To create your RFQ, we still need {missing_str}. Are you looking to BUY or SELL goods, and what product?"
-            await _persist_stream_terminal(reply_content=missing_reply)
-            yield emit({
-                "content": missing_reply,
-                "thinking": "",
-                "thinking_after": "",
-                "tool_step": None,
-                "rfq_draft": draft,
-                "readiness": readiness,
-                "created_rfq": None,
-                "counterparty_message": None,
-                "done": True,
-            })
-            return
-
-    # Immediate handling when user explicitly asks to close an RFQ
-    if not is_match_query and not is_analysis_query and not is_counterparty_msg and rfq_tool_service.check_close_rfq_intent(last_user_content):
-        closed_rfq_obj, err = await execute_close_rfq_call(
-            rfq_id_str=None, conversation=conversation, db=db, user=user
-        )
-        tool_step = {
-            "name": "close_rfq",
-            "title": "Closing Marketplace RFQ",
-            "status": "completed" if closed_rfq_obj else "failed",
-            "args": (
-                {"title": closed_rfq_obj["title"], "id": closed_rfq_obj["id"]}
-                if closed_rfq_obj
-                else {"error": err}
-            ),
-        }
-        if closed_rfq_obj:
-            reply_text = f"✅ **RFQ Closed:** '{closed_rfq_obj['title']}' (ID: `{closed_rfq_obj['id']}`) has been successfully closed. It is no longer active in the marketplace and will not appear in match searches."
-        else:
-            reply_text = f"⚠️ {err or 'Could not close the RFQ.'}"
-
-        await _persist_stream_terminal(
-            reply_content=reply_text,
-            tool_step_val=tool_step,
-            created_rfq_val=closed_rfq_obj,
-            counterparty_message_val=None,
-        )
-        yield emit({
-            "content": reply_text,
-            "thinking": "",
-            "thinking_after": "",
-            "tool_step": tool_step,
-            "rfq_draft": draft,
-            "readiness": readiness,
-            "created_rfq": closed_rfq_obj,
-            "counterparty_message": None,
-            "done": True,
-        })
+            yield await finish(
+                reply=f"To create your RFQ, we still need {' and '.join(missing)}. Are you looking to BUY or SELL goods, and what product?"
+            )
         return
 
-    # Tools are provisioned dynamically by the Super Agent router, ensuring action tools are never stripped
-    tools = active_tools
-    draft_guards = _draft_guards(messages, last_user_content, draft)
+    if "close_rfq" in allowed:
+        agent_state["info"] = agent_info(agent_for_tools(["close_rfq"]) or routed_agent)
+        closed, err = await execute_close_rfq_call(
+            rfq_id_str=chat_permissions.close_rfq_target(last_user_content),
+            conversation=conversation, db=db, user=user, require_unambiguous=True,
+        )
+        step = {
+            "name": "close_rfq",
+            "title": "Closing Marketplace RFQ",
+            "status": "completed" if closed else "failed",
+            "args": {"title": closed["title"], "id": closed["id"]} if closed else {"error": err},
+        }
+        if closed:
+            reply = (
+                f"✅ **RFQ Closed:** '{closed['title']}' (ID: `{closed['id']}`) has been successfully closed. "
+                "It is no longer active in the marketplace and will not appear in match searches."
+            )
+        else:
+            reply = f"⚠️ {err or 'Could not close the RFQ.'}"
+        yield await finish(reply=reply, tool_step=step, created=closed)
+        return
 
-    captured_tool_step = None
+    # ---- answer: read tools + allowed action tools ----------------------
+    captured_tool_step: Optional[dict[str, Any]] = None
     try:
-        total_content = ""
-        total_thinking = ""
-        total_thinking_after = ""
-        created_rfq_obj = None
-        counterparty_msg_obj = None
-        draft_msg_fallback = None
-        # The answer is verified before any of it is shown, so it is sent once, whole.
-        content_replaced = False
-
         queue: asyncio.Queue = asyncio.Queue()
-
-        async def _on_progress(event: dict[str, Any]) -> None:
-            queue.put_nowait({"__progress": event})
-
         runner = _ActionRunner(
             draft=draft,
-            draft_guards=draft_guards,
+            draft_guards=_draft_guards(messages, last_user_content, draft),
             db=db,
             user=user,
             conversation=conversation,
@@ -2718,20 +2183,10 @@ async def stream_business_chat_reply(
             on_step=queue.put_nowait,
         )
 
-        def _status(text: str) -> dict[str, Any]:
-            return emit({
-                "content": "",
-                "thinking": text,
-                "thinking_after": "",
-                "tool_step": None,
-                "rfq_draft": runner.draft,
-                "readiness": rfq_tool_service.evaluate_rfq_readiness(runner.draft),
-                "created_rfq": None,
-                "counterparty_message": None,
-                "done": False,
-            })
+        def status(text: str) -> ChatEvent:
+            return ChatEvent("status", wire(thinking=text, draft_now=runner.draft))
 
-        yield _status("Looking up verified marketplace data...\n")
+        yield status("Looking up verified marketplace data...\n")
         task = asyncio.create_task(
             answer_engine.answer(
                 db,
@@ -2739,13 +2194,13 @@ async def stream_business_chat_reply(
                 history_messages=window_messages,
                 system_prompt=dynamic_system_prompt,
                 user_message=last_user_content,
-                extra_tools=tools,
+                extra_tools=_action_tool_specs(allowed),
                 tool_executor=runner,
                 context=AnswerContext(
                     rfq_id=str(rfq_id) if rfq_id else None,
                     draft=lambda: runner.draft,
                     extra_allowed_text=_engine_allowed_text(matched_candidates, counterparty_context, last_counterparty_msg),
-                    on_progress=_on_progress,
+                    on_progress=lambda event: queue.put_nowait({"__progress": event}),
                 ),
             )
         )
@@ -2758,21 +2213,14 @@ async def stream_business_chat_reply(
                 if "__progress" in item:
                     event = item["__progress"]
                     if event.get("event") == "verifying":
-                        yield _status("Checking every number against the data...\n")
+                        yield status("Checking every number against the data...\n")
                     elif event.get("name") in answer_engine.market_data_tools.READ_TOOL_NAMES:
-                        yield _status(f"Looking up: {str(event['name']).replace('_', ' ')}\n")
+                        yield status(f"Looking up: {str(event['name']).replace('_', ' ')}\n")
                     continue
-                yield emit({
-                    "content": "",
-                    "thinking": "",
-                    "thinking_after": "",
-                    "tool_step": item.get("tool_step"),
-                    "rfq_draft": runner.draft,
-                    "readiness": rfq_tool_service.evaluate_rfq_readiness(runner.draft),
-                    "created_rfq": item.get("created_rfq"),
-                    "counterparty_message": item.get("counterparty_message"),
-                    "done": False,
-                })
+                yield ChatEvent("tool_step", wire(
+                    tool_step=item.get("tool_step"), created=item.get("created_rfq"),
+                    cp_msg=item.get("counterparty_message"), draft_now=runner.draft,
+                ))
         finally:
             if not task.done():
                 task.cancel()
@@ -2782,96 +2230,54 @@ async def stream_business_chat_reply(
         readiness = rfq_tool_service.evaluate_rfq_readiness(draft)
         created_rfq_obj = runner.created_rfq_obj
         counterparty_msg_obj = runner.counterparty_msg_obj
-        draft_msg_fallback = runner.draft_msg_fallback
         captured_tool_step = runner.captured_tool_step
         total_content = engine_result.text
-        total_thinking = engine_result.thinking or ""
+        thinking = engine_result.thinking or None
+        tool_cards = _cards_from_tool_results(engine_result.tool_results)
+
+        # The badge follows the tools the assistant really used.
+        used = [r.get("tool") for r in engine_result.tool_results] + [a.get("tool") for a in engine_result.action_results]
+        used_agent = agent_for_tools(t for t in used if t)
+        if used_agent is not None:
+            agent_state["info"] = agent_info(used_agent)
+
         if is_counterparty_msg and engine_result.used_fallback and not engine_result.tool_results:
-            total_content = ""
+            total_content = ""  # a letter is not a data answer; the composer below builds it
 
         if engine_result.llm_error and not engine_result.tool_results and not runner.touched:
-            unavail_reply = "\n\n⚠️ [Connection to local AI assistant interrupted.]"
-            await _persist_stream_terminal(reply_content=unavail_reply)
-            yield emit({
-                "content": unavail_reply,
-                "thinking": "",
-                "thinking_after": "",
-                "tool_step": None,
-                "rfq_draft": draft,
-                "readiness": readiness,
-                "created_rfq": None,
-                "counterparty_message": None,
-                "done": True,
-            })
+            yield await finish(kind="error", reply=_CONNECTION_LOST)
             return
 
         if runner.err_reply and (not total_content or runner.duplicate):
             total_content = runner.err_reply
-        if draft_msg_fallback and not total_content:
-            draft_msg_text, draft_err = draft_msg_fallback
-            total_content = (
-                f"📝 **Negotiation Message Draft:**\n\n"
-                f"> {draft_msg_text}\n\n"
-                f"⚠️ *Note: {draft_err}*"
-            )
+        if runner.draft_msg_fallback and not total_content:
+            draft_msg_text, draft_err = runner.draft_msg_fallback
+            total_content = f"📝 **Negotiation Message Draft:**\n\n> {draft_msg_text}\n\n⚠️ *Note: {draft_err}*"
 
         # Guardrail recovery: the model refused a legitimate business request.
-        # Recover before the fallbacks below reuse the text as a counterparty letter.
         if is_false_positive_refusal(total_content, last_user_content):
             total_content = await _recover_from_false_refusal(prepared_messages, last_user_content, call_model=True) or ""
-            content_replaced = True
-
-        # Check user intent to create if tool was not called explicitly by model
-        if not is_match_query and not is_analysis_query and not is_counterparty_msg and not created_rfq_obj and rfq_tool_service.check_create_rfq_intent(last_user_content):
-            if readiness["has_role"] and readiness["has_product"]:
-                created_rfq_obj, err = await execute_create_rfq_call(draft, {}, db=db, user=user)
-                captured_tool_step = {
-                    "name": "create_rfq",
-                    "title": "Creating Marketplace RFQ",
-                    "status": "completed" if created_rfq_obj else "failed",
-                    "args": (
-                        {"title": created_rfq_obj["title"], "id": created_rfq_obj["id"]}
-                        if created_rfq_obj
-                        else {"error": err}
-                    ),
-                }
-                yield emit({
-                    "content": "",
-                    "thinking": "",
-                    "thinking_after": "",
-                    "tool_step": captured_tool_step,
-                    "rfq_draft": draft,
-                    "readiness": readiness,
-                    "created_rfq": created_rfq_obj,
-                    "counterparty_message": None,
-                    "done": False,
-                })
 
         # Never let the model announce an RFQ that was not actually created.
         if not created_rfq_obj and claims_rfq_created(total_content):
             logger.warning("Model claimed RFQ creation without a create_rfq call; correcting reply.")
             total_content = unbacked_creation_reply(draft, readiness)
-            content_replaced = True
 
-        # Check deterministic counterparty messaging fallback if tool was not called explicitly
-        is_dispatch_reply = bool(re.search(r"(✉️|📝|message\s+sent\s+to|dispatched|drafted|dear\s+[\w\s]+,)", total_content, re.IGNORECASE))
-        if not counterparty_msg_obj and (is_counterparty_msg or is_dispatch_reply):
+        # The model may skip the message tool; compose the letter deterministically.
+        if not counterparty_msg_obj and (is_counterparty_msg or _DISPATCH_REPLY_RE.search(total_content)):
             msg_to_send = extract_or_compose_counterparty_message(
-                reply_text=total_content,
-                user_instruction=last_user_content,
-                last_counterparty_info=last_counterparty_msg,
-                draft=draft,
+                reply_text=total_content, user_instruction=last_user_content,
+                last_counterparty_info=last_counterparty_msg, draft=draft,
             )
             recipient_name = extract_recipient_name(
-                reply_text=total_content,
-                last_counterparty_info=last_counterparty_msg,
-                matched_candidates=matched_candidates,
+                reply_text=total_content, last_counterparty_info=last_counterparty_msg,
+                matched_candidates=matched_candidates or tool_cards,
             )
-            counterparty_msg_obj, err = await execute_draft_counterparty_message_call(
+            counterparty_msg_obj, _err = await execute_draft_counterparty_message_call(
                 tool_args={"message": msg_to_send, "recipient_name": recipient_name},
                 db=db,
                 user=user,
-                matched_candidates=matched_candidates,
+                matched_candidates=matched_candidates or tool_cards,
                 active_connection_id=active_connection_id,
                 connection_hint=_connection_hint(last_user_content, focus),
             )
@@ -2883,24 +2289,19 @@ async def stream_business_chat_reply(
                     "status": "completed",
                     "args": {"recipient": c_name, "message": counterparty_msg_obj["message"]},
                 }
-                yield emit({
-                    "content": "",
-                    "thinking": "",
-                    "thinking_after": "",
-                    "tool_step": captured_tool_step,
-                    "rfq_draft": draft,
-                    "readiness": readiness,
-                    "created_rfq": None,
-                    "counterparty_message": counterparty_msg_obj,
-                    "done": False,
-                })
+                agent_state["info"] = agent_info(agent_for_tools(["draft_counterparty_message"]) or routed_agent)
+                yield ChatEvent("tool_step", wire(tool_step=captured_tool_step, cp_msg=counterparty_msg_obj))
 
-        # If model did not emit tool_calls in stream, but preprocessing updated fields
-        if not is_match_query and not is_analysis_query and not is_counterparty_msg and not counterparty_msg_obj and not captured_tool_step and draft != (current_rfq or {}):
-            extracted_args = {}
-            for k in ("role", "category", "product_details", "quantity", "price_target", "location", "deadline"):
-                if draft.get(k) and draft.get(k) != (current_rfq or {}).get(k):
-                    extracted_args[k] = draft[k]
+        # Preprocessing may have captured fields the model did not record through the tool.
+        if (
+            "update_rfq_draft" in allowed and not counterparty_msg_obj and not captured_tool_step
+            and draft != (current_rfq or {})
+        ):
+            extracted_args = {
+                k: draft[k]
+                for k in ("role", "category", "product_details", "quantity", "price_target", "location", "deadline")
+                if draft.get(k) and draft.get(k) != (current_rfq or {}).get(k)
+            }
             if extracted_args:
                 captured_tool_step = {
                     "name": "update_rfq_draft",
@@ -2908,179 +2309,104 @@ async def stream_business_chat_reply(
                     "status": "completed",
                     "args": extracted_args,
                 }
-                yield emit({
-                    "content": "",
-                    "thinking": "",
-                    "thinking_after": "",
-                    "tool_step": captured_tool_step,
-                    "rfq_draft": draft,
-                    "readiness": readiness,
-                    "created_rfq": None,
-                    "counterparty_message": None,
-                    "done": False,
-                })
+                agent_state["info"] = agent_info(agent_for_tools(["update_rfq_draft"]) or routed_agent)
+                yield ChatEvent("tool_step", wire(tool_step=captured_tool_step))
 
-        # Check if counterparty_msg_obj has a truncated message and total_content has the full message
+        # The tool argument can be cut off mid-sentence; the reply may hold the whole letter.
         if counterparty_msg_obj and is_truncated_message(counterparty_msg_obj.get("message", "")):
             complete_letter = extract_or_compose_counterparty_message(
-                reply_text=total_content,
-                user_instruction=last_user_content,
-                last_counterparty_info=last_counterparty_msg,
-                draft=draft,
+                reply_text=total_content, user_instruction=last_user_content,
+                last_counterparty_info=last_counterparty_msg, draft=draft,
             )
             if complete_letter and not is_truncated_message(complete_letter):
                 counterparty_msg_obj["message"] = complete_letter
                 if counterparty_msg_obj.get("message_id") and db:
                     try:
                         from models.connection import ConnectionMessage
-                        msg_uuid = uuid.UUID(str(counterparty_msg_obj["message_id"]))
-                        db_msg = await db.get(ConnectionMessage, msg_uuid)
+
+                        db_msg = await db.get(ConnectionMessage, uuid.UUID(str(counterparty_msg_obj["message_id"])))
                         if db_msg:
                             db_msg.content = complete_letter
                             await db.commit()
                     except Exception as exc:
                         logger.warning("Could not update truncated message in DB: %s", exc)
 
+        if not total_content.strip() and thinking and not counterparty_msg_obj and not created_rfq_obj:
+            total_content, thinking = thinking, None
+
         if total_content.strip() and not created_rfq_obj:
-            yield emit({
-                "content": total_content,
-                "replace_content": True,
-                "thinking": "",
-                "thinking_after": "",
-                "tool_step": None,
-                "rfq_draft": draft,
-                "readiness": readiness,
-                "created_rfq": None,
-                "counterparty_message": None,
-                "done": False,
-            })
+            yield ChatEvent("replace_content", wire(content=total_content, replace=True))
 
-        # Final completion chunk
         if counterparty_msg_obj:
-            if total_content.strip():
-                final_content = ""
-                persist_content = total_content
-            else:
-                final_content = format_counterparty_message_text(counterparty_msg_obj)
-                persist_content = final_content
-
-            await _persist_stream_terminal(
-                reply_content=persist_content,
-                thinking_val=total_thinking,
-                thinking_after_val=total_thinking_after,
-                tool_step_val=captured_tool_step,
-                created_rfq_val=None,
-                counterparty_message_val=counterparty_msg_obj,
+            shown = "" if total_content.strip() else format_counterparty_message_text(counterparty_msg_obj)
+            yield await finish(
+                reply=total_content if total_content.strip() else shown, wire_content=shown, thinking=thinking,
+                tool_step=captured_tool_step, cp_msg=counterparty_msg_obj,
             )
-            yield emit({
-                "content": final_content,
-                "thinking": "",
-                "thinking_after": "",
-                "tool_step": captured_tool_step,
-                "rfq_draft": draft,
-                "readiness": readiness,
-                "created_rfq": None,
-                "counterparty_message": counterparty_msg_obj,
-                "done": True,
-            })
         elif created_rfq_obj:
-            final_content = format_created_rfq_text(created_rfq_obj)
-            persist_content = final_content
-
-            await _persist_stream_terminal(
-                reply_content=persist_content,
-                thinking_val=total_thinking,
-                thinking_after_val=total_thinking_after,
-                tool_step_val=captured_tool_step,
-                created_rfq_val=created_rfq_obj,
-                counterparty_message_val=None,
+            yield await finish(
+                reply=format_created_rfq_text(created_rfq_obj), thinking=thinking,
+                tool_step=captured_tool_step, created=created_rfq_obj,
             )
-            yield emit({
-                "content": final_content,
-                "thinking": "",
-                "thinking_after": "",
-                "tool_step": captured_tool_step,
-                "rfq_draft": draft,
-                "readiness": readiness,
-                "created_rfq": created_rfq_obj,
-                "counterparty_message": None,
-                "done": True,
-            })
         elif total_content.strip():
-            link_appendix = ""
-            if is_match_query and matched_candidates and "/marketplace?rfq=" not in total_content and not total_content.startswith("⚠️"):
-                link_appendix = build_rfq_link_appendix(matched_candidates)
-                if link_appendix:
-                    total_content += link_appendix
-
-            await _persist_stream_terminal(
-                reply_content=total_content,
-                thinking_val=total_thinking,
-                thinking_after_val=total_thinking_after,
-                tool_step_val=captured_tool_step,
-                created_rfq_val=None,
-                counterparty_message_val=None,
+            appendix = ""
+            wants_links = any(c for c in tool_cards) and (
+                any(r.get("tool") == "find_matches" for r in engine_result.tool_results)
+                or chat_permissions.effective_intent(last_user_content, parsed_intent) == "search"
             )
-            yield emit({
-                "content": link_appendix,
-                "thinking": "",
-                "thinking_after": "",
-                "tool_step": captured_tool_step,
-                "rfq_draft": draft,
-                "readiness": readiness,
-                "created_rfq": None,
-                "counterparty_message": None,
-                "done": True,
-            })
+            if wants_links and "/marketplace?rfq=" not in total_content and not total_content.startswith("⚠️"):
+                appendix = build_rfq_link_appendix(tool_cards)
+            yield await finish(
+                reply=total_content + appendix, wire_content=appendix, thinking=thinking,
+                tool_step=captured_tool_step, cards=tool_cards or None,
+            )
         else:
-            # Provide intelligent, structured acknowledgment based on current draft
-            fallback_text = format_rfq_summary_text(draft, readiness)
-            await _persist_stream_terminal(
-                reply_content=fallback_text,
-                thinking_val=total_thinking,
-                thinking_after_val=total_thinking_after,
-                tool_step_val=captured_tool_step,
-                created_rfq_val=None,
-                counterparty_message_val=None,
+            yield await finish(
+                reply=format_rfq_summary_text(draft, readiness), thinking=thinking, tool_step=captured_tool_step
             )
-            yield emit({
-                "content": fallback_text,
-                "thinking": "",
-                "thinking_after": "",
-                "tool_step": captured_tool_step,
-                "rfq_draft": draft,
-                "readiness": readiness,
-                "created_rfq": None,
-                "counterparty_message": None,
-                "done": True,
-            })
-
     except httpx.TimeoutException:
-        timeout_msg = "\n\n⏳ [Response timed out. Please try asking a more concise question.]"
-        await _persist_stream_terminal(reply_content=timeout_msg, tool_step_val=captured_tool_step)
-        yield emit({
-            "content": timeout_msg,
-            "thinking": "",
-            "thinking_after": "",
-            "tool_step": captured_tool_step,
-            "rfq_draft": draft,
-            "readiness": readiness,
-            "created_rfq": None,
-            "counterparty_message": None,
-            "done": True,
-        })
+        yield await finish(kind="error", reply=_TIMED_OUT, tool_step=captured_tool_step)
     except Exception as exc:
-        logger.error("Ollama stream failed: %s", exc)
-        error_msg = "\n\n⚠️ [Connection to local AI assistant interrupted.]"
-        await _persist_stream_terminal(reply_content=error_msg, tool_step_val=captured_tool_step)
-        yield emit({
-            "content": error_msg,
-            "thinking": "",
-            "thinking_after": "",
-            "tool_step": captured_tool_step,
-            "rfq_draft": draft,
-            "readiness": readiness,
-            "created_rfq": None,
-            "counterparty_message": None,
-            "done": True,
-        })
+        logger.error("Chat turn failed: %s", exc)
+        yield await finish(kind="error", reply=_CONNECTION_LOST, tool_step=captured_tool_step)
+
+
+async def generate_business_chat_reply(
+    messages: list[Any],
+    current_rfq: Optional[dict[str, Any]] = None,
+    db: Optional[AsyncSession] = None,
+    user: Optional[User] = None,
+    conversation_id: Optional[uuid.UUID] = None,
+    matched_candidates: Optional[list[dict[str, Any]]] = None,
+    active_connection_id: Optional[Union[str, uuid.UUID]] = None,
+    agent: Optional[AgentDefinition] = None,
+    rfq_id: Optional[uuid.UUID] = None,
+) -> dict[str, Any]:
+    """Run one chat turn and return the finished response (the /message endpoint)."""
+    result: Optional[TurnResult] = None
+    async for event in _run_chat_turn(
+        messages, current_rfq, db, user, conversation_id, matched_candidates, active_connection_id, agent, rfq_id
+    ):
+        if event.result is not None:
+            result = event.result
+    if result is None:  # the turn always ends with a final or error event
+        raise RuntimeError("chat turn ended without a result")
+    return result.as_response()
+
+
+async def stream_business_chat_reply(
+    messages: list[Any],
+    current_rfq: Optional[dict[str, Any]] = None,
+    db: Optional[AsyncSession] = None,
+    user: Optional[User] = None,
+    conversation_id: Optional[uuid.UUID] = None,
+    matched_candidates: Optional[list[dict[str, Any]]] = None,
+    active_connection_id: Optional[Union[str, uuid.UUID]] = None,
+    agent: Optional[AgentDefinition] = None,
+    rfq_id: Optional[uuid.UUID] = None,
+) -> AsyncIterator[dict[str, Any]]:
+    """Run one chat turn and yield its SSE chunks (the /stream endpoint)."""
+    async for event in _run_chat_turn(
+        messages, current_rfq, db, user, conversation_id, matched_candidates, active_connection_id, agent, rfq_id
+    ):
+        yield event.chunk

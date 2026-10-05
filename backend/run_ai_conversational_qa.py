@@ -370,7 +370,7 @@ class ConversationalQAEvaluationEngine:
                         reasons.append(f"Failed to identify SELLER role in: '{p}'")
 
                 # Check agent routing: should route to drafting or market analysis or general assistant, not fail
-                agent_res = agent_router.route_query_to_agent(p)
+                agent_res = agent_router.agent_for_intent(agent_router._fallback_intent(p))
                 agent = agent_res[0] if agent_res else None
                 if not agent:
                     passed = False
@@ -415,7 +415,7 @@ class ConversationalQAEvaluationEngine:
                 count += 1
                 test_id = f"S4_{count:03d}"
                 contextualized_q = f"In category Chemicals, {q}" if i % 2 == 0 else q
-                agent_res = agent_router.route_query_to_agent(contextualized_q)
+                agent_res = agent_router.agent_for_intent(agent_router._fallback_intent(contextualized_q))
                 agent = agent_res[0] if agent_res else None
 
                 passed = True

@@ -20,7 +20,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from models.conversation import Message
 from models.enums import RFQRole
 from models.rfq import RFQ
-from services import agent_router, query_extractor, rfq_tool_service
+from services import agent_router, ai_query_parser, chat_permissions, query_extractor, rfq_tool_service
+from services.query_grounding import AIParse
 from services.ai_chat_service import (
     _connection_relevance,
     claims_rfq_created,
@@ -83,7 +84,7 @@ def test_typos_and_commands_are_not_products(message):
 
 @pytest.mark.parametrize("message", [RAISE_MSG, "raise it", "please raise the rfq"])
 def test_raise_is_a_create_request(message):
-    assert rfq_tool_service.check_create_rfq_intent(message) is True
+    assert chat_permissions.check_create_rfq_intent(message) is True
 
 
 @pytest.mark.parametrize(
@@ -91,62 +92,50 @@ def test_raise_is_a_create_request(message):
     [MESSAGE_BUYER_MSG, "write a note for the suppliers", "reply to this buyer", "send a message to the buyer"],
 )
 def test_messaging_a_counterparty_is_detected_without_a_connection(message):
-    assert rfq_tool_service.check_counterparty_message_intent(message) is True
+    assert chat_permissions.check_counterparty_message_intent(message) is True
 
 
 def test_editing_own_rfq_is_not_a_counterparty_message_during_a_thread():
-    assert rfq_tool_service.check_counterparty_message_intent(ROLE_SWITCH_MSG, has_active_connection=True) is False
+    assert chat_permissions.check_counterparty_message_intent(ROLE_SWITCH_MSG, has_active_connection=True) is False
 
 
 # =============================================================================
-# Router: rules win over the small model for unambiguous actions
+# Permission gate: explicit commands unlock writes, whatever the parser says
 # =============================================================================
 
-def _mock_ai(data):
-    return patch.object(agent_router, "_extract_semantic_intent_with_ai", AsyncMock(return_value=data))
+def _parse_as(message: str, intent: str, **fields):
+    """Make the AI parser "return" a parse for ``message`` (the parser is disabled in tests)."""
+    ai_query_parser._store(message, AIParse(intent=intent, **fields))
 
 
-def _tool_names(tools):
-    return {t["function"]["name"] for t in tools}
+def _allowed(message, parsed_intent, draft=None, **state):
+    return chat_permissions.allowed_action_tools(message, draft, state, parsed_intent)
 
 
-@pytest.mark.asyncio
-async def test_message_request_routes_to_negotiation_even_when_model_says_rfq_drafting():
-    ai = {"product": "basmati rice", "role": "buyer", "intent": "rfq_drafting", "action_needed": "none"}
-    with _mock_ai(ai):
-        agent, tools, _ = await agent_router.route_query_to_agent_async(MESSAGE_BUYER_MSG, current_draft=SELLER_DRAFT)
-    assert agent.id == "negotiation"
-    assert "draft_counterparty_message" in _tool_names(tools)
-    assert "create_rfq" not in _tool_names(tools)
+def test_message_request_unlocks_the_message_tool_even_when_parser_says_rfq_drafting():
+    assert _allowed(MESSAGE_BUYER_MSG, "rfq_drafting", SELLER_DRAFT) == {"draft_counterparty_message"}
+    assert agent_router.agent_for_tools(["draft_counterparty_message"]).id == "negotiation"
 
 
-@pytest.mark.asyncio
-async def test_raise_the_rfq_gets_the_create_tool_even_when_model_offers_none():
-    ai = {"product": "rais", "role": "buyer", "intent": "rfq_drafting", "action_needed": "none"}
-    with _mock_ai(ai):
-        agent, tools, _ = await agent_router.route_query_to_agent_async(RAISE_MSG, current_draft=SELLER_DRAFT)
-    assert agent.id == "rfq_drafting"
-    assert "create_rfq" in _tool_names(tools)
+def test_raise_the_rfq_gets_the_create_tool_even_when_parser_offers_none():
+    allowed = _allowed(RAISE_MSG, "rfq_drafting", SELLER_DRAFT)
+    assert "create_rfq" in allowed
+    assert agent_router.agent_for_tools(["create_rfq"]).id == "rfq_drafting"
 
 
-@pytest.mark.asyncio
-async def test_off_schema_send_message_action_is_understood():
-    ai = {"product": None, "role": None, "intent": None, "action_needed": "send_message"}
-    with _mock_ai(ai):
-        agent, tools, _ = await agent_router.route_query_to_agent_async("pls draft something nice for them")
-    assert agent.id == "negotiation"
-    assert _tool_names(tools) == {"draft_counterparty_message"}
+def test_drafting_something_for_them_is_a_message_request():
+    assert _allowed("pls draft something nice for them", None) == {"draft_counterparty_message"}
 
 
-@pytest.mark.asyncio
-async def test_quantity_update_mid_draft_is_not_market_research():
-    ai = {"product": "delevered", "role": "buyer", "intent": "market_research", "action_needed": "none"}
-    with _mock_ai(ai):
-        agent, tools, meta = await agent_router.route_query_to_agent_async(QUANTITY_MSG, current_draft=SELLER_DRAFT)
-    assert agent.id == "rfq_drafting"
-    assert "update_rfq_draft" in _tool_names(tools)
-    # The model's role guess is not reconciled with a role the user never stated.
-    assert meta["semantic_extraction"]["role"] == "buyer"
+def test_quantity_update_mid_draft_is_not_market_research():
+    # Even if the parser labels it a lookup, a quantity stated mid-draft edits the draft.
+    assert "update_rfq_draft" in _allowed(QUANTITY_MSG, "market_research", SELLER_DRAFT)
+    assert agent_router.agent_for_intent("market_research")[0].id == "market_research"
+
+
+def test_a_market_question_with_a_quantity_in_it_does_not_edit_the_draft():
+    msg = "what is the market price of basmati rice for quantity 50 tonnes?"
+    assert _allowed(msg, "market_research", SELLER_DRAFT) == set()
 
 
 # =============================================================================
@@ -195,9 +184,9 @@ def _mock_stream(content: str):
 async def test_stream_replaces_a_fake_rfq_created_reply(client: AsyncClient, make_actor, db: AsyncSession):
     actor = await make_actor("seller")
     fake = "✅ **RFQ Created Successfully**\nRFQ ID: `rfq_created_20240527_1623`"
-    ai = {"product": "rice", "role": "seller", "intent": "rfq_drafting", "action_needed": "none"}
+    _parse_as("looks good", "rfq_drafting", product="rice")
     # "looks good" is not a create request, so no create_rfq runs this turn.
-    with _mock_ai(ai), _mock_stream(fake):
+    with _mock_stream(fake):
         res = await actor.post(
             "/ai-chat/stream",
             json={"messages": [{"role": "user", "content": "looks good"}], "current_rfq": SELLER_DRAFT},
@@ -225,8 +214,8 @@ async def test_stream_recovers_from_a_false_refusal(client: AsyncClient, make_ac
             return resp
         return await orig_post(self, url, *args, **kwargs)
 
-    ai = {"product": "basmati rice", "role": "seller", "intent": "general", "action_needed": "none"}
-    with _mock_ai(ai), _mock_stream(refusal), patch.object(httpx.AsyncClient, "post", mock_post):
+    _parse_as("what should i tell the buyer about rice quality", "other", product="basmati rice")
+    with _mock_stream(refusal), patch.object(httpx.AsyncClient, "post", mock_post):
         res = await actor.post(
             "/ai-chat/stream",
             json={"messages": [{"role": "user", "content": "what should i tell the buyer about rice quality"}]},
@@ -274,8 +263,8 @@ def test_this_buyer_prefers_the_rice_buyer_connection_over_a_newer_unrelated_one
 @pytest.mark.asyncio
 async def test_reply_is_stored_after_the_question(client: AsyncClient, make_actor, db: AsyncSession):
     actor = await make_actor("seller")
-    ai = {"product": "rice", "role": "seller", "intent": "general", "action_needed": "none"}
-    with _mock_ai(ai), _mock_stream("Noted."):
+    _parse_as("hello there", "chitchat")
+    with _mock_stream("Noted."):
         res = await actor.post("/ai-chat/stream", json={"messages": [{"role": "user", "content": "hello there"}]})
     assert res.status_code == 200
     rows = (await db.execute(select(Message.role, Message.created_at).order_by(Message.created_at))).all()

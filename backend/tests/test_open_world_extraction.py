@@ -6,7 +6,7 @@ import pytest
 
 from core.config import settings
 from models.enums import RFQRole
-from services import agent_router, categories, ai_query_parser, learned_vocabulary, query_extractor
+from services import categories, ai_query_parser, learned_vocabulary, query_extractor
 
 
 NEW_CAT = categories.normalize_category("Drones & UAV Parts")
@@ -145,35 +145,14 @@ async def test_disabled_or_failing_model_returns_none(monkeypatch):
     assert await ai_query_parser.understand("need rice") is None
 
 
-async def test_router_ai_role_beats_static_cues(monkeypatch):
+async def test_parser_role_beats_static_cues(monkeypatch):
+    """The one parser call supplies the role (the separate router model call is gone)."""
     msg = "we've got 500 bags of turmeric lying in our godown"
+    monkeypatch.setattr(settings, "QUERY_AI_ENABLED", True)
     _mock_model(monkeypatch, {"role": "seller", "role_evidence": "we've got", "product": "turmeric",
-                              "product_as_written": "turmeric"})
-
-    class FakeResp:
-        status_code = 200
-
-        def json(self):
-            return {"response": '{"product": "turmeric", "role": "seller", "intent": "general"}'}
-
-    class FakeClient:
-        def __init__(self, *a, **k): ...
-        async def __aenter__(self): return self
-        async def __aexit__(self, *a): return False
-        async def post(self, *a, **k): return FakeResp()
-
-    monkeypatch.setattr(agent_router.httpx, "AsyncClient", FakeClient)
-    data = await agent_router._extract_semantic_intent_with_ai(msg)
-    assert data["role"] == "seller"
-
-    # Router model silent on role: the grounded parse supplies it.
-    class SilentResp(FakeResp):
-        def json(self):
-            return {"response": '{"product": "turmeric", "role": null, "intent": "general"}'}
-
-    FakeClient.post = lambda self, *a, **k: _async(SilentResp())
-    data = await agent_router._extract_semantic_intent_with_ai(msg)
-    assert data["role"] == "seller"
+                              "product_as_written": "turmeric", "intent": "sell_offer"})
+    assert (await query_extractor.detect_role_async(msg)).value == "seller"
+    assert ai_query_parser.cached(msg).intent == "sell_offer"
 
 
 async def _async(value):

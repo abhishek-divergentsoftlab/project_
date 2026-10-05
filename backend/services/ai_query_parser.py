@@ -107,7 +107,7 @@ USER_MESSAGE_JSON: {json.dumps(message, ensure_ascii=False)}
 Return ONE JSON object with these fields (null when the message does not say):
 - role: "seller" if the user has goods to offer/sell/clear, "buyer" if they want to buy/source/get a quote, else null.
 - role_evidence: the EXACT words copied from the message that show the role, else null.
-- intent: short free label such as search, sell_offer, buy_request, price_check, market_research, logistics, chitchat, other.
+- intent: short free label such as search, sell_offer, buy_request, price_check, market_research, logistics, verification, negotiation, chitchat, other.
 - product: canonical English name of the goods; product_as_written: the span exactly as written in the message.
 - category: known categories: {json.dumps(known_categories, ensure_ascii=False)}. Choose one if it fits, otherwise propose a short new category name.
 - attributes: object of any key to value (color, material, grade, size, certification, packaging, origin, anything stated).

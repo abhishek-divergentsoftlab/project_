@@ -19,7 +19,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.enums import RFQRole, RFQStatus
 from models.rfq import RFQ
-from services.agent_router import route_query_to_agent, route_query_to_agent_async
+from services import chat_permissions
+from services.agent_router import _fallback_intent, agent_for_intent
 from models.user import User
 from services import market_data_tools
 from services.answer_verifier import render_facts_answer
@@ -132,29 +133,28 @@ def test_qa_compound_role_and_product_invariants(query, expected_role, expected_
 # 3. Tool Compulsion Defense (Analytical vs Action Turns)
 # =============================================================================
 
-@pytest.mark.asyncio
-async def test_qa_tool_compulsion_defense():
-    """Analytical turns must receive empty tools ([]) to prevent hallucinated tool calls.
+def test_qa_tool_compulsion_defense():
+    """Analytical turns are offered no write tools, so the model cannot hallucinate an action.
 
-    Action turns ('create rfq', 'update draft') must receive corresponding tools.
+    Action turns ('create rfq', 'update draft') are offered the matching tool. Reads are
+    never gated: that is covered by the answer engine, which always offers the read tools.
     """
-    # 1. Pure market analysis query -> tools must be empty
+    # 1. Pure market analysis query -> no action tools
     analysis_query = "can you analyze the market density and pricing trends for corrugated boxes in surat?"
-    agent, tools, meta = await route_query_to_agent_async(analysis_query)
+    agent = agent_for_intent(_fallback_intent(analysis_query))[0]
     assert agent.id in ("market_research", "price_analyst")
-    assert tools == [], f"Expected empty tools on analytical query, got: {[t['function']['name'] for t in tools]}"
+    allowed = chat_permissions.allowed_action_tools(analysis_query, None, None, None)
+    assert allowed == set(), f"Expected no action tools on analytical query, got: {allowed}"
 
-    # 2. Pure price comparison query -> tools must be empty
+    # 2. Pure price comparison query -> no action tools
     price_query = "compare prices and tell me which seller is cheapest for office chairs"
-    agent_p, tools_p, _ = await route_query_to_agent_async(price_query)
-    assert agent_p.id == "price_analyst"
-    assert tools_p == []
+    assert agent_for_intent(_fallback_intent(price_query))[0].id == "price_analyst"
+    assert chat_permissions.allowed_action_tools(price_query, None, None, None) == set()
 
-    # 3. Action query -> tools must be present
+    # 3. Action query -> the write tools must be present
     action_query = "please create rfq for 500 pcs corrugated boxes at 20 inr per piece"
-    agent_a, tools_a, _ = await route_query_to_agent_async(action_query)
-    tool_names = [t["function"]["name"] for t in tools_a]
-    assert "create_rfq" in tool_names or "update_rfq_draft" in tool_names
+    allowed_a = chat_permissions.allowed_action_tools(action_query, None, None, None)
+    assert "create_rfq" in allowed_a or "update_rfq_draft" in allowed_a
 
 
 # =============================================================================
@@ -211,11 +211,10 @@ def test_qa_adversarial_input_does_not_crash_parser(malformed_input):
     """Ensure arbitrary user inputs, punctuation floods, and noise never cause unhandled crashes."""
     r = extract(malformed_input)
     assert r is not None
-    # Router must also handle gracefully
-    agent, tools, meta = route_query_to_agent(malformed_input)
+    # The routing fallback and the permission gate must also handle it gracefully
+    agent, _why = agent_for_intent(_fallback_intent(malformed_input))
     assert agent is not None
-    assert isinstance(tools, list)
-    assert isinstance(meta, dict)
+    assert isinstance(chat_permissions.allowed_action_tools(malformed_input, None, None, None), set)
 
 
 # =============================================================================
@@ -317,7 +316,7 @@ async def test_qa_buyer_candidates_are_real_rice_buyers_only(db: AsyncSession, m
     from sqlalchemy.orm import selectinload
 
     from models.user import User
-    from services.ai_chat_service import _fetch_catalog_candidates_for_query
+    from services.ai_chat_service import _cards_from_tool_results
 
     await _seed_rice_market(make_actor)
     other = await make_actor("seller")
@@ -327,11 +326,13 @@ async def test_qa_buyer_candidates_are_real_rice_buyers_only(db: AsyncSession, m
         await db.execute(select(User).options(selectinload(User.profile)).where(User.id == viewer_actor.id))
     ).scalar_one()
 
-    focus = {"product": "rice", "category": "Agriculture", "role": "seller", "listing_role": "buyer"}
-    candidates = await _fetch_catalog_candidates_for_query(db, viewer, focus)
+    # Cards now come from the read tool the model calls, not from a keyword-gated prefetch.
+    async def cards(**kw):
+        return _cards_from_tool_results([await market_data_tools.search_listings(db, user=viewer, **kw)])
+
+    candidates = await cards(product="rice", role="buyer")
     assert [c["title"] for c in candidates] == ["Need 25 metric tons of 1121 steam basmati rice"]
     assert candidates[0]["score"] is None
     json.dumps(candidates)  # persisted to the JSONB conversation state
 
-    assert await _fetch_catalog_candidates_for_query(db, viewer, {**focus, "product": "saffron"}) == []
-    assert await _fetch_catalog_candidates_for_query(db, viewer, {**focus, "product": None}) == []
+    assert await cards(product="saffron", role="buyer") == []

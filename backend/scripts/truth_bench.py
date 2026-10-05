@@ -122,7 +122,7 @@ async def run() -> int:
             world = await seed(db)
             for sc in scenarios(world):
                 draft: dict[str, Any] = {}
-                prompt = build_rfq_system_prompt(draft, rfq_tool_service.evaluate_rfq_readiness(draft), is_analysis_query=True)
+                prompt = build_rfq_system_prompt(draft, rfq_tool_service.evaluate_rfq_readiness(draft), allowed_tools=set())
                 t0 = time.time()
                 res = await answer_engine.answer(
                     db, sc["user"], history_messages=[{"role": "user", "content": sc["q"]}],
