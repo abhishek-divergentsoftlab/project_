@@ -37,6 +37,7 @@ MASS_CONVERSION_TO_KG: dict[str, Decimal] = {
     "quintals": Decimal("100"),
     "qtl": Decimal("100"),
     # Kilograms
+    "k": Decimal("1"),
     "kg": Decimal("1"),
     "kgs": Decimal("1"),
     "kilo": Decimal("1"),
@@ -63,6 +64,10 @@ MASS_CONVERSION_TO_KG: dict[str, Decimal] = {
     "ग्राम": Decimal("0.001"),
     "टन": Decimal("1000"),
     "मीट्रिक टन": Decimal("1000"),
+    # Ounces
+    "oz": Decimal("0.0283495"),
+    "ounce": Decimal("0.0283495"),
+    "ounces": Decimal("0.0283495"),
     # Fixed packaging weight representations
     "100kg": Decimal("100"),
     "100 kg": Decimal("100"),
@@ -101,6 +106,11 @@ LENGTH_CONVERSION_TO_METER: dict[str, Decimal] = {
     "yd": Decimal("0.9144"),
     "yard": Decimal("0.9144"),
     "yards": Decimal("0.9144"),
+    # Hindi length units
+    "मीटर": Decimal("1"),
+    "किमी": Decimal("1000"),
+    "सेमी": Decimal("0.01"),
+    "मिमी": Decimal("0.001"),
 }
 
 # Standard conversion multiplier to Liters (L)
@@ -110,15 +120,34 @@ VOLUME_CONVERSION_TO_LITER: dict[str, Decimal] = {
     "liters": Decimal("1"),
     "litre": Decimal("1"),
     "litres": Decimal("1"),
+    "ltr": Decimal("1"),
+    "ltrs": Decimal("1"),
     "ml": Decimal("0.001"),
     "milliliter": Decimal("0.001"),
     "milliliters": Decimal("0.001"),
     "millilitre": Decimal("0.001"),
     "millilitres": Decimal("0.001"),
+    "cc": Decimal("0.001"),
+    "kl": Decimal("1000"),
+    "kilolitre": Decimal("1000"),
+    "kilolitres": Decimal("1000"),
+    "kiloliter": Decimal("1000"),
+    "kiloliters": Decimal("1000"),
+    "m3": Decimal("1000"),
+    "cubic meter": Decimal("1000"),
+    "cubic meters": Decimal("1000"),
+    "cubic metre": Decimal("1000"),
+    "cubic metres": Decimal("1000"),
+    "m³": Decimal("1000"),
     "gallon": Decimal("3.78541"),
     "gallons": Decimal("3.78541"),
     "gal": Decimal("3.78541"),
-    "m3": Decimal("1000"),
+    "barrel": Decimal("158.987"),
+    "barrels": Decimal("158.987"),
+    "bbl": Decimal("158.987"),
+    # Hindi volume units
+    "लीटर": Decimal("1"),
+    "मिली": Decimal("0.001"),
 }
 
 # Standard conversion multiplier to Watts (W)
@@ -173,10 +202,22 @@ COUNT_CONVERSION_TO_PIECES: dict[str, Decimal] = {
     "doz": Decimal("12"),
     "dz": Decimal("12"),
     "gross": Decimal("144"),
+    "set": Decimal("1"),
+    "sets": Decimal("1"),
+    "bundle": Decimal("1"),
+    "bundles": Decimal("1"),
+    "roll": Decimal("1"),
+    "rolls": Decimal("1"),
+    "sheet": Decimal("1"),
+    "sheets": Decimal("1"),
+    "pack": Decimal("1"),
+    "packs": Decimal("1"),
     # Hindi count units
     "दर्जन": Decimal("12"),
     "पीस": Decimal("1"),
     "नग": Decimal("1"),
+    "पैकेट": Decimal("1"),
+    "सेट": Decimal("1"),
 }
 
 # Recognized trade packaging containers
@@ -248,11 +289,21 @@ def clean_unit(unit: Optional[str]) -> Optional[str]:
     cleaned = _PREFIX_STRIP_RE.sub("", cleaned).strip()
     cleaned = _UNIT_PUNCT_RE.sub(" ", cleaned).strip()
     # Check if last word is a known unit (e.g. "rupees per kg" -> "kg", "1000 per quintal" -> "quintal")
-    if cleaned not in MASS_CONVERSION_TO_KG and cleaned not in COUNT_CONVERSION_TO_PIECES and cleaned not in PACKAGING_UNITS:
+    if (
+        cleaned not in MASS_CONVERSION_TO_KG
+        and cleaned not in VOLUME_CONVERSION_TO_LITER
+        and cleaned not in COUNT_CONVERSION_TO_PIECES
+        and cleaned not in LENGTH_CONVERSION_TO_METER
+        and cleaned not in PACKAGING_UNITS
+    ):
         words = cleaned.split()
         if words and words[-1] in MASS_CONVERSION_TO_KG:
             cleaned = words[-1]
+        elif words and words[-1] in VOLUME_CONVERSION_TO_LITER:
+            cleaned = words[-1]
         elif words and words[-1] in COUNT_CONVERSION_TO_PIECES:
+            cleaned = words[-1]
+        elif words and words[-1] in LENGTH_CONVERSION_TO_METER:
             cleaned = words[-1]
         elif words and words[-1] in PACKAGING_UNITS:
             cleaned = words[-1]
@@ -262,6 +313,16 @@ def clean_unit(unit: Optional[str]) -> Optional[str]:
 def is_mass_unit(unit: Optional[str]) -> bool:
     cleaned = clean_unit(unit)
     return bool(cleaned) and cleaned in MASS_CONVERSION_TO_KG
+
+
+def is_volume_unit(unit: Optional[str]) -> bool:
+    cleaned = clean_unit(unit)
+    return bool(cleaned) and cleaned in VOLUME_CONVERSION_TO_LITER
+
+
+def is_length_unit(unit: Optional[str]) -> bool:
+    cleaned = clean_unit(unit)
+    return bool(cleaned) and cleaned in LENGTH_CONVERSION_TO_METER
 
 
 def is_count_unit(unit: Optional[str]) -> bool:
@@ -301,13 +362,185 @@ def base_unit(unit: Optional[str]) -> Optional[tuple[Decimal, str]]:
         return None
     if cleaned in MASS_CONVERSION_TO_KG:
         return MASS_CONVERSION_TO_KG[cleaned], "kg"
+    if cleaned in VOLUME_CONVERSION_TO_LITER:
+        return VOLUME_CONVERSION_TO_LITER[cleaned], "l"
     if cleaned in COUNT_CONVERSION_TO_PIECES:
         return COUNT_CONVERSION_TO_PIECES[cleaned], "pcs"
     if cleaned in LENGTH_CONVERSION_TO_METER:
         return LENGTH_CONVERSION_TO_METER[cleaned], "m"
-    if cleaned in VOLUME_CONVERSION_TO_LITER:
-        return VOLUME_CONVERSION_TO_LITER[cleaned], "l"
     return None
+
+
+def resolve_to_base_unit(
+    unit: Optional[str],
+    attributes: Optional[dict[str, Any]] = None,
+) -> Optional[tuple[Decimal, str, str]]:
+    """(factor_to_base, base_unit_name, physical_dimension).
+
+    Resolves:
+    - Mass -> (factor, "kg", "mass")
+    - Volume -> (factor, "l", "volume")
+    - Count -> (factor, "pcs", "count")
+    - Length -> (factor, "m", "length")
+    - Packaging:
+      - with pack_weight -> (weight_in_kg, "kg", "mass")
+      - agricultural mandi default (bora, bag, katta) -> (50, "kg", "mass")
+      - with pack_count -> (pack_count, "pcs", "count")
+      - bare packaging -> (1, "unit", "packaging")
+    """
+    cleaned = clean_unit(unit)
+    if not cleaned:
+        return None
+
+    if cleaned in MASS_CONVERSION_TO_KG:
+        return MASS_CONVERSION_TO_KG[cleaned], "kg", "mass"
+
+    if cleaned in VOLUME_CONVERSION_TO_LITER:
+        return VOLUME_CONVERSION_TO_LITER[cleaned], "l", "volume"
+
+    if cleaned in COUNT_CONVERSION_TO_PIECES:
+        return COUNT_CONVERSION_TO_PIECES[cleaned], "pcs", "count"
+
+    if cleaned in LENGTH_CONVERSION_TO_METER:
+        return LENGTH_CONVERSION_TO_METER[cleaned], "m", "length"
+
+    # Packaging unit resolution
+    if cleaned in PACKAGING_UNITS:
+        pw = None
+        if attributes:
+            pw = attributes.get("pack_weight_kg") or attributes.get("pack_weight")
+        if pw is None and cleaned in (
+            "bora", "boras", "bori", "boris", "katta", "kattas",
+            "bag", "bags", "sack", "sacks", "gunny bag", "gunny bags",
+            "बोरी", "बोरा", "कट्टा", "कट्टे", "बैग", "थैला"
+        ):
+            pw = Decimal("50")
+
+        if pw is not None:
+            try:
+                pw_dec = Decimal(str(pw))
+                if pw_dec > 0:
+                    return pw_dec, "kg", "mass"
+            except (InvalidOperation, ValueError, TypeError):
+                pass
+
+        pc = None
+        if attributes:
+            pc = attributes.get("pack_count") or attributes.get("pack_pieces") or attributes.get("pcs_per_pack")
+        if pc is not None:
+            try:
+                pc_dec = Decimal(str(pc))
+                if pc_dec > 0:
+                    return pc_dec, "pcs", "count"
+            except (InvalidOperation, ValueError, TypeError):
+                pass
+
+        return Decimal("1"), cleaned, "packaging"
+
+    return None
+
+
+def normalize_quantity_to_base(
+    value: Any,
+    unit: Optional[str],
+    attributes: Optional[dict[str, Any]] = None,
+) -> Optional[tuple[Decimal, str, str]]:
+    """Converts a quantity value and unit into (base_value, base_unit, dimension).
+
+    e.g.
+    - (10, "tonne") -> (Decimal("10000"), "kg", "mass")
+    - (50, "quintals") -> (Decimal("5000"), "kg", "mass")
+    - (2, "dozen") -> (Decimal("24"), "pcs", "count")
+    - (5, "kl") -> (Decimal("5000"), "l", "volume")
+    - (500, "ml") -> (Decimal("0.5"), "l", "volume")
+    - (100, "bag", {"pack_weight_kg": 25}) -> (Decimal("2500"), "kg", "mass")
+    """
+    if value is None:
+        return None
+    try:
+        val_d = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if val_d <= 0:
+        return None
+
+    # Check total weight overrides in attributes first
+    if attributes:
+        if "total_weight_kg" in attributes and attributes["total_weight_kg"] is not None:
+            try:
+                tw_kg = Decimal(str(attributes["total_weight_kg"]))
+                if tw_kg > 0:
+                    return tw_kg, "kg", "mass"
+            except (InvalidOperation, ValueError, TypeError):
+                pass
+        if "total_weight_tons" in attributes and attributes["total_weight_tons"] is not None:
+            try:
+                tw_t = Decimal(str(attributes["total_weight_tons"]))
+                if tw_t > 0:
+                    return tw_t * Decimal("1000"), "kg", "mass"
+            except (InvalidOperation, ValueError, TypeError):
+                pass
+
+    resolved = resolve_to_base_unit(unit, attributes)
+    if resolved is not None:
+        factor, base_u, dim = resolved
+        return val_d * factor, base_u, dim
+
+    clean_u = clean_unit(unit) or "unit"
+    return val_d, clean_u, "unknown"
+
+
+def normalize_price_to_base(
+    amount: Any,
+    currency_code: Optional[str],
+    per_unit: Optional[str],
+    quantity_unit: Optional[str] = None,
+    attributes: Optional[dict[str, Any]] = None,
+    target_currency: Optional[str] = None,
+) -> Optional[tuple[Decimal, str, str, str]]:
+    """Restates price per base unit in target (or canonical) currency:
+    (base_price_amount, currency, base_unit, dimension).
+
+    e.g.
+    - 28000 INR per tonne -> (Decimal("28"), "INR", "kg", "mass")
+    - 24 USD per dozen -> (Decimal("2"), "USD", "pcs", "count")
+    - 5000 INR per kl -> (Decimal("5"), "INR", "l", "volume")
+    - 2500 INR per 50kg bag -> (Decimal("50"), "INR", "kg", "mass")
+    """
+    if amount is None:
+        return None
+    try:
+        amt_d = Decimal(str(amount))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if amt_d <= 0:
+        return None
+
+    unit_to_use = per_unit or quantity_unit
+    resolved = resolve_to_base_unit(unit_to_use, attributes)
+    if resolved is not None:
+        factor, base_u, dim = resolved
+        price_per_base = amt_d / factor if factor > 0 else amt_d
+    else:
+        clean_u = clean_unit(unit_to_use) or "unit"
+        price_per_base = amt_d
+        base_u = clean_u
+        dim = "unknown"
+
+    from services import currency
+    norm_ccy = currency.normalize_currency(currency_code) if currency_code else None
+    if norm_ccy is None and currency_code:
+        norm_ccy = str(currency_code).strip().upper()
+
+    if norm_ccy and target_currency:
+        target_norm = currency.normalize_currency(target_currency) or target_currency.strip().upper()
+        if target_norm and target_norm != norm_ccy:
+            converted = currency.convert(price_per_base, norm_ccy, target_norm)
+            if converted is not None:
+                price_per_base = converted
+                norm_ccy = target_norm
+
+    return price_per_base, norm_ccy or "", base_u, dim
 
 
 def price_per_base_unit(
@@ -468,15 +701,19 @@ def to_base_si(value: Decimal, unit: str) -> Optional[tuple[Decimal, str, str]]:
     if cleaned in VOLUME_CONVERSION_TO_LITER:
         return value * VOLUME_CONVERSION_TO_LITER[cleaned], "l", "volume"
 
-    # 4. Power [P] -> watt (W)
+    # 4. Count [C] -> piece (pcs)
+    if cleaned in COUNT_CONVERSION_TO_PIECES:
+        return value * COUNT_CONVERSION_TO_PIECES[cleaned], "pcs", "count"
+
+    # 5. Power [P] -> watt (W)
     if cleaned in POWER_CONVERSION_TO_WATT:
         return value * POWER_CONVERSION_TO_WATT[cleaned], "w", "power"
 
-    # 5. Voltage [V] -> volt (V)
+    # 6. Voltage [V] -> volt (V)
     if cleaned in VOLTAGE_CONVERSION_TO_VOLT:
         return value * VOLTAGE_CONVERSION_TO_VOLT[cleaned], "v", "voltage"
 
-    # 6. Capacity [Ah] -> ampere-hour (Ah)
+    # 7. Capacity [Ah] -> ampere-hour (Ah)
     if cleaned in CAPACITY_CONVERSION_TO_AH:
         return value * CAPACITY_CONVERSION_TO_AH[cleaned], "ah", "capacity"
 

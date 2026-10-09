@@ -10,6 +10,7 @@ from api.v1 import (
     currency,
     dashboard,
     escrow,
+    hsn,
     logistics,
     marketplace,
     matches,
@@ -45,6 +46,7 @@ api_router.include_router(marketplace.router)
 api_router.include_router(translation.router)
 api_router.include_router(escrow.router)
 api_router.include_router(logistics.router)
+api_router.include_router(hsn.router)
 
 
 

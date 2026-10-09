@@ -89,6 +89,17 @@ class Counterparty(BaseModel):
         return self.connection_status is ConnectionStatus.ACCEPTED
 
 
+class AttributeMatchDetail(BaseModel):
+    key: str
+    requested_value: Any
+    offered_key: Optional[str] = None
+    offered_value: Optional[Any] = None
+    score: float
+    status: str  # "matched", "partial", "unstated", "mismatch"
+    reason: str
+    must_match: bool = False
+
+
 class MatchCandidate(BaseModel):
     rfq_id: uuid.UUID
     role: RFQRole
@@ -103,6 +114,10 @@ class MatchCandidate(BaseModel):
     location: Optional[Location] = None
     deadline: Optional[DeadlineOut] = None
 
+    # Base SI units and aligned currency representation
+    normalized_quantity: Optional[Quantity] = None
+    normalized_price: Optional[Money] = None
+
     product_details: dict[str, Any]
     search_tags: list[str]
 
@@ -113,6 +128,9 @@ class MatchCandidate(BaseModel):
 
     counterparty: Counterparty
     score: MatchScore
+
+    # Itemized attribute matching transparency
+    attribute_breakdown: Optional[list[AttributeMatchDetail]] = None
 
 
 

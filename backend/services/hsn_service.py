@@ -193,29 +193,117 @@ def hsn_similarity(hsn_1: Optional[str], hsn_2: Optional[str]) -> Optional[float
     return 0.55
 
 
-# Common baseline fast mappings for instant zero-shot resolution
+# Common baseline fast mappings for instant zero-shot resolution across commercial trade categories
 _COMMON_HEADING_KEYWORDS: dict[str, str] = {
-    # Cereals & Grains
+    # Eyewear, Optics & Protective Instruments (Chapter 90 & 70)
+    "sunglasses": "90041000", "sun glasses": "90041000", "sunglass": "90041000", "sun glass": "90041000",
+    "spectacles": "900490", "goggles": "900490", "reading glasses": "900490", "safety glasses": "900490",
+    "spectacle frames": "900311", "contact lenses": "900130", "contact lens": "900130",
+    "glass for sun glasses": "70159020",
+
+    # Beverages, Soft Drinks & Mineral Water (Chapter 22 & 20)
+    "soft drink": "2202", "soft drinks": "2202", "softdrink": "2202",
+    "cold drink": "2202", "cold drinks": "2202", "aerated drink": "2202", "aerated drinks": "2202",
+    "coca cola": "220210", "cococola": "220210", "coco cola": "220210", "coke": "220210",
+    "pepsi": "220210", "thums up": "220210", "sprite": "220210", "7up": "220210",
+    "fanta": "220210", "mirinda": "220210", "mountain dew": "220210", "limca": "220210",
+    "appy fizz": "220299", "appy": "200971", "red bull": "220299", "sting": "220299", "energy drink": "220299",
+    "fruit juice": "2009", "mango juice": "200989", "apple juice": "200971", "orange juice": "200912",
+    "mineral water": "220110", "drinking water": "220190", "packaged water": "220190", "soda water": "220110",
+
+    # Footwear, Shoes & Apparel (Chapter 64, 61, 62)
+    "sneakers": "640411", "sneaker": "640411", "sports shoes": "640411", "running shoes": "640411",
+    "tennis shoes": "640411", "gym shoes": "640411", "leather shoes": "640359", "formal shoes": "640359",
+    "sandals": "640220", "slippers": "640299", "chappal": "640299", "boots": "640391",
+    "t-shirt": "610910", "t shirt": "610910", "tshirt": "610910", "polo shirt": "610510",
+    "shirt": "620520", "shirts": "620520", "jeans": "620342", "denim": "620342",
+    "trousers": "620342", "pants": "620342", "hoodie": "611020", "jacket": "620130",
+    "saree": "520859", "kurti": "620442", "tracksuit": "611212", "socks": "611595",
+
+    # Bags, Luggage & Travel Goods (Chapter 42)
+    "laptop bag": "420212", "laptop case": "420212", "laptop sleeve": "420212",
+    "backpack": "420292", "backpacks": "420292", "school bag": "420292", "travel bag": "420292",
+    "suitcase": "420212", "luggage": "420212", "trolley bag": "420212", "handbag": "420222", "wallet": "420231",
+
+    # Consumer Electronics, Computers & Telecom (Chapter 84 & 85)
+    "smartphone": "851713", "smart phone": "851713", "mobile phone": "851713", "cell phone": "851713",
+    "iphone": "851713", "samsung galaxy": "851713", "android phone": "851713",
+    "laptop": "847130", "notebook computer": "847130", "macbook": "847130",
+    "tablet": "847130", "ipad": "847130", "desktop computer": "847141",
+    "smartwatch": "851762", "smart watch": "851762", "apple watch": "851762",
+    "headphones": "851830", "headphone": "851830", "earphones": "851830", "earphone": "851830",
+    "earbuds": "851830", "airpods": "851830", "bluetooth speaker": "851821", "soundbar": "851822",
+    "television": "852872", "smart tv": "852872", "tv": "852872", "monitor": "852852",
+    "mobile charger": "850440", "charger": "850440", "power adapter": "850440",
+    "power bank": "850760", "powerbank": "850760", "lithium battery": "850760",
+    "usb cable": "854442", "cctv camera": "852589", "pendrive": "852351", "hard drive": "847170",
+
+    # Home & Kitchen Electrical Appliances (Chapter 84 & 85)
+    "air conditioner": "841510", "ac": "841510", "split ac": "841510",
+    "refrigerator": "841821", "fridge": "841821", "freezer": "841830",
+    "washing machine": "845011", "microwave": "851650", "microwave oven": "851650",
+    "ceiling fan": "841451", "table fan": "841451", "fan": "841451",
+    "water heater": "851610", "geyser": "851610", "mixer grinder": "850940",
+    "water purifier": "842121", "vacuum cleaner": "850811", "electric kettle": "851679",
+
+    # Dairy, Grains & Food Staples (Chapter 04, 07, 10, 11, 17, 09, 15)
+    "milk": "0401", "cow milk": "040120", "buffalo milk": "040120", "butter": "040510",
+    "ghee": "040590", "curd": "040320", "dahi": "040320", "yogurt": "040320",
+    "cheese": "040690", "paneer": "040610", "milk powder": "040210",
     "corn": "1005", "maize": "1005", "sweet corn": "100590", "baby corn": "070999",
-    "rice": "1006", "wheat": "1001", "barley": "1003", "oats": "1004", "millet": "1008",
-    "chickpea": "0713", "gram": "0713", "lentil": "0713", "chia seed": "1207",
-    # Personal Care & Cosmetics
-    "hair spray": "330530", "hair sprey": "330530", "hairspray": "330530", "hair lacquer": "330530",
-    "hair color": "330590", "hair colour": "330590", "hair dye": "330590", "henna": "330590",
+    "rice": "1006", "basmati rice": "10063020", "wheat": "1001", "atta": "110100",
+    "maida": "110100", "suji": "110311", "besan": "110610", "barley": "1003", "oats": "1004", "millet": "1008",
+    "chickpea": "071320", "chana": "071320", "kabuli chana": "07132010", "lentil": "071340",
+    "moong dal": "071331", "urad dal": "071331", "toor dal": "071360", "rajma": "071333",
+    "sugar": "170199", "tea": "090240", "coffee": "090121",
+    "black pepper": "090411", "cardamom": "090831", "cumin": "090931", "jeera": "090931",
+    "turmeric": "091030", "haldi": "091030", "red chilli": "090422",
+    "mustard oil": "151491", "sunflower oil": "151219", "soybean oil": "150790", "palm oil": "151190",
+
+    # Packaged Foods, Confectionery & FMCG (Chapter 19, 21, 25)
+    "biscuit": "190531", "biscuits": "190531", "cookies": "190531", "parle g": "190531",
+    "noodles": "190230", "maggi": "190230", "pasta": "190219", "chocolate": "180632",
+    "salt": "250100", "tata salt": "250100", "tomato ketchup": "210320",
+
+    # Personal Care, Cosmetics & Hygiene (Chapter 33, 34, 38, 96)
+    "soap": "340111", "bathing soap": "340111", "body wash": "340130", "hand wash": "340130",
     "shampoo": "330510", "hair cleanser": "330510", "conditioner": "330590",
-    # Auto Parts & Spares
-    "brake pad": "870830", "brake pads": "870830", "brake disc": "870830", "brake rotor": "870830",
-    "headlight": "851220", "led headlight": "851220", "spark plug": "851110",
-    "engine oil": "271019", "motor oil": "271019",
-    # Solar & Energy
+    "hair spray": "330530", "hair sprey": "330530", "hairspray": "330530", "hair lacquer": "330530",
+    "hair color": "330590", "hair colour": "330590", "hair dye": "330590", "hair oil": "330590",
+    "toothpaste": "330610", "toothbrush": "960321", "perfume": "330300", "deodorant": "330720",
+    "sunscreen": "330499", "face wash": "330499", "lipstick": "330410",
+    "sanitary pad": "961900", "sanitary pads": "961900", "sanitary napkin": "961900",
+    "diaper": "961900", "diapers": "961900", "baby diaper": "961900",
+    "hand sanitizer": "380894", "antiseptic": "380894",
+
+    # Stationery & Paper (Chapter 48 & 96)
+    "pen": "960810", "ball pen": "960810", "gel pen": "960810", "pencil": "960910",
+    "notebook": "482020", "a4 paper": "480256", "copy paper": "480256",
+
+    # Building Materials, Steel & Hardware (Chapter 25, 72, 73, 69, 32)
+    "cement": "252329", "portland cement": "252329", "tmt bar": "72142090", "tmt bars": "72142090",
+    "sariya": "72142090", "steel pipe": "730630", "steel sheets": "721049",
+    "tiles": "690721", "ceramic tiles": "690721", "paint": "320910", "emulsion": "320910",
+    "plywood": "441233", "float glass": "700529",
+
+    # Automotive & Tyres (Chapter 40, 85, 87)
+    "car tyre": "401110", "car tire": "401110", "tyre": "401110", "tire": "401110",
+    "truck tyre": "401120", "bike tyre": "401140", "car battery": "850710",
+    "helmet": "650610", "brake pad": "870830", "brake pads": "870830", "spark plug": "851110",
+    "engine oil": "271019", "motor oil": "271019", "headlight": "851220",
+
+    # Solar & Renewable Energy
     "solar panel": "854143", "solar panels": "854143", "pv module": "854143",
     "solar inverter": "850440", "inverter": "850440", "battery": "850760",
+
     # Medical & PPE
     "nitrile gloves": "392620", "surgical gloves": "401511", "examination gloves": "401519",
     "n95 mask": "630790", "surgical mask": "630790", "respirator": "902000",
-    # Specialty Chemicals
+    "thermometer": "902519", "bp monitor": "901890", "syringe": "901831",
+
+    # Chemicals & Industrial
     "citric acid": "291814", "potassium sorbate": "291619", "sodium benzoate": "291631",
-    "caustic soda": "281511", "sodium hydroxide": "281511",
+    "caustic soda": "281511", "sodium hydroxide": "281511", "urea": "310210",
 }
 
 
@@ -265,12 +353,15 @@ async def classify_hsn_with_ai(text: str) -> Optional[str]:
 
         model = getattr(settings, "HSN_AI_MODEL", "") or settings.AI_CHAT_MODEL
         prompt = (
-            "You are a World Customs Organization trade classifier. "
-            "What is the standard 4-digit or 6-digit Harmonized System (HS / HSN) code "
-            f"for this product: '{key}'? "
-            'Respond with ONLY a JSON object: {"hsn_code": "<digits_only>"}'
+            "You are an expert Indian GST customs classifier. Give the most specific Indian GST HSN code "
+            "(6 or 8 digits, never a 2-digit chapter) for the commercial product below. "
+            "First think of the generic product type (e.g. 'maaza' is a mango fruit drink), then classify it. "
+            "Examples: samosa -> 210690; maaza -> 220299; pepsi -> 220210; bread/pav -> 190590; "
+            "rusk -> 190540; kurkure -> 210690; paneer -> 040690; sunglasses -> 900410; smartphone -> 851713. "
+            f"Product: '{key}'. "
+            'Respond with ONLY a JSON object: {"generic_name": "<generic product type>", "hsn_code": "<digits_only>"}'
         )
-        timeout = float(getattr(settings, "HSN_AI_TIMEOUT_SECONDS", 3.0))
+        timeout = float(getattr(settings, "HSN_AI_TIMEOUT_SECONDS", 8.0))
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(
                 f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/generate",

@@ -167,6 +167,17 @@ export interface Counterparty {
   gst_verified?: boolean;
 }
 
+export interface AttributeMatchDetail {
+  key: string;
+  requested_value: any;
+  offered_key?: string | null;
+  offered_value?: any;
+  score: number;
+  status: "matched" | "partial" | "unstated" | "mismatch";
+  reason: string;
+  must_match?: boolean;
+}
+
 export interface MatchCandidate {
   rfq_id: string;
   role: RFQRole;
@@ -185,6 +196,9 @@ export interface MatchCandidate {
   logistics?: LogisticsEstimate | null;
   counterparty: Counterparty;
   score: MatchScore;
+  normalized_quantity?: Quantity | null;
+  normalized_price?: Money | null;
+  attribute_breakdown?: AttributeMatchDetail[] | null;
 }
 
 export interface LogisticsEstimate {
@@ -776,5 +790,22 @@ export interface ShipmentStatusUpdatePayload {
   status: ShipmentStatus;
   location?: string;
   note?: string;
+}
+
+export interface SuggestedAttribute {
+  key: string;
+  label: string;
+  placeholder: string;
+  input_type?: "numeric" | "text" | "select" | string;
+  options?: string[];
+  explanation?: string;
+  must_match?: boolean;
+}
+
+export interface SuggestedAttributesResponse {
+  product_name: string;
+  category?: string | null;
+  suggested_attributes: SuggestedAttribute[];
+  source: "llm" | "expert_rules" | "category_defaults" | "cache" | string;
 }
 

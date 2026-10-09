@@ -603,7 +603,9 @@ def _score(
         c_hsn = hsn_service.resolve_hsn(candidate.product_details, cand_name)
         if r_hsn and c_hsn:
             h_sim = match_scoring.hsn_score(str(r_hsn), str(c_hsn))
-            if h_sim is not None and h_sim >= 0.85:
+            # Only exact tariff commodities (6+ digit matching = 1.0) override distinct commodity names.
+            # 4-digit heading matches (0.88) are broad industry families and must not conflate distinct crops (e.g. chickpeas vs moong).
+            if h_sim is not None and h_sim >= 0.95:
                 hsn_or_dynamic_match = True
         if not hsn_or_dynamic_match and req_prod and cand_name:
             dyn_sim = match_scoring._dynamic_semantic_similarity(req_prod, cand_name)
@@ -757,6 +759,57 @@ def _to_candidate(
         else None
     )
 
+    normalized_quantity = None
+    if candidate.quantity_value is not None:
+        from services import unit_converter
+        norm_q = unit_converter.normalize_quantity_to_base(
+            candidate.quantity_value,
+            candidate.quantity_unit,
+            candidate.product_details,
+        )
+        if norm_q:
+            base_q_val, base_q_unit, _ = norm_q
+            rounded_q = float(base_q_val)
+            if rounded_q.is_integer():
+                rounded_q = int(rounded_q)
+            else:
+                rounded_q = round(rounded_q, 4)
+            normalized_quantity = Quantity(value=rounded_q, unit=base_q_unit)
+
+    normalized_price = None
+    if candidate.price_amount is not None:
+        from services import unit_converter
+        norm_p = unit_converter.normalize_price_to_base(
+            candidate.price_amount,
+            candidate.price_currency,
+            candidate.price_per_unit,
+            quantity_unit=candidate.quantity_unit,
+            attributes=candidate.product_details,
+            target_currency=requester.price_currency or candidate.price_currency,
+        )
+        if norm_p:
+            base_p_val, base_p_ccy, base_p_unit, _ = norm_p
+            rounded_p = float(base_p_val)
+            if rounded_p.is_integer():
+                rounded_p = int(rounded_p)
+            else:
+                rounded_p = round(rounded_p, 4)
+            normalized_price = Money(
+                amount=rounded_p,
+                currency=base_p_ccy,
+                per_unit=base_p_unit,
+            )
+
+    attribute_breakdown = None
+    req_details = getattr(requester, "product_details", None)
+    cand_details = getattr(candidate, "product_details", None)
+    if req_details or cand_details:
+        _, raw_breakdown = match_scoring.attribute_score_with_breakdown(
+            req_details or {}, cand_details or {}
+        )
+        if raw_breakdown:
+            attribute_breakdown = raw_breakdown
+
     return MatchCandidate(
         rfq_id=candidate.id,
         role=candidate.role,
@@ -768,12 +821,15 @@ def _to_candidate(
         price=price,
         location=location,
         deadline=deadline,
+        normalized_quantity=normalized_quantity,
+        normalized_price=normalized_price,
         product_details=candidate.product_details,
         search_tags=candidate.search_tags,
         distance_km=distance,
         logistics=logistics,
         counterparty=_counterparty(candidate, connection),
         score=score,
+        attribute_breakdown=attribute_breakdown,
     )
 
 

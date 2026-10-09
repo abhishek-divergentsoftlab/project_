@@ -180,3 +180,21 @@ class RFQListOut(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class SuggestedAttribute(BaseModel):
+    key: str
+    label: str
+    placeholder: str
+    input_type: str = "text"  # "numeric", "text", "select"
+    options: list[str] = Field(default_factory=list)
+    explanation: Optional[str] = None
+    must_match: bool = False
+
+
+class SuggestedAttributesResponse(BaseModel):
+    product_name: str
+    category: Optional[str] = None
+    suggested_attributes: list[SuggestedAttribute]
+    source: str = "llm"  # "llm", "expert_rules", "category_defaults"
+

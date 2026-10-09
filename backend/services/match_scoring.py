@@ -479,18 +479,24 @@ def _dynamic_semantic_similarity(w: str, o: str) -> Optional[float]:
     except Exception:
         pass
 
-    # 2. Vector Embedding Cosine Similarity
+    # 2. Vector Embedding Cosine Similarity (with short 2s timeout so scoring never blocks)
     try:
-        vecs = embeddings._embed_sync([w, o])
-        if vecs and len(vecs) == 2:
-            dot = sum(a * b for a, b in zip(vecs[0], vecs[1]))
-            m1 = math.sqrt(sum(a * a for a in vecs[0]))
-            m2 = math.sqrt(sum(b * b for b in vecs[1]))
-            if m1 > 0 and m2 > 0:
-                cos = dot / (m1 * m2)
-                if cos >= 0.85:
-                    return round(cos, 4)
-                return 0.0
+        data = embeddings._post(
+            "/api/embed",
+            {"model": settings.EMBEDDING_MODEL, "input": [w, o]},
+            timeout=2,
+        )
+        if data:
+            vecs = data.get("embeddings")
+            if vecs and len(vecs) == 2:
+                dot = sum(a * b for a, b in zip(vecs[0], vecs[1]))
+                m1 = math.sqrt(sum(a * a for a in vecs[0]))
+                m2 = math.sqrt(sum(b * b for b in vecs[1]))
+                if m1 > 0 and m2 > 0:
+                    cos = dot / (m1 * m2)
+                    if cos >= 0.85:
+                        return round(cos, 4)
+                    return 0.0
     except Exception:
         pass
 
@@ -710,8 +716,23 @@ def _value_similarity(wanted: Any, offered: Any) -> float:
             return 0.0
         return _value_similarity(wanted["value"], offered["value"])
 
-    if isinstance(wanted, (int, float)) and isinstance(offered, (int, float)):
-        left, right = float(wanted), float(offered)
+    def _parse_num(val: Any) -> Optional[float]:
+        if isinstance(val, bool):
+            return None
+        if isinstance(val, (int, float)):
+            return float(val)
+        if isinstance(val, str):
+            clean = val.strip().rstrip("%").strip()
+            try:
+                return float(clean)
+            except (ValueError, TypeError):
+                return None
+        return None
+
+    w_num = _parse_num(wanted)
+    o_num = _parse_num(offered)
+    if w_num is not None and o_num is not None:
+        left, right = w_num, o_num
         if left == right:
             return 1.0
         largest = max(abs(left), abs(right))
@@ -743,6 +764,15 @@ _RAW_KEY_SYNONYMS: tuple[frozenset[str], ...] = (
     frozenset({"finish", "coating", "treatment", "surface", "plating"}),
     frozenset({"color", "colour", "shade", "hue", "tint"}),
     frozenset({"certification", "certified", "standard", "compliance"}),
+    frozenset({"power", "wattage", "watt", "watts", "capacity", "rating"}),
+    frozenset({"voltage", "volts", "volt", "v"}),
+    frozenset({"moisture", "moisture_pct", "moisture_percentage", "moisture_content", "humidity"}),
+    frozenset({"crop_year", "harvest_year", "year", "season", "harvest"}),
+    frozenset({"brand", "make", "manufacturer", "oem"}),
+    frozenset({"packaging", "package", "container", "pack_type", "packing"}),
+    frozenset({"flavor", "flavour", "taste", "variant"}),
+    frozenset({"purity", "assay", "concentration", "fineness"}),
+    frozenset({"shelf_life", "expiry", "validity", "best_before", "storage_life"}),
 )
 _KEY_SYNONYMS: dict[str, frozenset[str]] = {}
 for _group in _RAW_KEY_SYNONYMS:
@@ -750,23 +780,42 @@ for _group in _RAW_KEY_SYNONYMS:
         _KEY_SYNONYMS[_k] = _KEY_SYNONYMS.get(_k, frozenset()) | _group
 
 
-def _find_best_attribute_match(wanted_key: str, wanted_val: Any, offered: dict[str, Any]) -> tuple[float, bool]:
-    """Finds best matching attribute in offered dict, supporting:
+def _find_best_attribute_match_detailed(
+    wanted_key: str, wanted_val: Any, offered: dict[str, Any]
+) -> tuple[float, bool, Optional[str], Any, str]:
+    """Finds best matching attribute in offered dict with human explanation.
+
+    Supports:
     1. Direct key match (e.g., {"color": "black"} vs {"color": "black"})
     2. Key-to-Value Inversion (e.g., {"type": "organic"} vs {"organic": True})
     3. Key Synonyms (e.g., {"material": "cotton"} vs {"fabric": "cotton"})
     4. Cross-Measurement Match (e.g. {"dia": "20mm"} vs {"thickness": "2cm"})
 
-    Returns (score: float, found: bool).
+    Returns (score: float, found: bool, matched_key: Optional[str], matched_val: Any, reason: str).
     """
     wk_clean = wanted_key.strip().lower()
 
     # 1. Direct key match
     if wanted_key in offered and offered[wanted_key] not in (None, ""):
-        return _value_similarity(wanted_val, offered[wanted_key]), True
+        ov = offered[wanted_key]
+        score = _value_similarity(wanted_val, ov)
+        meas = unit_converter.compare_measurements(wanted_val, None, ov, None)
+        if meas is not None and str(wanted_val).strip().lower() != str(ov).strip().lower():
+            reason = f"Base SI equivalent ({wanted_val} = {ov})" if score >= 0.99 else "Close dimension"
+        else:
+            reason = "Exact match" if score >= 0.99 else ("Semantic match" if score >= 0.70 else "Different value")
+        return score, True, wanted_key, ov, reason
+
     for k in offered:
         if k.strip().lower() == wk_clean and offered[k] not in (None, ""):
-            return _value_similarity(wanted_val, offered[k]), True
+            ov = offered[k]
+            score = _value_similarity(wanted_val, ov)
+            meas = unit_converter.compare_measurements(wanted_val, None, ov, None)
+            if meas is not None and str(wanted_val).strip().lower() != str(ov).strip().lower():
+                reason = f"Base SI equivalent ({wanted_val} = {ov})" if score >= 0.99 else "Close dimension"
+            else:
+                reason = "Exact match" if score >= 0.99 else ("Semantic match" if score >= 0.70 else "Different value")
+            return score, True, k, ov, reason
 
     # 2. Key-to-Value Inversion:
     # Case A: Requester wanted string value (e.g. type: "organic") and counterparty has boolean key (e.g. organic: True)
@@ -776,9 +825,9 @@ def _find_best_attribute_match(wanted_key: str, wanted_val: Any, offered: dict[s
             ok_clean = ok.strip().lower()
             if ok_clean == val_clean or val_clean in ok_clean or ok_clean.endswith(f"_{val_clean}"):
                 if isinstance(ov, bool) and ov:
-                    return 1.0, True
+                    return 1.0, True, ok, ov, f"Specification verified ({ok})"
                 if str(ov).strip().lower() in ("true", "yes", "1", "certified", val_clean):
-                    return 1.0, True
+                    return 1.0, True, ok, ov, f"Specification verified ({ok})"
 
     # Case B: Requester specified boolean (e.g. organic: True, is_certified: True) and counterparty has string value
     if isinstance(wanted_val, bool) and wanted_val:
@@ -788,32 +837,113 @@ def _find_best_attribute_match(wanted_key: str, wanted_val: Any, offered: dict[s
         for ok, ov in offered.items():
             ov_clean = str(ov).strip().lower()
             if ov_clean in (wk_clean, f"is_{wk_clean}", stem) or (stem and stem in ov_clean):
-                return 1.0, True
+                return 1.0, True, ok, ov, f"Specification verified ({ov})"
 
     # 3. Key Synonym Resolution
     synonyms = _KEY_SYNONYMS.get(wk_clean, frozenset())
     for ok, ov in offered.items():
         ok_clean = ok.strip().lower()
-        if ok_clean in synonyms:
+        if ok_clean in synonyms and ov not in (None, ""):
             sim = _value_similarity(wanted_val, ov)
             if sim >= 0.70:
-                return sim, True
+                meas = unit_converter.compare_measurements(wanted_val, None, ov, None)
+                if meas is not None and str(wanted_val).strip().lower() != str(ov).strip().lower():
+                    reason = f"Base SI equivalent ({wanted_val} = {ov})"
+                else:
+                    reason = f"Synonym spec ({ok} ≈ {wanted_key})"
+                return sim, True, ok, ov, reason
 
-    # 4. Cross-Measurement Match
-    # If wanted_val is a measurement, check if any offered measurement in the same dimension matches
+    # 4. Cross-Measurement Match (e.g. dia: 20mm vs thickness: 2cm)
     if unit_converter.parse_measurement(wanted_val) is not None:
         for ok, ov in offered.items():
-            meas_sim = unit_converter.compare_measurements(wanted_val, None, ov, None)
-            if meas_sim is not None and meas_sim >= 0.70:
-                return meas_sim, True
+            if ov not in (None, ""):
+                meas_sim = unit_converter.compare_measurements(wanted_val, None, ov, None)
+                if meas_sim is not None and meas_sim >= 0.70:
+                    reason = f"Base SI equivalent ({wanted_val} = {ov})" if meas_sim >= 0.99 else "Close dimension"
+                    return meas_sim, True, ok, ov, reason
 
-    return 0.5, False
+    return 0.5, False, None, None, "Unstated by counterparty"
+
+
+def _find_best_attribute_match(wanted_key: str, wanted_val: Any, offered: dict[str, Any]) -> tuple[float, bool]:
+    score, found, _, _, _ = _find_best_attribute_match_detailed(wanted_key, wanted_val, offered)
+    return score, found
 
 
 # Suffix the UI appends to flag an attribute for heavier matching weight.
 _MUST_MATCH_SUFFIX = "__must_match"
 _MUST_MATCH_WEIGHT = 3.0
 _MUST_MATCH_MISSING = 0.15
+
+
+def attribute_score_with_breakdown(
+    wanted: dict[str, Any], offered: dict[str, Any]
+) -> tuple[Optional[float], list[dict[str, Any]]]:
+    """How well the candidate satisfies the attributes the requester named,
+    along with an itemized breakdown of each attribute comparison.
+    """
+    must_match_keys: set[str] = set()
+    for key, value in wanted.items():
+        if key.endswith(_MUST_MATCH_SUFFIX) and value:
+            must_match_keys.add(key[: -len(_MUST_MATCH_SUFFIX)])
+
+    requested = {
+        key: value
+        for key, value in wanted.items()
+        if key not in _PRODUCT_NAME_KEYS
+        and key not in _DERIVED_QUANTITY_KEYS
+        and not key.endswith(_MUST_MATCH_SUFFIX)
+        and value not in (None, "")
+    }
+    if not requested:
+        return None, []
+
+    offered_clean = {
+        key: value
+        for key, value in offered.items()
+        if not key.endswith(_MUST_MATCH_SUFFIX)
+        and key not in _DERIVED_QUANTITY_KEYS
+    }
+
+    total = 0.0
+    weight_sum = 0.0
+    breakdown: list[dict[str, Any]] = []
+
+    for key, value in requested.items():
+        is_must = key in must_match_keys
+        weight = _MUST_MATCH_WEIGHT if is_must else 1.0
+
+        score, found, matched_key, matched_val, reason = _find_best_attribute_match_detailed(
+            key, value, offered_clean
+        )
+        if not found:
+            effective_score = _MUST_MATCH_MISSING if is_must else 0.5
+            status = "unstated"
+        else:
+            effective_score = score
+            if score >= 0.85:
+                status = "matched"
+            elif score >= 0.55:
+                status = "partial"
+            else:
+                status = "mismatch"
+
+        total += weight * effective_score
+        weight_sum += weight
+
+        breakdown.append({
+            "key": key,
+            "requested_value": value,
+            "offered_key": matched_key,
+            "offered_value": matched_val,
+            "score": round(float(effective_score), 2),
+            "status": status,
+            "reason": reason,
+            "must_match": is_must,
+        })
+
+    overall = total / weight_sum if weight_sum else None
+    return overall, breakdown
 
 
 def attribute_score(
@@ -824,46 +954,8 @@ def attribute_score(
     Supports Key-to-Value Inversion, Key Synonym Graphs, and Multi-Dimensional
     Unit Normalization (e.g. 2cm vs 20mm -> 1.0).
     """
-    # Collect which attributes the requester flagged as critical.
-    must_match_keys: set[str] = set()
-    for key, value in wanted.items():
-        if key.endswith(_MUST_MATCH_SUFFIX) and value:
-            must_match_keys.add(key[: -len(_MUST_MATCH_SUFFIX)])
-
-    # Filter to real, non-empty attributes (skip name keys, derived quantity keys, and metadata keys).
-    requested = {
-        key: value
-        for key, value in wanted.items()
-        if key not in _PRODUCT_NAME_KEYS
-        and key not in _DERIVED_QUANTITY_KEYS
-        and not key.endswith(_MUST_MATCH_SUFFIX)
-        and value not in (None, "")
-    }
-    if not requested:
-        return None
-
-    # Also strip __must_match keys and derived quantity keys from the offered side (they are metadata).
-    offered_clean = {
-        key: value
-        for key, value in offered.items()
-        if not key.endswith(_MUST_MATCH_SUFFIX)
-        and key not in _DERIVED_QUANTITY_KEYS
-    }
-
-    total = 0.0
-    weight_sum = 0.0
-    for key, value in requested.items():
-        is_must = key in must_match_keys
-        weight = _MUST_MATCH_WEIGHT if is_must else 1.0
-
-        score, found = _find_best_attribute_match(key, value, offered_clean)
-        if not found:
-            score = _MUST_MATCH_MISSING if is_must else 0.5
-
-        total += weight * score
-        weight_sum += weight
-
-    return total / weight_sum if weight_sum else None
+    score, _ = attribute_score_with_breakdown(wanted, offered)
+    return score
 
 
 def _per_unit_prices(
@@ -874,55 +966,36 @@ def _per_unit_prices(
     buyer_attributes: Optional[dict[str, Any]] = None,
     seller_attributes: Optional[dict[str, Any]] = None,
 ) -> Optional[tuple[Decimal, Decimal]]:
-    """Both prices restated per the same unit, or None if that is impossible.
+    """Both prices restated per the same canonical base unit, or None if impossible.
 
-    Units resolvable to a base (kg, pcs, m, l) are converted: 28,000/tonne and
-    30/kg become 28 and 30 per kg. Units without a fixed base ("bora",
-    "carton") resolve via pack_weight_kg if supplied (or default 50kg for standard
-    agricultural bags/boras) or compare directly when they are the same word.
-    When only one side, or neither, said what the price is per, both are assumed
-    to be quoted on the same basis -- the same assumption the listing form makes.
+    Converts all resolvable units to their base form:
+    - Mass -> per kg (e.g. 28,000/tonne -> 28/kg)
+    - Volume -> per liter (e.g. 5,000/kL -> 5/l)
+    - Count -> per piece (e.g. 24/dozen -> 2/pcs)
+    - Length -> per meter (e.g. 50/cm -> 5000/m)
+    - Packaging -> per kg via pack_weight or per piece via pack_count.
+    When only one side, or neither, specifies per_unit, both are assumed
+    to be quoted on the same basis.
     """
     left, right = normalise_unit(buyer_unit), normalise_unit(seller_unit)
     if not left or not right:
         return buyer_target, seller_ask
 
-    b = unit_converter.price_per_base_unit(buyer_target, left)
-    if b is None and unit_converter.is_packaging_unit(left):
-        pw_kg = None
-        if buyer_attributes:
-            pw_kg = buyer_attributes.get("pack_weight_kg") or buyer_attributes.get("pack_weight")
-        if pw_kg is None and left in ("bora", "boras", "bori", "katta", "kattas", "bag", "bags", "sack", "sacks", "बोरी", "बोरा", "कट्टा"):
-            pw_kg = Decimal("50")
-        if pw_kg is not None:
-            try:
-                pw_dec = Decimal(str(pw_kg))
-                if pw_dec > 0:
-                    b = (buyer_target / pw_dec, "kg")
-            except (InvalidOperation, ValueError, TypeError):
-                pass
+    b_res = unit_converter.resolve_to_base_unit(left, buyer_attributes)
+    s_res = unit_converter.resolve_to_base_unit(right, seller_attributes)
 
-    s = unit_converter.price_per_base_unit(seller_ask, right)
-    if s is None and unit_converter.is_packaging_unit(right):
-        pw_kg = None
-        if seller_attributes:
-            pw_kg = seller_attributes.get("pack_weight_kg") or seller_attributes.get("pack_weight")
-        if pw_kg is None and right in ("bora", "boras", "bori", "katta", "kattas", "bag", "bags", "sack", "sacks", "बोरी", "बोरा", "कट्टा"):
-            pw_kg = Decimal("50")
-        if pw_kg is not None:
-            try:
-                pw_dec = Decimal(str(pw_kg))
-                if pw_dec > 0:
-                    s = (seller_ask / pw_dec, "kg")
-            except (InvalidOperation, ValueError, TypeError):
-                pass
+    if b_res is not None and s_res is not None:
+        b_factor, b_base, b_dim = b_res
+        s_factor, s_base, s_dim = s_res
+        if b_dim != s_dim or b_base != s_base:
+            return None  # per kg vs per piece: incomparable dimensions
+        b_price_base = buyer_target / b_factor if b_factor > 0 else buyer_target
+        s_price_base = seller_ask / s_factor if s_factor > 0 else seller_ask
+        return b_price_base, s_price_base
 
-    if b is not None and s is not None:
-        if b[1] != s[1]:
-            return None  # per kg vs per piece: not the same thing
-        return b[0], s[0]
     if left == right:
         return buyer_target, seller_ask
+
     return None
 
 
@@ -938,17 +1011,14 @@ def price_score(
 ) -> Optional[float]:
     """1.0 when the seller is at or under the buyer's target, decaying above it.
 
+    Converts both sides into base unit (per kg, per liter, per piece, etc.)
+    and into a common currency before computing the score.
+
     Unscored (None) rather than guessed when:
-
-    * either price is missing or not positive -- a 0 is "price on request",
-      not a free offer, and must not beat every real quote;
-    * either currency is missing -- 100 of an unknown currency is not
-      comparable to 90 USD;
+    * either price is missing or not positive;
+    * either currency is missing when the other is present;
     * a currency is unknown to the conversion table;
-    * the units are incomparable (per kg vs per piece).
-
-    Different currencies are converted to the buyer's first, then both prices
-    are restated per a common base unit (see ``_per_unit_prices``).
+    * the units are physically incomparable (e.g. per kg vs per piece).
     """
     if buyer_target is None or seller_ask is None:
         return None
@@ -999,11 +1069,15 @@ def quantity_score(
 ) -> Optional[float]:
     """Full marks when the seller can cover the buyer's requirement.
 
-    A partial fill still scores proportionally rather than zero -- two sellers at
-    half the volume each is a real outcome in this market.
+    Converts all units to canonical base SI / trade units (kg, liters, pcs, meters)
+    before evaluating volume coverage.
 
-    Supports mass-to-mass conversions (e.g. kg to tonnes, quintals to kg)
-    and packaging conversions (e.g. 1,000 boras of 55 kg to bulk tonnes).
+    Supports:
+    - Mass conversions (tonnes, quintals, kg, grams, lbs, mandis)
+    - Volume conversions (kL, m3, liters, mL, gallons)
+    - Count conversions (dozen, gross, pair, pieces)
+    - Length conversions (km, meters, cm, mm)
+    - Packaging conversions (boras, kattas, bags, cartons with pack weights).
     """
     if needed is None or available is None:
         return None
@@ -1013,73 +1087,40 @@ def quantity_score(
     except (InvalidOperation, TypeError, ValueError):
         return None
 
-    if needed_d <= 0:
+    if needed_d <= 0 or available_d <= 0:
         return None
 
-    # Try resolving both sides to kilograms (kg)
-    needed_kg: Optional[Decimal] = None
-    if needed_attributes and "total_weight_kg" in needed_attributes:
-        try:
-            needed_kg = Decimal(str(needed_attributes["total_weight_kg"]))
-        except (InvalidOperation, ValueError, TypeError):
-            pass
-    if needed_kg is None and needed_unit and unit_converter.is_mass_unit(needed_unit):
-        needed_kg = unit_converter.to_kg(needed_d, needed_unit)
-    if needed_kg is None:
-        pw_kg = None
-        if needed_attributes:
-            pw_kg = needed_attributes.get("pack_weight_kg") or needed_attributes.get("pack_weight")
-        clean_nu = unit_converter.clean_unit(needed_unit)
-        if pw_kg is None and clean_nu in ("bora", "boras", "bori", "katta", "kattas", "bag", "bags", "sack", "sacks", "बोरी", "बोरा", "कट्टा"):
-            pw_kg = Decimal("50")
-        if pw_kg is not None:
-            try:
-                needed_kg = needed_d * Decimal(str(pw_kg))
-            except (InvalidOperation, ValueError, TypeError):
-                pass
+    # Base SI / trade unit normalization
+    needed_base = unit_converter.normalize_quantity_to_base(needed_d, needed_unit, needed_attributes)
+    available_base = unit_converter.normalize_quantity_to_base(available_d, available_unit, available_attributes)
 
-    available_kg: Optional[Decimal] = None
-    if available_attributes and "total_weight_kg" in available_attributes:
-        try:
-            available_kg = Decimal(str(available_attributes["total_weight_kg"]))
-        except (InvalidOperation, ValueError, TypeError):
-            pass
-    if available_kg is None and available_unit and unit_converter.is_mass_unit(available_unit):
-        available_kg = unit_converter.to_kg(available_d, available_unit)
-    if available_kg is None:
-        pw_kg = None
-        if available_attributes:
-            pw_kg = available_attributes.get("pack_weight_kg") or available_attributes.get("pack_weight")
-        clean_au = unit_converter.clean_unit(available_unit)
-        if pw_kg is None and clean_au in ("bora", "boras", "bori", "katta", "kattas", "bag", "bags", "sack", "sacks", "बोरी", "बोरा", "कट्टा"):
-            pw_kg = Decimal("50")
-        if pw_kg is not None:
-            try:
-                available_kg = available_d * Decimal(str(pw_kg))
-            except (InvalidOperation, ValueError, TypeError):
-                pass
+    if needed_base is not None and available_base is not None:
+        n_val, n_unit, n_dim = needed_base
+        a_val, a_unit, a_dim = available_base
 
-    if needed_kg is not None and available_kg is not None:
-        if needed_kg <= 0:
+        if n_dim == a_dim and n_unit == a_unit:
+            if n_val <= 0:
+                return None
+            if a_val >= n_val or math.isclose(float(a_val), float(n_val), rel_tol=1e-5):
+                return 1.0
+            return max(0.0, min(1.0, float(a_val / n_val)))
+
+        if n_dim != "unknown" and a_dim != "unknown" and n_dim != a_dim:
+            # Different physical dimensions without bridge: 500 kg vs 500 cartons
             return None
-        if available_kg >= needed_kg or math.isclose(float(available_kg), float(needed_kg), rel_tol=1e-5):
-            return 1.0
-        return max(0.0, min(1.0, float(available_kg / needed_kg)))
 
     left, right = normalise_unit(needed_unit), normalise_unit(available_unit)
-    if left and right and left != right:
-        # Same dimension in different units: 24 pcs vs 2 dozen, 5 m vs 500 cm.
-        lb, rb = unit_converter.base_unit(left), unit_converter.base_unit(right)
-        if lb is None or rb is None or lb[1] != rb[1]:
-            # Comparing 500 kg to 500 cartons would be nonsense.
-            return None
-        needed_d, available_d = needed_d * lb[0], available_d * rb[0]
-        if needed_d <= 0:
-            return None
+    if not left and not right:
+        if available_d >= needed_d or math.isclose(float(available_d), float(needed_d), rel_tol=1e-5):
+            return 1.0
+        return max(0.0, min(1.0, float(available_d / needed_d)))
 
-    if available_d >= needed_d or math.isclose(float(available_d), float(needed_d), rel_tol=1e-5):
-        return 1.0
-    return max(0.0, min(1.0, float(available_d / needed_d)))
+    if left == right:
+        if available_d >= needed_d or math.isclose(float(available_d), float(needed_d), rel_tol=1e-5):
+            return 1.0
+        return max(0.0, min(1.0, float(available_d / needed_d)))
+
+    return None
 
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:

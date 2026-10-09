@@ -55,7 +55,11 @@ class Settings(BaseSettings):
     # match scoring). Empty model = AI_CHAT_MODEL.
     HSN_AI_ENABLED: bool = True
     HSN_AI_MODEL: str = ""
-    HSN_AI_TIMEOUT_SECONDS: float = 3.0
+    HSN_AI_TIMEOUT_SECONDS: float = 8.0
+    # Optional LLM Product Attribute recommendation based on product name
+    ATTRIBUTE_AI_ENABLED: bool = True
+    ATTRIBUTE_AI_MODEL: str = "qwen3-coder:30b"
+    ATTRIBUTE_AI_TIMEOUT_SECONDS: float = 45.0
     # Vocabulary learned from grounded AI parses; relative paths resolve against backend/.
     LEARNED_VOCAB_PATH: str = "data/learned_vocab.json"
     # AI Conversational Business Assistant (Ollama)

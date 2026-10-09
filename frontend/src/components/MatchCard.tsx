@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Link } from "react-router-dom";
 
 import { IconShield, IconStar, IconTruck } from "@/components/icons";
-import type { Counterparty, MatchCandidate, MatchScore } from "@/types";
+import type { AttributeMatchDetail, Counterparty, MatchCandidate, MatchScore } from "@/types";
 import { formatDate, formatShortDate } from "@/utils/format";
 
 
@@ -82,6 +82,65 @@ function ScoreBar({ score, distanceKm }: { score: MatchScore; distanceKm: number
           </div>
         );
       })}
+    </div>
+  );
+}
+
+function AttributeBreakdownList({ breakdown }: { breakdown: AttributeMatchDetail[] }) {
+  const matchedCount = breakdown.filter((b) => b.status === "matched").length;
+
+  return (
+    <div className="attribute-breakdown-section">
+      <div className="attribute-breakdown-header">
+        <span className="attr-breakdown-title">
+          <strong>Attribute Match Breakdown</strong> ({matchedCount}/{breakdown.length} matched)
+        </span>
+      </div>
+      <div className="attribute-breakdown-list">
+        {breakdown.map((item, idx) => {
+          let badgeClass = "attr-badge-unstated";
+          let badgeText = "○ Unstated";
+          if (item.status === "matched") {
+            badgeClass = "attr-badge-matched";
+            badgeText = "✓ Matched";
+          } else if (item.status === "partial") {
+            badgeClass = "attr-badge-partial";
+            badgeText = "~ Partial";
+          } else if (item.status === "mismatch") {
+            badgeClass = "attr-badge-mismatch";
+            badgeText = "✕ Differ";
+          }
+
+          return (
+            <div key={`${item.key}-${idx}`} className={`attr-breakdown-row ${badgeClass}`}>
+              <div className="attr-row-top">
+                <span className="attr-key-name">
+                  {item.key}
+                  {item.must_match && <span className="must-match-tag">Must Match</span>}
+                </span>
+                <span className={`attr-status-badge ${badgeClass}`}>{badgeText}</span>
+              </div>
+              <div className="attr-comparison">
+                <span className="attr-wanted" title="Your requested specification">
+                  <span className="attr-spec-label">You:</span> {String(item.requested_value)}
+                </span>
+                <span className="attr-arrow">→</span>
+                <span className="attr-offered" title="Counterparty's offered specification">
+                  <span className="attr-spec-label">Them:</span>{" "}
+                  {item.offered_value !== null && item.offered_value !== undefined
+                    ? `${String(item.offered_value)}${item.offered_key && item.offered_key.toLowerCase() !== item.key.toLowerCase() ? ` (as ${item.offered_key})` : ""}`
+                    : "—"}
+                </span>
+              </div>
+              {item.reason && (
+                <div className="attr-reason-line" title={item.reason}>
+                  💡 {item.reason}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -205,7 +264,26 @@ export function MatchCard({ candidate, onContact, onViewRoute }: MatchCardProps)
       <dl className="meta-list match-facts">
         <div>
           <dt>Quantity</dt>
-          <dd>{quantity ? `${quantity.value.toLocaleString()} ${quantity.unit}` : "—"}</dd>
+          <dd>
+            {quantity ? `${quantity.value.toLocaleString()} ${quantity.unit}` : "—"}
+            {candidate.normalized_quantity &&
+              candidate.quantity &&
+              (candidate.normalized_quantity.unit.toLowerCase() !== candidate.quantity.unit.toLowerCase() ||
+                candidate.normalized_quantity.value !== candidate.quantity.value) && (
+                <span
+                  style={{
+                    display: "block",
+                    fontSize: "0.72rem",
+                    color: "var(--accent)",
+                    fontWeight: 500,
+                    marginTop: "2px",
+                  }}
+                  title="Converted to standard base SI / trade unit"
+                >
+                  ⚡ Base: {candidate.normalized_quantity.value.toLocaleString()} {candidate.normalized_quantity.unit}
+                </span>
+              )}
+          </dd>
         </div>
         <div>
           <dt>Price</dt>
@@ -213,6 +291,27 @@ export function MatchCard({ candidate, onContact, onViewRoute }: MatchCardProps)
             {price
               ? `${price.amount.toLocaleString()} ${price.currency}${price.per_unit ? `/${price.per_unit}` : ""}`
               : "—"}
+            {candidate.normalized_price &&
+              candidate.price &&
+              ((candidate.normalized_price.per_unit &&
+                candidate.price.per_unit &&
+                candidate.normalized_price.per_unit.toLowerCase() !== candidate.price.per_unit.toLowerCase()) ||
+                candidate.normalized_price.currency.toUpperCase() !== candidate.price.currency.toUpperCase() ||
+                candidate.normalized_price.amount !== candidate.price.amount) && (
+                <span
+                  style={{
+                    display: "block",
+                    fontSize: "0.72rem",
+                    color: "var(--accent)",
+                    fontWeight: 500,
+                    marginTop: "2px",
+                  }}
+                  title="Normalized price per base unit"
+                >
+                  ⚡ Base: {candidate.normalized_price.currency} {candidate.normalized_price.amount.toLocaleString()}
+                  {candidate.normalized_price.per_unit ? `/${candidate.normalized_price.per_unit}` : ""}
+                </span>
+              )}
           </dd>
         </div>
         <div>
@@ -267,6 +366,9 @@ export function MatchCard({ candidate, onContact, onViewRoute }: MatchCardProps)
       <details className="match-breakdown">
         <summary>Why this match</summary>
         <ScoreBar score={score} distanceKm={distanceKm} />
+        {candidate.attribute_breakdown && candidate.attribute_breakdown.length > 0 && (
+          <AttributeBreakdownList breakdown={candidate.attribute_breakdown} />
+        )}
       </details>
 
       {status === "accepted" && <ContactDetails counterparty={counterparty} />}

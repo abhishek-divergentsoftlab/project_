@@ -7,6 +7,8 @@ import type {
   RFQCreatePayload,
   RFQList,
   RFQStatus,
+  SuggestedAttribute,
+  SuggestedAttributesResponse,
   TokenPair,
   User,
   UserRole,
@@ -57,6 +59,8 @@ import type {
 } from "@/types";
 
 export type {
+  SuggestedAttribute,
+  SuggestedAttributesResponse,
   AgentInfo,
   DashboardStats,
   ActivityItem,
@@ -195,6 +199,14 @@ export const rfqs = {
   },
   async listSaved(params: { limit?: number; offset?: number } = {}): Promise<CatalogListResponse> {
     const { data } = await api.get<CatalogListResponse>("/rfqs/saved", { params });
+    return data;
+  },
+  async suggestAttributes(params: {
+    product_name: string;
+    category?: string;
+    role?: string;
+  }): Promise<SuggestedAttributesResponse> {
+    const { data } = await api.get<SuggestedAttributesResponse>("/rfqs/suggest-attributes", { params });
     return data;
   },
 };
@@ -752,4 +764,70 @@ export const logistics = {
     return data;
   },
 };
+
+export interface HsnItem {
+  code: string;
+  description: string;
+  formatted_title?: string;
+  level: number;
+  chapter: string;
+  heading: string;
+  subheading: string;
+  category: string;
+  is_service: boolean;
+  aliases?: string;
+  has_children?: boolean;
+}
+
+export interface HsnChapterItem {
+  chapter: string;
+  description: string;
+  total_items?: number;
+}
+
+export interface HsnCategoryGroup {
+  category: string;
+  chapters: HsnChapterItem[];
+  count: number;
+  total_items?: number;
+}
+
+export interface HsnSuggestion {
+  code: string;
+  description: string;
+  formatted_title: string;
+  category: string;
+  chapter: string;
+  chapter_name: string;
+  confidence: string;
+  reason?: string;
+}
+
+export const hsnApi = {
+  async search(query: string, limit = 50): Promise<HsnItem[]> {
+    const { data } = await api.get<HsnItem[]>(`/hsn/search?q=${encodeURIComponent(query)}&limit=${limit}`);
+    return data;
+  },
+  async getChildren(parent: string, limit = 100): Promise<HsnItem[]> {
+    const { data } = await api.get<HsnItem[]>(`/hsn/children?parent=${encodeURIComponent(parent)}&limit=${limit}`);
+    return data;
+  },
+  async getByCode(code: string): Promise<HsnItem> {
+    const { data } = await api.get<HsnItem>(`/hsn/code/${encodeURIComponent(code)}`);
+    return data;
+  },
+  async getCategories(): Promise<HsnCategoryGroup[]> {
+    const { data } = await api.get<HsnCategoryGroup[]>("/hsn/categories");
+    return data;
+  },
+  async suggest(text: string): Promise<HsnSuggestion | null> {
+    try {
+      const { data } = await api.get<HsnSuggestion>(`/hsn/suggest?text=${encodeURIComponent(text)}`);
+      return data;
+    } catch {
+      return null;
+    }
+  },
+};
+
 

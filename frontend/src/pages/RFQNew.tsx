@@ -1,14 +1,20 @@
-import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 
 import { errorMessage } from "@/api/client";
-import { moderation as moderationApi, rfqs as rfqApi } from "@/api/endpoints";
-import { IconAlert, IconChevronLeft, IconClose, IconMapPin, IconPlus } from "@/components/icons";
+import { moderation as moderationApi, rfqs as rfqApi, hsnApi, type HsnSuggestion } from "@/api/endpoints";
+import { IconAlert, IconCheck, IconChevronLeft, IconClose, IconMapPin, IconPlus, IconSparkles } from "@/components/icons";
+import { HsnTreeSelector, type HsnSelection } from "@/components/HsnTreeSelector";
 import { LocationMapPicker } from "@/components/map/lazy";
 import { useAuth } from "@/context/useAuth";
 import { useFeedback } from "@/context/useFeedback";
-import type { ProductDetails, RFQ, RFQCreatePayload, RFQRole } from "@/types";
-import { normalizeCurrency, CURRENCY_NAMES } from "@/utils/currency";
+import type { ProductDetails, RFQ, RFQCreatePayload, RFQRole, SuggestedAttribute } from "@/types";
+import { normalizeCurrency } from "@/utils/currency";
+import {
+  MAJOR_CURRENCIES,
+  findSiUnit,
+  calculateOrderEstimate,
+} from "@/utils/siUnits";
 
 interface Attribute {
   key: string;
@@ -45,9 +51,13 @@ function toAttributeRows(details: ProductDetails): Attribute[] {
 }
 
 /** Turn the typed attribute rows into the JSONB payload. */
-function buildProductDetails(name: string, attributes: Attribute[]): ProductDetails {
+function buildProductDetails(name: string, attributes: Attribute[], hsnCode?: string): ProductDetails {
   const details: ProductDetails = {};
   if (name.trim()) details.name = name.trim();
+  if (hsnCode?.trim()) {
+    details.hsn_code = hsnCode.trim();
+    details.hsn_source = "manual";
+  }
 
   for (const { key, value, mustMatch } of attributes) {
     const trimmedKey = key.trim();
@@ -93,17 +103,18 @@ export function RFQNew() {
 
   const [form, setForm] = useState({
     role: defaultRole,
+    hsnCode: "",
     category: "",
     title: "",
     description: "",
     productName: "",
     quantityValue: "",
-    quantityUnit: "",
+    quantityUnit: "tonnes",
     minOrderValue: "",
-    minOrderUnit: "",
+    minOrderUnit: "tonnes",
     priceAmount: "",
-    priceCurrency: "",
-    pricePerUnit: "",
+    priceCurrency: "INR",
+    pricePerUnit: "kg",
     city: "",
     state: "",
     country: "",
@@ -120,19 +131,23 @@ export function RFQNew() {
   const [existing, setExisting] = useState<RFQ | null>(null);
 
   const prefill = useCallback((rfq: RFQ) => {
+    const rawHsn = rfq.product_details.hsn_code;
+    const hsn = typeof rawHsn === "string" ? rawHsn : typeof rawHsn === "number" ? String(rawHsn) : "";
+    const qUnit = rfq.quantity?.unit ?? "tonnes";
     setForm({
       role: rfq.role,
+      hsnCode: hsn,
       category: rfq.category,
       title: rfq.title,
       description: rfq.description ?? "",
       productName: typeof rfq.product_details.name === "string" ? rfq.product_details.name : "",
       quantityValue: rfq.quantity ? String(rfq.quantity.value) : "",
-      quantityUnit: rfq.quantity?.unit ?? "",
+      quantityUnit: qUnit,
       minOrderValue: rfq.minimum_order ? String(rfq.minimum_order.value) : "",
-      minOrderUnit: rfq.minimum_order?.unit ?? "",
+      minOrderUnit: rfq.minimum_order?.unit ?? qUnit,
       priceAmount: rfq.price_target ? String(rfq.price_target.amount) : "",
-      priceCurrency: rfq.price_target?.currency ?? "",
-      pricePerUnit: rfq.price_target?.per_unit ?? "",
+      priceCurrency: rfq.price_target?.currency ?? "INR",
+      pricePerUnit: rfq.price_target?.per_unit ?? (qUnit === "tonnes" ? "kg" : qUnit),
       city: rfq.location?.city ?? "",
       state: rfq.location?.state ?? "",
       country: rfq.location?.country ?? "",
@@ -148,6 +163,15 @@ export function RFQNew() {
     setAttributes(toAttributeRows(rfq.product_details));
     setExisting(rfq);
   }, []);
+
+  function handleHsnSelect(selection: HsnSelection) {
+    setForm((current) => ({
+      ...current,
+      hsnCode: selection.hsnCode,
+      category: selection.category,
+      // Do not auto-fill or overwrite productName: user can freely type it
+    }));
+  }
 
   useEffect(() => {
     if (!rfqId) return;
@@ -192,6 +216,122 @@ export function RFQNew() {
     return () => clearTimeout(timer);
   }, [form.title, form.description, form.category]);
 
+  const [aiSuggestion, setAiSuggestion] = useState<HsnSuggestion | null>(null);
+  const [suggestionDismissed, setSuggestionDismissed] = useState(false);
+
+  // Real-time AI classification recommendation for typed Product Name (e.g. "Appy Fizz" -> HSN 2202 Beverages)
+  useEffect(() => {
+    const query = form.productName.trim();
+    if (query.length < 2) {
+      setAiSuggestion(null);
+      return;
+    }
+
+    setSuggestionDismissed(false);
+
+    const timer = setTimeout(() => {
+      void hsnApi
+        .suggest(query)
+        .then((sug) => {
+          if (sug && sug.code) {
+            setAiSuggestion(sug);
+          } else {
+            setAiSuggestion(null);
+          }
+        })
+        .catch(() => setAiSuggestion(null));
+    }, 400);
+
+    return () => clearTimeout(timer);
+  }, [form.productName]);
+
+  function handleApplyAiSuggestion(sug: HsnSuggestion) {
+    setForm((current) => ({
+      ...current,
+      hsnCode: sug.code,
+      category: sug.category,
+    }));
+    setSuggestionDismissed(true);
+  }
+
+  const orderEstimate = useMemo(() => {
+    return calculateOrderEstimate(
+      form.quantityValue,
+      form.quantityUnit,
+      form.priceAmount,
+      form.pricePerUnit,
+      form.priceCurrency
+    );
+  }, [form.quantityValue, form.quantityUnit, form.priceAmount, form.pricePerUnit, form.priceCurrency]);
+
+  const [aiSuggestedSpecs, setAiSuggestedSpecs] = useState<SuggestedAttribute[]>([]);
+  const [isAiSpecsLoading, setIsAiSpecsLoading] = useState(false);
+  const [aiSpecsSource, setAiSpecsSource] = useState<string>("");
+
+  useEffect(() => {
+    const trimmed = form.productName.trim();
+    if (trimmed.length < 2) {
+      setAiSuggestedSpecs([]);
+      setAiSpecsSource("");
+      return;
+    }
+
+    setIsAiSpecsLoading(true);
+    const timer = setTimeout(() => {
+      rfqApi
+        .suggestAttributes({
+          product_name: trimmed,
+          category: form.category || undefined,
+          role: form.role,
+        })
+        .then((res) => {
+          if (res && res.suggested_attributes && res.suggested_attributes.length > 0) {
+            setAiSuggestedSpecs(res.suggested_attributes);
+            setAiSpecsSource(res.source);
+          } else {
+            setAiSuggestedSpecs([]);
+            setAiSpecsSource("");
+          }
+        })
+        .catch(() => {
+          setAiSuggestedSpecs([]);
+          setAiSpecsSource("");
+        })
+        .finally(() => {
+          setIsAiSpecsLoading(false);
+        });
+    }, 450);
+
+    return () => clearTimeout(timer);
+  }, [form.productName, form.category, form.role]);
+
+  // Active specs directly and purely from real-time AI generation
+  const activeSpecs: SuggestedAttribute[] = aiSuggestedSpecs;
+
+  const handleAddOrFocusSpec = useCallback((spec: SuggestedAttribute, presetValue?: string) => {
+    setAttributes((current) => {
+      const existingIndex = current.findIndex(
+        (attr) =>
+          attr.key.trim().toLowerCase() === spec.key.toLowerCase() ||
+          attr.key.trim().toLowerCase() === spec.label.toLowerCase()
+      );
+      if (existingIndex >= 0) {
+        if (presetValue) {
+          return current.map((attr, idx) =>
+            idx === existingIndex ? { ...attr, value: presetValue } : attr
+          );
+        }
+        return current;
+      }
+      const initialVal = presetValue || "";
+      const mustMatch = Boolean(spec.must_match);
+      if (current.length === 1 && !current[0].key.trim() && !current[0].value.trim()) {
+        return [{ key: spec.label, value: initialVal, mustMatch }];
+      }
+      return [...current, { key: spec.label, value: initialVal, mustMatch }];
+    });
+  }, []);
+
   function update<K extends keyof typeof form>(key: K, value: (typeof form)[K]) {
     setForm((current) => ({ ...current, [key]: value }));
   }
@@ -213,14 +353,26 @@ export function RFQNew() {
       return;
     }
 
+    if (!form.productName.trim() && !form.title.trim()) {
+      setError("Please specify the Product Name.");
+      return;
+    }
+
+    if (!form.hsnCode && !form.category) {
+      setError("Please select a product classification or HSN code.");
+      return;
+    }
+
     setSubmitting(true);
+
+    const finalTitle = form.productName.trim() || form.title.trim() || "Product Listing";
 
     const payload: RFQCreatePayload = {
       role: form.role,
-      category: form.category,
-      title: form.title,
+      category: form.category || "General Goods",
+      title: finalTitle,
       status: form.publishNow ? "active" : "draft",
-      product_details: buildProductDetails(form.productName, attributes),
+      product_details: buildProductDetails(form.productName.trim(), attributes, form.hsnCode),
     };
 
     // A closed or expired listing keeps its status through an edit -- the
@@ -293,8 +445,6 @@ export function RFQNew() {
     );
   }
 
-  const currencyName = CURRENCY_NAMES[form.priceCurrency];
-
   return (
     <section className="page page-narrow">
       <header>
@@ -344,14 +494,15 @@ export function RFQNew() {
             )}
           </div>
 
+          {/* Tree-Like HSN Code & Commodity Selector */}
           <div className="field">
-            <label htmlFor="title">Title</label>
-            <input
-              id="title"
-              required
-              placeholder="e.g. Need 6,000 red USB-C cables"
-              value={form.title}
-              onChange={(e) => update("title", e.target.value)}
+            <span className="field-label" id="hsn-tree-label">
+              Product Classification &amp; HSN Code
+            </span>
+            <HsnTreeSelector
+              selectedHsnCode={form.hsnCode}
+              onSelect={handleHsnSelect}
+              role={form.role}
             />
           </div>
 
@@ -365,120 +516,317 @@ export function RFQNew() {
             </div>
           )}
 
-          <div className="field-grid">
-            <div className="field">
-              <label htmlFor="category">Category</label>
-              <input
-                id="category"
-                required
-                placeholder="e.g. Electronics"
-                value={form.category}
-                onChange={(e) => update("category", e.target.value)}
-              />
-            </div>
-            <div className="field">
-              <label htmlFor="productName">
-                Product name <span className="optional">Optional</span>
-              </label>
-              <input
-                id="productName"
-                placeholder="e.g. USB cable"
-                value={form.productName}
-                onChange={(e) => update("productName", e.target.value)}
-              />
-            </div>
+          {/* Product Name (Direct User Input) */}
+          <div className="field" style={{ marginTop: "1rem" }}>
+            <label htmlFor="productName">
+              Product Name <span className="required" style={{ color: "var(--accent)" }}>*</span>
+            </label>
+            <input
+              id="productName"
+              required
+              placeholder="e.g. Milk, Pure Cow Milk, Salted Butter, Curd..."
+              value={form.productName}
+              onChange={(e) => {
+                const val = e.target.value;
+                update("productName", val);
+                update("title", val);
+              }}
+            />
+            <small>
+              Specify what product you want to {form.role === "seller" ? "sell" : "buy"} (e.g. Milk, Butter, Curd).
+            </small>
           </div>
+
+          {/* AI Category & Classification Recommendation Card */}
+          {aiSuggestion && !suggestionDismissed && form.hsnCode !== aiSuggestion.code && (
+            <div className="hsn-ai-suggestion-card">
+              <div className="hsn-ai-suggestion-header">
+                <div className="hsn-ai-badge">
+                  <IconSparkles size={14} className="hsn-sparkle-icon" />
+                  <span>AI Classification Recommendation</span>
+                </div>
+                <button
+                  type="button"
+                  className="hsn-ai-dismiss"
+                  onClick={() => setSuggestionDismissed(true)}
+                  title="Dismiss recommendation"
+                >
+                  <IconClose size={13} />
+                </button>
+              </div>
+
+              <div className="hsn-ai-suggestion-body">
+                <div className="hsn-ai-target">
+                  <strong>HSN {aiSuggestion.code}</strong> &bull; {aiSuggestion.formatted_title}
+                </div>
+                <div className="hsn-ai-meta">
+                  Suggested Category: <span className="hsn-cat-pill">{aiSuggestion.category}</span> &bull; Chapter {aiSuggestion.chapter} ({aiSuggestion.chapter_name})
+                </div>
+                {aiSuggestion.reason && (
+                  <p className="hsn-ai-reason">💡 {aiSuggestion.reason}</p>
+                )}
+              </div>
+
+              <div className="hsn-ai-suggestion-footer">
+                <button
+                  type="button"
+                  className="hsn-apply-ai-btn"
+                  onClick={() => handleApplyAiSuggestion(aiSuggestion)}
+                >
+                  ✓ Apply HSN {aiSuggestion.code} ({aiSuggestion.category})
+                </button>
+              </div>
+            </div>
+          )}
+
+          {form.hsnCode && aiSuggestion && form.hsnCode === aiSuggestion.code && (
+            <div className="hsn-ai-applied-tag">
+              <IconCheck size={14} className="hsn-check-icon" />
+              <span>
+                Classified under <strong>HSN {aiSuggestion.code}</strong> ({aiSuggestion.formatted_title}) &mdash; {aiSuggestion.chapter_name}
+              </span>
+            </div>
+          )}
         </div>
 
+        {/* Section 1: Quantity Specifications (SI Standardized) */}
         <div className="form-section">
           <div className="form-section-head">
-            <h2>Quantity &amp; price</h2>
+            <h2>1. Quantity &amp; Volume (SI Verified)</h2>
+            <p>Specify the required order volume using world-standard, SI-verified units.</p>
           </div>
 
-          <div className="field-grid field-grid-4">
+          <div className="field-grid field-grid-2">
             <div className="field">
-              <label htmlFor="quantityValue">Quantity</label>
+              <label htmlFor="quantityValue">
+                {form.role === "seller" ? "Total Available Quantity" : "Required Quantity"}
+              </label>
               <input
                 id="quantityValue"
                 type="number"
                 min="0"
                 step="any"
                 inputMode="decimal"
+                placeholder="e.g. 10"
                 value={form.quantityValue}
                 onChange={(e) => update("quantityValue", e.target.value)}
               />
             </div>
+
             <div className="field">
-              <label htmlFor="quantityUnit">Unit</label>
-              <input
+              <label htmlFor="quantityUnit">Quantity Unit (SI Standard)</label>
+              <select
                 id="quantityUnit"
-                placeholder="pcs, kg, tonnes"
                 value={form.quantityUnit}
-                onChange={(e) => update("quantityUnit", e.target.value)}
-              />
-            </div>
-            <div className="field">
-              <label htmlFor="priceAmount">Target price</label>
-              <input
-                id="priceAmount"
-                type="number"
-                min="0"
-                step="any"
-                inputMode="decimal"
-                placeholder="Per unit"
-                value={form.priceAmount}
-                onChange={(e) => update("priceAmount", e.target.value)}
-              />
-            </div>
-            <div className="field">
-              <label htmlFor="priceCurrency">Currency</label>
-              <input
-                id="priceCurrency"
-                placeholder="INR, USD…"
-                value={form.priceCurrency}
-                aria-describedby={currencyName ? "currency-hint" : undefined}
                 onChange={(e) => {
-                  const val = e.target.value;
-                  const norm = normalizeCurrency(val);
-                  if (norm && norm !== val.toUpperCase() && val.length > 2) {
-                    update("priceCurrency", norm);
-                  } else {
-                    update("priceCurrency", val.toUpperCase());
+                  const newUnit = e.target.value;
+                  update("quantityUnit", newUnit);
+                  // Intelligently suggest matching price unit if not yet diverged
+                  if (!form.pricePerUnit || form.pricePerUnit === form.quantityUnit) {
+                    const si = findSiUnit(newUnit);
+                    if (si?.category === "mass" && newUnit === "tonnes") {
+                      update("pricePerUnit", "kg"); // standard Indian & global trade habit: tons in kg rate
+                    } else {
+                      update("pricePerUnit", newUnit);
+                    }
                   }
                 }}
-                onBlur={() => {
-                  if (form.priceCurrency) {
-                    update("priceCurrency", normalizeCurrency(form.priceCurrency));
-                  }
-                }}
-              />
-              {currencyName && <small id="currency-hint">{currencyName}</small>}
+              >
+                <optgroup label="Mass / Weight (SI Standard)">
+                  <option value="tonnes">Metric Tonne (t / MT - 1,000 kg)</option>
+                  <option value="quintal">Quintal (q - 100 kg)</option>
+                  <option value="kg">Kilogram (kg - SI Base)</option>
+                  <option value="g">Gram (g - 0.001 kg)</option>
+                </optgroup>
+                <optgroup label="Volume / Liquids (SI Metric)">
+                  <option value="litres">Litre (L - SI Metric)</option>
+                  <option value="ml">Millilitre (mL - 0.001 L)</option>
+                  <option value="kl">Kilolitre (kL - 1,000 L)</option>
+                  <option value="m3">Cubic Metre (m³ - 1,000 L)</option>
+                </optgroup>
+                <optgroup label="Length / Distance (SI)">
+                  <option value="metres">Metre (m - SI Base)</option>
+                  <option value="km">Kilometre (km - 1,000 m)</option>
+                  <option value="cm">Centimetre (cm - 0.01 m)</option>
+                  <option value="mm">Millimetre (mm - 0.001 m)</option>
+                </optgroup>
+                <optgroup label="Count & Commercial Packaging">
+                  <option value="pieces">Pieces / Units (pcs)</option>
+                  <option value="dozen">Dozen (12 pcs)</option>
+                  <option value="boxes">Boxes</option>
+                  <option value="cartons">Cartons (ctn)</option>
+                  <option value="bags">Bags (e.g. 50 kg sacks)</option>
+                  <option value="drums">Drums / Barrels (200 L)</option>
+                  <option value="pallets">Pallets</option>
+                </optgroup>
+              </select>
             </div>
           </div>
 
+          {/* SI Verification Badge for Quantity */}
+          {form.quantityUnit && (
+            <div className="si-verification-badge">
+              <IconCheck size={14} className="si-check-icon" />
+              <span>
+                <strong>SI Standard:</strong> {findSiUnit(form.quantityUnit)?.siFormula || `${form.quantityUnit} verified`}
+              </span>
+            </div>
+          )}
+
+          {/* Seller Minimum Order Quantity (MOQ) */}
           {form.role === "seller" && (
-            <div className="field-grid field-grid-4">
+            <div className="field-grid field-grid-2" style={{ marginTop: "0.75rem" }}>
               <div className="field">
-                <label htmlFor="minOrderValue">Minimum order</label>
+                <label htmlFor="minOrderValue">Minimum Order Quantity (MOQ)</label>
                 <input
                   id="minOrderValue"
                   type="number"
                   min="0"
                   step="any"
                   inputMode="decimal"
+                  placeholder="e.g. 1"
                   value={form.minOrderValue}
                   onChange={(e) => update("minOrderValue", e.target.value)}
                 />
               </div>
               <div className="field">
-                <label htmlFor="minOrderUnit">Unit</label>
-                <input
+                <label htmlFor="minOrderUnit">MOQ Unit</label>
+                <select
                   id="minOrderUnit"
-                  placeholder="pcs, kg, tonnes"
-                  value={form.minOrderUnit}
+                  value={form.minOrderUnit || form.quantityUnit}
                   onChange={(e) => update("minOrderUnit", e.target.value)}
-                />
+                >
+                  <optgroup label="Mass / Weight (SI)">
+                    <option value="tonnes">Metric Tonne (t / MT)</option>
+                    <option value="quintal">Quintal (q)</option>
+                    <option value="kg">Kilogram (kg)</option>
+                    <option value="g">Gram (g)</option>
+                  </optgroup>
+                  <optgroup label="Volume / Liquids (SI/Metric)">
+                    <option value="litres">Litre (L)</option>
+                    <option value="ml">Millilitre (mL)</option>
+                    <option value="kl">Kilolitre (kL)</option>
+                    <option value="m3">Cubic Metre (m³)</option>
+                  </optgroup>
+                  <optgroup label="Length / Distance (SI)">
+                    <option value="metres">Metre (m)</option>
+                    <option value="km">Kilometre (km)</option>
+                    <option value="cm">Centimetre (cm)</option>
+                    <option value="mm">Millimetre (mm)</option>
+                  </optgroup>
+                  <optgroup label="Count & Commercial Packaging">
+                    <option value="pieces">Pieces (pcs)</option>
+                    <option value="dozen">Dozen</option>
+                    <option value="boxes">Boxes</option>
+                    <option value="cartons">Cartons</option>
+                    <option value="bags">Bags</option>
+                    <option value="drums">Drums</option>
+                    <option value="pallets">Pallets</option>
+                  </optgroup>
+                </select>
               </div>
+            </div>
+          )}
+        </div>
+
+        {/* Section 2: Pricing & Commercial Terms (Different & Separated) */}
+        <div className="form-section">
+          <div className="form-section-head">
+            <h2>2. Target Price &amp; Commercial Terms</h2>
+            <p>Enter the unit price and select from major global trade currencies.</p>
+          </div>
+
+          <div className="field-grid field-grid-3">
+            <div className="field">
+              <label htmlFor="priceAmount">
+                {form.role === "seller" ? "Offer Price" : "Target Price"}
+              </label>
+              <input
+                id="priceAmount"
+                type="number"
+                min="0"
+                step="any"
+                inputMode="decimal"
+                placeholder="e.g. 70"
+                value={form.priceAmount}
+                onChange={(e) => update("priceAmount", e.target.value)}
+              />
+            </div>
+
+            <div className="field">
+              <label htmlFor="priceCurrency">Trade Currency</label>
+              <select
+                id="priceCurrency"
+                value={form.priceCurrency}
+                onChange={(e) => update("priceCurrency", e.target.value)}
+              >
+                {MAJOR_CURRENCIES.map((curr) => (
+                  <option key={curr.code} value={curr.code}>
+                    {curr.symbol} — {curr.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="field">
+              <label htmlFor="pricePerUnit">Quoted Per Unit</label>
+              <select
+                id="pricePerUnit"
+                value={form.pricePerUnit}
+                onChange={(e) => update("pricePerUnit", e.target.value)}
+              >
+                <optgroup label="Mass / Weight (SI)">
+                  <option value="kg">per Kilogram (kg)</option>
+                  <option value="tonnes">per Metric Tonne (t / MT)</option>
+                  <option value="quintal">per Quintal (q)</option>
+                  <option value="g">per Gram (g)</option>
+                </optgroup>
+                <optgroup label="Volume / Liquids (SI/Metric)">
+                  <option value="litres">per Litre (L)</option>
+                  <option value="ml">per Millilitre (mL)</option>
+                  <option value="kl">per Kilolitre (kL)</option>
+                  <option value="m3">per Cubic Metre (m³)</option>
+                </optgroup>
+                <optgroup label="Length / Distance (SI)">
+                  <option value="metres">per Metre (m)</option>
+                  <option value="km">per Kilometre (km)</option>
+                  <option value="cm">per Centimetre (cm)</option>
+                  <option value="mm">per Millimetre (mm)</option>
+                </optgroup>
+                <optgroup label="Count & Commercial Packaging">
+                  <option value="pieces">per Piece / Unit (pcs)</option>
+                  <option value="dozen">per Dozen (12 pcs)</option>
+                  <option value="boxes">per Box</option>
+                  <option value="cartons">per Carton</option>
+                  <option value="bags">per Bag (50kg)</option>
+                  <option value="drums">per Drum (200L)</option>
+                  <option value="pallets">per Pallet</option>
+                </optgroup>
+              </select>
+            </div>
+          </div>
+
+          {/* Real-time SI Order Value Calculation Card */}
+          {orderEstimate.isValid && (
+            <div className="si-calculator-card">
+              <div className="si-calc-header">
+                <span className="si-calc-title">Estimated Total Order Value</span>
+                <span className="si-calc-tag">SI-Verified Standard</span>
+              </div>
+              <div className="si-calc-body">
+                <span className="si-calc-total">{orderEstimate.formattedTotal}</span>
+                <span className="si-calc-formula">{orderEstimate.siSummary}</span>
+              </div>
+              {orderEstimate.conversionFormula && (
+                <div className="si-calc-footer">
+                  <span>✓ {orderEstimate.conversionFormula}</span>
+                </div>
+              )}
+              {orderEstimate.warning && (
+                <div className="si-calc-footer" style={{ color: "var(--warning)" }}>
+                  <span>⚠ {orderEstimate.warning}</span>
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -570,63 +918,181 @@ export function RFQNew() {
 
         <div className="form-section">
           <div className="form-section-head">
-            <h2>Details</h2>
-            <p>Specs that matter for this product — material, colour, grade, amperage.</p>
+            <h2>Details &amp; Specifications</h2>
+            <p>Specs that matter for this product — click recommended standard specs to guarantee exact match with trading partners.</p>
           </div>
-
-          <div className="field">
-            <label htmlFor="description">
-              Notes <span className="optional">Optional</span>
-            </label>
-            <textarea
-              id="description"
-              rows={3}
-              value={form.description}
-              onChange={(e) => update("description", e.target.value)}
-            />
-          </div>
-
           <fieldset className="attributes">
             <legend>Product attributes</legend>
-            <div className="attribute-list">
-              {attributes.map((attribute, index) => (
-                // Index keys are safe here: rows are only appended and removed,
-                // never reordered.
-                <div className="attribute-row" key={index}>
-                  <input
-                    aria-label={`Attribute ${index + 1} name`}
-                    placeholder="Name, e.g. colour"
-                    value={attribute.key}
-                    onChange={(e) => updateAttribute(index, { key: e.target.value })}
-                  />
-                  <input
-                    aria-label={`Attribute ${index + 1} value`}
-                    placeholder="Value, e.g. red"
-                    value={attribute.value}
-                    onChange={(e) => updateAttribute(index, { value: e.target.value })}
-                  />
-                  <label
-                    className={`must-match-label${attribute.mustMatch ? " checked" : ""}`}
-                    title="Matching strongly favours exact or nearest values for this attribute"
-                  >
-                    <input
-                      type="checkbox"
-                      checked={attribute.mustMatch}
-                      onChange={(e) => updateAttribute(index, { mustMatch: e.target.checked })}
-                    />
-                    Must match
-                  </label>
-                  <button
-                    type="button"
-                    className="icon-btn"
-                    aria-label={`Remove attribute ${index + 1}`}
-                    title="Remove"
-                    onClick={() => setAttributes((current) => current.filter((_, i) => i !== index))}
-                  >
-                    <IconClose size={16} />
-                  </button>
+
+            {(isAiSpecsLoading || activeSpecs.length > 0) && (
+              <div className="recommended-specs-container">
+                <div className="recommended-specs-header">
+                  <span className="recommended-specs-title">
+                    <IconSparkles size={13} className="sparkle-icon" />
+                    <strong>AI Specifications for "{form.productName}":</strong>
+                    {isAiSpecsLoading && <span className="ai-loading-pulse">Discovering specs live with AI…</span>}
+                    {!isAiSpecsLoading && aiSpecsSource && (
+                      <span className="ai-source-badge">{aiSpecsSource === "cache" ? "Fast AI Cache" : "Live AI"}</span>
+                    )}
+                  </span>
+                  <span className="recommended-specs-subtitle">
+                    {isAiSpecsLoading
+                      ? `Analyzing ${form.productName} characteristics and commercial grading requirements...`
+                      : `Key technical specifications discovered live by AI for ${form.productName} (click to add).`}
+                  </span>
                 </div>
-              ))}
+                {activeSpecs.length > 0 && (
+                  <div className="recommended-specs-chips" role="group" aria-label="Recommended attributes">
+                  {activeSpecs.map((spec) => {
+                    const isPresent = attributes.some(
+                      (attr) =>
+                        attr.key.trim().toLowerCase() === spec.key.toLowerCase() ||
+                        attr.key.trim().toLowerCase() === spec.label.toLowerCase()
+                    );
+                    const titleText = spec.explanation
+                      ? `${spec.explanation}${spec.placeholder ? ` (${spec.placeholder})` : ""}`
+                      : spec.placeholder || undefined;
+
+                    return (
+                      <button
+                        key={spec.key}
+                        type="button"
+                        className={`spec-chip${isPresent ? " is-active" : ""}`}
+                        onClick={() => handleAddOrFocusSpec(spec)}
+                        title={titleText}
+                      >
+                        <span className="chip-plus">{isPresent ? "✓" : "+"}</span>
+                        <span className="chip-label">{spec.label}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
+            <div className="attribute-list">
+              {attributes.map((attribute, index) => {
+                const matchingSpec = activeSpecs.find(
+                  (s) =>
+                    s.key.toLowerCase() === attribute.key.trim().toLowerCase() ||
+                    s.label.toLowerCase() === attribute.key.trim().toLowerCase()
+                );
+                const isNumeric = matchingSpec?.input_type === "numeric";
+                const placeholder = matchingSpec?.placeholder || (isNumeric ? "e.g. 6.0" : "Value, e.g. red");
+                const hasOptions = matchingSpec?.options && matchingSpec.options.length > 0;
+
+                return (
+                  <div className="attribute-row-container" key={index}>
+                    <div className="attribute-row">
+                      <input
+                        aria-label={`Attribute ${index + 1} name`}
+                        placeholder="Name, e.g. colour"
+                        value={attribute.key}
+                        onChange={(e) => updateAttribute(index, { key: e.target.value })}
+                      />
+                      <input
+                        aria-label={`Attribute ${index + 1} value`}
+                        placeholder={placeholder}
+                        value={attribute.value}
+                        inputMode={isNumeric ? "decimal" : undefined}
+                        onKeyDown={(e) => {
+                          if (!isNumeric) return;
+                          // Allow standard navigation and edit controls
+                          if (
+                            e.key === "Backspace" ||
+                            e.key === "Tab" ||
+                            e.key === "Enter" ||
+                            e.key === "Escape" ||
+                            e.key === "Delete" ||
+                            e.key === "ArrowLeft" ||
+                            e.key === "ArrowRight" ||
+                            e.key === "ArrowUp" ||
+                            e.key === "ArrowDown" ||
+                            e.key === "Home" ||
+                            e.key === "End"
+                          ) {
+                            return;
+                          }
+                          // Allow Ctrl/Cmd shortcuts
+                          if (e.ctrlKey || e.metaKey) {
+                            return;
+                          }
+                          // Allow digits 0-9
+                          if (/^[0-9]$/.test(e.key)) {
+                            return;
+                          }
+                          // Allow single decimal dot if not already present
+                          if (e.key === "." && !attribute.value.includes(".")) {
+                            return;
+                          }
+                          // Block all other keys (letters, %, symbols, spaces)
+                          e.preventDefault();
+                        }}
+                        onChange={(e) => {
+                          let val = e.target.value;
+                          if (isNumeric) {
+                            val = val.replace(/[^0-9.]/g, "");
+                            const parts = val.split(".");
+                            if (parts.length > 2) {
+                              val = parts[0] + "." + parts.slice(1).join("");
+                            }
+                          }
+                          updateAttribute(index, { value: val });
+                        }}
+                      />
+                      <label
+                        className={`must-match-label${attribute.mustMatch ? " checked" : ""}`}
+                        title="Matching strongly favours exact or nearest values for this attribute"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={attribute.mustMatch}
+                          onChange={(e) => updateAttribute(index, { mustMatch: e.target.checked })}
+                        />
+                        Must match
+                      </label>
+                      <button
+                        type="button"
+                        className="icon-btn"
+                        aria-label={`Remove attribute ${index + 1}`}
+                        title="Remove"
+                        onClick={() => setAttributes((current) => current.filter((_, i) => i !== index))}
+                      >
+                        <IconClose size={16} />
+                      </button>
+                    </div>
+
+                    {/* Quick Preset Value Options from LLM / Expert Spec */}
+                    {hasOptions && (
+                      <div className="attr-option-pills" role="group" aria-label="Suggested values">
+                        <span className="attr-option-pill-label">Suggested:</span>
+                        {matchingSpec.options!.map((opt) => {
+                          const cleanVal = isNumeric
+                            ? (opt.match(/[-+]?\d+(?:\.\d+)?/)?.[0] || opt.replace(/[^0-9.]/g, ""))
+                            : opt;
+                          return (
+                            <button
+                              key={opt}
+                              type="button"
+                              className={`attr-option-pill${attribute.value === cleanVal ? " is-selected" : ""}`}
+                              onClick={() => updateAttribute(index, { value: cleanVal })}
+                              title={`Choose ${cleanVal}`}
+                            >
+                              {cleanVal}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                    {matchingSpec?.explanation && (
+                      <div className="attr-explanation-hint">
+                        💡 {matchingSpec.explanation}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
             <button
               type="button"
@@ -634,7 +1100,7 @@ export function RFQNew() {
               onClick={() => setAttributes((current) => [...current, { key: "", value: "", mustMatch: false }])}
             >
               <IconPlus size={14} />
-              Add attribute
+              Add custom attribute
             </button>
           </fieldset>
         </div>

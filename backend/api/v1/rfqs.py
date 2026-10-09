@@ -13,7 +13,7 @@ from fastapi import APIRouter, HTTPException, Query, status
 from api.deps import CurrentUser, DbSession
 from models.enums import RFQStatus
 from models.rfq import RFQ
-from schemas.rfq import RFQCreate, RFQListOut, RFQOut, RFQPatch
+from schemas.rfq import RFQCreate, RFQListOut, RFQOut, RFQPatch, SuggestedAttributesResponse
 from schemas.marketplace import CatalogListOut
 from schemas.connection import ConnectionOut
 from services import connection_service, rfq_service, saved_rfq_service
@@ -102,6 +102,26 @@ async def list_saved_rfqs(
     """List all RFQs bookmarked by the current user for later review."""
     return await saved_rfq_service.list_saved_rfqs(
         db, current_user, limit=limit, offset=offset
+    )
+
+
+@router.get("/suggest-attributes", response_model=SuggestedAttributesResponse)
+async def suggest_attributes(
+    product_name: Annotated[str, Query(min_length=1, max_length=200)],
+    category: Annotated[Optional[str], Query(max_length=120)] = None,
+    role: Annotated[Optional[str], Query(max_length=20)] = None,
+) -> SuggestedAttributesResponse:
+    """Dynamically suggest discriminating wholesale product specifications via LLM and expert models."""
+    from services.attribute_recommender import recommend_product_attributes
+
+    attrs, source = await recommend_product_attributes(
+        product_name=product_name, category=category, role=role
+    )
+    return SuggestedAttributesResponse(
+        product_name=product_name,
+        category=category,
+        suggested_attributes=attrs,
+        source=source,
     )
 
 
