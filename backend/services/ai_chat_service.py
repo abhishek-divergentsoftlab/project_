@@ -660,12 +660,16 @@ async def execute_create_rfq_call(
     status = tool_args.get("status", "active")
     notes = tool_args.get("notes")
 
-    payload = rfq_tool_service.build_rfq_create_payload(
-        draft=draft,
-        title=title,
-        status=status,
-        notes=notes,
-    )
+    try:
+        payload = rfq_tool_service.build_rfq_create_payload(
+            draft=draft,
+            title=title,
+            status=status,
+            notes=notes,
+        )
+    except rfq_tool_service.RFQDraftInvalid as exc:
+        problems = "; ".join(f"{f}: {m}" for f, m in exc.errors)
+        return None, f"I couldn't create the RFQ yet — please fix: {problems}"
 
     if db is not None and user is not None:
         if not user.can_post_as(payload.role):
@@ -1202,6 +1206,23 @@ def is_truncated_message(msg: str) -> bool:
     return False
 
 
+def _draft_location(city: str, stated_country: Optional[str] = None) -> dict[str, Any]:
+    """City/state/country from the gazetteer when it knows the city; never an invented country."""
+    from services import locations
+
+    loc = locations.find_location(city) if city else None
+    if loc is not None and loc.is_city:
+        out: dict[str, Any] = {"city": loc.city or city}
+        if loc.state:
+            out["state"] = loc.state
+        out["country"] = loc.country
+        return out
+    out = {"city": city}
+    if stated_country:
+        out["country"] = stated_country
+    return out
+
+
 def format_created_rfq_text(created_rfq: dict[str, Any]) -> str:
     """Format celebratory message when an RFQ is created."""
     rfq_id = created_rfq.get("id", "")
@@ -1209,6 +1230,17 @@ def format_created_rfq_text(created_rfq: dict[str, Any]) -> str:
     role = (created_rfq.get("role") or "BUYER").upper()
     status = (created_rfq.get("status") or "ACTIVE").upper()
     category = created_rfq.get("category", "General Goods")
+
+    if status == "DRAFT":
+        return (
+            f"📝 **RFQ saved as a draft (not published).**\n\n"
+            f"- **Title**: {title}\n"
+            f"- **RFQ ID**: `{rfq_id}`\n"
+            f"- **Market Side**: {role}\n"
+            f"- **Category**: {category}\n"
+            f"- **Status**: DRAFT (not visible in the Marketplace)\n\n"
+            f"You can review and publish it later from your RFQs."
+        )
 
     rfq_link_md = f"[View RFQ in Marketplace](/marketplace?rfq={rfq_id})" if rfq_id else "[View Marketplace](/marketplace)"
 
@@ -2004,7 +2036,8 @@ async def _run_chat_turn(
             logger.exception("Failed to initialize conversation: %s", exc)
 
     state = (conversation.state or {}) if conversation else {}
-    if not current_rfq and isinstance(state.get("rfq_draft"), dict) and state["rfq_draft"]:
+    if conversation is not None and isinstance(state.get("rfq_draft"), dict):
+        # The server's draft is authoritative; the client copy is only for stateless calls.
         current_rfq = dict(state["rfq_draft"])
 
     client_cands = list(matched_candidates or [])
@@ -2089,12 +2122,11 @@ async def _run_chat_turn(
         ai_loc = sem_ext.get("location")
         if ai_loc and not (draft.get("location") or {}).get("city"):
             raw_city = ai_loc.split(",")[0].strip()
-            draft["location"] = {"city": _clean_city_name(raw_city) or raw_city, "country": "India"}
+            draft["location"] = _draft_location(_clean_city_name(raw_city) or raw_city, ai_loc)
         elif req_linguistic.city and not (draft.get("location") or {}).get("city"):
-            draft["location"] = {
-                "city": _clean_city_name(req_linguistic.city) or req_linguistic.city,
-                "country": req_linguistic.country or "India",
-            }
+            draft["location"] = _draft_location(
+                _clean_city_name(req_linguistic.city) or req_linguistic.city, req_linguistic.country
+            )
     readiness = rfq_tool_service.evaluate_rfq_readiness(draft)
     window_messages, older_summary = build_sliding_window_messages(messages, max_history_turns=8)
     tool_cards: list[dict[str, Any]] = []
@@ -2227,10 +2259,14 @@ async def _run_chat_turn(
             yield ChatEvent("status", wire(
                 thinking="User requested to finalize and publish RFQ. Validating required fields and submitting listing to marketplace database..."
             ))
-            created, err = await execute_create_rfq_call(draft, {}, db=db, user=user)
+            create_args = {"status": "draft"} if chat_permissions.wants_draft_status(last_user_content) else {}
+            created, err = await execute_create_rfq_call(draft, create_args, db=db, user=user)
             step = create_step(created, err)
             yield ChatEvent("tool_step", wire(tool_step=step, created=created))
             reply = format_created_rfq_text(created) if created else f"⚠️ {err or 'Failed to create RFQ.'}"
+            if created:
+                draft.clear()  # the RFQ exists now; a second "create" must start from a fresh draft
+                readiness = rfq_tool_service.evaluate_rfq_readiness(draft)
             yield await finish(
                 reply=reply, tool_step=step, created=created,
                 thinking="Validated required fields and submitted RFQ to marketplace database.",
@@ -2450,6 +2486,8 @@ async def _run_chat_turn(
                 tool_step=captured_tool_step, cp_msg=counterparty_msg_obj,
             )
         elif created_rfq_obj:
+            draft.clear()
+            readiness = rfq_tool_service.evaluate_rfq_readiness(draft)
             yield await finish(
                 reply=format_created_rfq_text(created_rfq_obj), thinking=thinking,
                 tool_step=captured_tool_step, created=created_rfq_obj,

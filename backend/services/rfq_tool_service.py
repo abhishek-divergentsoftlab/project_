@@ -16,7 +16,7 @@ import re
 from decimal import Decimal
 from typing import Any, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from models.enums import RFQRole, RFQStatus
 from schemas.common import Deadline, Location, Money, Quantity
@@ -584,8 +584,8 @@ def evaluate_rfq_readiness(
     missing_required: list[str] = []
     if not has_role:
         missing_required.append("role")
-    if not has_product and not has_category:
-        missing_required.append("product/category")
+    if not has_product:
+        missing_required.append("product")
 
     required_complete = len(missing_required) == 0
 
@@ -595,7 +595,7 @@ def evaluate_rfq_readiness(
     next_required_prompt: Optional[str] = None
     if not has_role:
         next_required_prompt = "role"
-    elif not has_product and not has_category:
+    elif not has_product:
         next_required_prompt = "product"
 
     # Optional fields analysis
@@ -610,7 +610,7 @@ def evaluate_rfq_readiness(
 
     return {
         "has_role": has_role,
-        "has_product": has_product or has_category,
+        "has_product": has_product,
         "has_category": has_category,
         "required_complete": required_complete,
         "missing_required": missing_required,
@@ -624,86 +624,88 @@ def evaluate_rfq_readiness(
 # RFQ Payload Builder (explicit-command intent checks live in services.chat_permissions)
 # =============================================================================
 
+class RFQDraftInvalid(ValueError):
+    """The draft cannot become an RFQ; ``errors`` is a list of (field, message)."""
+
+    def __init__(self, errors: list[tuple[str, str]]):
+        self.errors = errors
+        super().__init__("; ".join(f"{f}: {m}" for f, m in errors))
+
+
+def _short_error(exc: Exception) -> str:
+    return str(exc) or "invalid value"
+
+
+def _validation_errors(exc: Exception, default_field: str = "rfq") -> list[tuple[str, str]]:
+    errs = exc.errors() if hasattr(exc, "errors") else None
+    if not errs:
+        return [(default_field, _short_error(exc))]
+    out: list[tuple[str, str]] = []
+    for e in errs:
+        loc = [str(x) for x in e.get("loc", ())]
+        field = loc[0] if loc else default_field
+        msg = re.sub(r"^(Value error, |Assertion failed, )", "", str(e.get("msg", "invalid value")))
+        msg = re.sub(r"^Input should be ", "must be ", msg)
+        if len(loc) > 1 and loc[-1] != loc[0]:
+            msg = f"{loc[-1]} {msg}"
+        out.append((field, msg))
+    return out
+
+
 def build_rfq_create_payload(
     draft: dict[str, Any],
     title: Optional[str] = None,
     status: str = "active",
     notes: Optional[str] = None,
 ) -> RFQCreate:
-    """Transform an accumulated RFQ draft dictionary into a validated RFQCreate model."""
-    role_str = (draft.get("role") or "buyer").lower()
-    role = RFQRole.BUYER if role_str == "buyer" else RFQRole.SELLER
+    """Transform an accumulated RFQ draft into a validated RFQCreate, exactly as the web form would.
 
+    Invalid values are never dropped silently: they raise RFQDraftInvalid.
+    """
+    errors: list[tuple[str, str]] = []
+
+    role_str = (draft.get("role") or "").strip().lower()
+    role: Optional[RFQRole] = None
+    if role_str == "buyer":
+        role = RFQRole.BUYER
+    elif role_str == "seller":
+        role = RFQRole.SELLER
+    else:
+        errors.append(("role", "buyer or seller is required"))
+
+    product_name = str((draft.get("product_details") or {}).get("name") or "").strip()
     category = draft.get("category")
     if not category:
-        prod_name = (draft.get("product_details") or {}).get("name")
-        if prod_name:
-            category = infer_category(prod_name)
+        if product_name:
+            category = query_extractor._infer_category(product_name)
         if not category:
             category = "General Goods"
 
-    # Auto-generate a descriptive title if not explicitly provided
+    # Like the form: the title is the product name as written.
     if not title:
-        existing_title = draft.get("title")
-        if existing_title:
-            title = existing_title
-        else:
-            role_prefix = "Procurement of" if role == RFQRole.BUYER else "Supply of"
-            prod_name = (draft.get("product_details") or {}).get("name") or category
-            qty_str = ""
-            if draft.get("quantity") and draft["quantity"].get("value"):
-                qty_val = draft["quantity"]["value"]
-                qty_unit = draft["quantity"].get("unit", "")
-                try:
-                    qty_str = f"{int(qty_val):,} {qty_unit}".strip()
-                except Exception:
-                    qty_str = f"{qty_val} {qty_unit}".strip()
-            loc_str = ""
-            if draft.get("location") and draft["location"].get("city"):
-                loc_str = f"in {draft['location']['city']}"
+        title = draft.get("title") or product_name or category
+    title = str(title).strip()
 
-            parts = [p for p in [role_prefix, qty_str, prod_name.title(), loc_str] if p]
-            title = " ".join(parts)
+    description = notes or draft.get("description") or None
 
-    description = notes or draft.get("description")
-    if not description:
-        prod_name = (draft.get("product_details") or {}).get("name") or category
-        description = f"RFQ for {prod_name} created via AI Business Assistant."
-
-    quantity = None
-    if draft.get("quantity") and isinstance(draft["quantity"], dict):
+    def build(field: str, factory: Any) -> Any:
+        value = draft.get(field)
+        if not value:
+            return None
+        if not isinstance(value, dict):
+            errors.append((field, "invalid value"))
+            return None
         try:
-            quantity = Quantity(**draft["quantity"])
-        except Exception:
-            quantity = None
+            return factory(**value)
+        except Exception as exc:
+            errors.extend((field, m) for _, m in _validation_errors(exc, field))
+            return None
 
-    minimum_order = None
-    if draft.get("minimum_order") and isinstance(draft["minimum_order"], dict):
-        try:
-            minimum_order = Quantity(**draft["minimum_order"])
-        except Exception:
-            minimum_order = None
-
-    price_target = None
-    if draft.get("price_target") and isinstance(draft["price_target"], dict):
-        try:
-            price_target = Money(**draft["price_target"])
-        except Exception:
-            price_target = None
-
-    location = None
-    if draft.get("location") and isinstance(draft["location"], dict):
-        try:
-            location = Location(**draft["location"])
-        except Exception:
-            location = None
-
-    deadline = None
-    if draft.get("deadline") and isinstance(draft["deadline"], dict):
-        try:
-            deadline = Deadline(**draft["deadline"])
-        except Exception:
-            deadline = None
+    quantity = build("quantity", Quantity)
+    minimum_order = build("minimum_order", Quantity) if role == RFQRole.SELLER else None
+    price_target = build("price_target", Money)
+    location = build("location", Location)
+    deadline = build("deadline", Deadline)
 
     product_details = dict(draft.get("product_details") or {})
     prod_name = product_details.get("name")
@@ -725,6 +727,8 @@ def build_rfq_create_payload(
                 if clean_title and not re.search(r"\brfq\b", clean_title.lower()):
                     salvaged = clean_title
             product_details["name"] = salvaged or category
+            if re.search(r"\brfq\b", title.lower()) or check_create_rfq_intent(title.lower()):
+                title = product_details["name"]
 
     rfq_status = (
         RFQStatus.ACTIVE
@@ -732,17 +736,23 @@ def build_rfq_create_payload(
         else RFQStatus.DRAFT
     )
 
-    return RFQCreate(
-        role=role,
-        category=category[:120],
-        title=title[:300],
-        description=description,
-        quantity=quantity,
-        minimum_order=minimum_order,
-        price_target=price_target,
-        location=location,
-        deadline=deadline,
-        product_details=product_details,
-        status=rfq_status,
-    )
+    if errors:
+        raise RFQDraftInvalid(errors)
+
+    try:
+        return RFQCreate(
+            role=role,
+            category=category[:120],
+            title=title[:300],
+            description=description,
+            quantity=quantity,
+            minimum_order=minimum_order,
+            price_target=price_target,
+            location=location,
+            deadline=deadline,
+            product_details=product_details,
+            status=rfq_status,
+        )
+    except ValidationError as exc:
+        raise RFQDraftInvalid(_validation_errors(exc)) from exc
 

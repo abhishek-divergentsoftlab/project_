@@ -682,7 +682,7 @@ export function AIChat() {
             setSearchParams({ c: chunk.conversation_id }, { replace: true });
           }
 
-          if (chunk.rfq_draft && Object.keys(chunk.rfq_draft).length > 0) {
+          if (chunk.rfq_draft && (Object.keys(chunk.rfq_draft).length > 0 || (chunk.done && chunk.created_rfq))) {
             currentRfqRef.current = chunk.rfq_draft;
             setCurrentRfq(chunk.rfq_draft);
           }

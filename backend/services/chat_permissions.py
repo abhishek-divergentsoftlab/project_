@@ -75,6 +75,10 @@ CREATE_INTENT_REGEXES = [
         r"\bbanado\b",
         r"\b(create|publish|post|submit|raise|live|upload)\s+kar\s*(do|de|dijiye|dena|dain|den)\b",
         r"\b(create|publish|post|submit)\s+kardo\b",
+        # Save as draft: still an explicit create request (the draft status is chosen by wants_draft_status).
+        r"\b(save|keep|store)\s+(it\s+|this\s+|the\s+rfq\s+|my\s+rfq\s+)?(as\s+)?(an?\s+)?draft\b",
+        r"\bdraft\s+(me\s+|mein\s+|main\s+)(save|rakh|rakho)\b",
+        r"\bdraft\s+bana\s*(do|de|dijiye|dena|o)\b",
     ]
 ]
 
@@ -103,6 +107,39 @@ _NON_RFQ_OBJECT_RE = re.compile(
     r"\b(message|msg|mail|email|letter|note|reply|description|table|summary|list|chart|report)\b", re.IGNORECASE
 )
 _ASKED_TO_CREATE_RE = re.compile(r"\b(create|publish|post|submit|raise)\b", re.IGNORECASE)
+
+
+# "save as draft", "keep it as a draft", "draft me save karo", "draft bana do".
+_DRAFT_STATUS_RES = [
+    re.compile(p, re.IGNORECASE)
+    for p in [
+        r"\b(save|keep|store|leave|put)\s+(it\s+|this\s+|the\s+rfq\s+|my\s+rfq\s+)?(as\s+|in\s+)?(an?\s+)?draft\b",
+        r"\bas\s+(an?\s+)?draft\b",
+        r"\bdraft\s+(me|mein|main|mai)\s+(save|rakh|rakho|daal|dal)\b",
+        r"\bdraft\s+(bana|banao|banado)\b",
+    ]
+]
+# "don't publish yet", "abhi publish mat karo": a hold-back on publishing means draft.
+_HOLD_PUBLISH_RES = [
+    re.compile(p, re.IGNORECASE)
+    for p in [
+        r"\b(don'?t|dont|do\s+not|not)\s+(publish|post|go\s+live)\b",
+        r"\b(publish|post)\s+(mat|na)\s+(kar|karo|karna|karein)\b",
+    ]
+]
+
+
+def wants_draft_status(user_message: str) -> bool:
+    """True when the user asks to save the RFQ as a draft instead of publishing it."""
+    text = (user_message or "").strip()
+    if not text:
+        return False
+    if any(rx.search(text) for rx in _HOLD_PUBLISH_RES):
+        return True
+    # "don't save it as a draft" / "draft mat banao" negate the draft wish.
+    if _CREATE_NEGATION_RE.search(text):
+        return False
+    return any(rx.search(text) for rx in _DRAFT_STATUS_RES)
 
 
 def is_question(user_message: str) -> bool:

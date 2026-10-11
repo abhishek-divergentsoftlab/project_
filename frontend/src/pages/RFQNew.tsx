@@ -363,6 +363,24 @@ export function RFQNew() {
       return;
     }
 
+    if (form.quantityValue && !(Number(form.quantityValue) > 0)) {
+      setError("Quantity must be greater than 0.");
+      return;
+    }
+
+    if (form.role === "seller" && form.minOrderValue && !(Number(form.minOrderValue) > 0)) {
+      setError("Minimum order must be greater than 0.");
+      return;
+    }
+
+    if (form.deadlineDays) {
+      const days = Number(form.deadlineDays);
+      if (!Number.isInteger(days) || days < 1 || days > 3650) {
+        setError("Dispatch days must be a whole number between 1 and 3650.");
+        return;
+      }
+    }
+
     setSubmitting(true);
 
     const finalTitle = form.productName.trim() || form.title.trim() || "Product Listing";
@@ -420,10 +438,17 @@ export function RFQNew() {
       if (editing && rfqId) {
         // role is absent from RFQUpdate on purpose: flipping a live listing
         // from buy-side to sell-side would invalidate everyone's matches.
-        const { role: _role, ...patch } = payload;
+        // status is absent too: lifecycle moves through /publish and /close.
+        const { role: _role, status: _status, ...patch } = payload;
         void _role;
+        void _status;
         await rfqApi.update(rfqId, patch);
-        toast("Changes saved.");
+        if (existing?.status === "draft" && form.publishNow) {
+          await rfqApi.publish(rfqId);
+          toast("RFQ published.");
+        } else {
+          toast("Changes saved.");
+        }
       } else {
         await rfqApi.create(payload);
         toast(payload.status === "active" ? "RFQ published." : "Draft saved.");
@@ -535,6 +560,18 @@ export function RFQNew() {
             <small>
               Specify what product you want to {form.role === "seller" ? "sell" : "buy"} (e.g. Milk, Butter, Curd).
             </small>
+          </div>
+
+          <div className="field">
+            <label htmlFor="description">Description / notes</label>
+            <textarea
+              id="description"
+              rows={3}
+              maxLength={5000}
+              placeholder="Anything else a counterparty should know (optional)"
+              value={form.description}
+              onChange={(e) => update("description", e.target.value)}
+            />
           </div>
 
           {/* AI Category & Classification Recommendation Card */}
@@ -899,7 +936,9 @@ export function RFQNew() {
             <input
               id="deadlineDays"
               type="number"
-              min="0"
+              min="1"
+              max="3650"
+              step="1"
               inputMode="numeric"
               placeholder={
                 editing && existing?.deadline?.date
@@ -1106,15 +1145,17 @@ export function RFQNew() {
         </div>
 
         <div className="form-footer">
-          <label className="checkbox form-footer-start">
-            <input
-              type="checkbox"
-              checked={form.publishNow}
-              onChange={(e) => update("publishNow", e.target.checked)}
-            />
-            Publish now
-            <span className="muted">(otherwise saved as a draft)</span>
-          </label>
+          {(!editing || existing?.status === "draft") && (
+            <label className="checkbox form-footer-start">
+              <input
+                type="checkbox"
+                checked={form.publishNow}
+                onChange={(e) => update("publishNow", e.target.checked)}
+              />
+              Publish now
+              <span className="muted">(otherwise saved as a draft)</span>
+            </label>
+          )}
           <Link to="/rfqs" className="button secondary">
             Cancel
           </Link>

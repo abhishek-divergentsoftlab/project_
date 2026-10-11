@@ -98,6 +98,10 @@ export function errorMessage(error: unknown, fallback = "Something went wrong"):
   if (axios.isAxiosError(error)) {
     const detail = error.response?.data?.detail;
     if (typeof detail === "string") return detail;
+    // 409 duplicate: {message, existing_rfq_id}.
+    if (detail && typeof detail === "object" && !Array.isArray(detail) && typeof detail.message === "string") {
+      return detail.message;
+    }
     // 422 from Pydantic: a list of per-field errors.
     if (Array.isArray(detail)) {
       return detail

@@ -343,9 +343,8 @@ def test_build_rfq_create_payload():
     payload = build_rfq_create_payload(draft, status="active")
     assert payload.role == RFQRole.BUYER
     assert payload.category == "Agriculture"
-    assert "Procurement of" in payload.title
-    assert "Apple" in payload.title
-    assert "Indore" in payload.title
+    assert payload.title == "apple"  # like the form: title is the product name as written
+    assert payload.description is None
     assert payload.quantity.value == 1000.0
     assert payload.price_target.amount == 10.0
     assert payload.status == RFQStatus.ACTIVE
