@@ -22,7 +22,7 @@ from models.enums import RFQRole, RFQStatus
 from schemas.common import Deadline, Location, Money, Quantity
 from schemas.rfq import RFQCreate
 from schemas.rfq_structure import RFQStructure
-from services import query_extractor
+from services import chat_draft_assist, query_extractor
 from services.chat_permissions import (
     check_close_rfq_intent,
     check_counterparty_message_intent,
@@ -165,6 +165,21 @@ UPDATE_RFQ_DRAFT_TOOL: dict[str, Any] = {
                 "product_details": {
                     "type": "object",
                     "description": "[OPTIONAL] Technical attributes, specs, colors, grades, etc.",
+                },
+                "hsn_code": {
+                    "type": "string",
+                    "description": (
+                        "[OPTIONAL] HSN/tariff code the USER typed (e.g. 1006, 100630). Only pass a code the user stated; "
+                        "it is checked against the HSN master and ignored when unknown."
+                    ),
+                },
+                "must_match": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "[OPTIONAL] Names of attributes in product_details the user said must match strictly "
+                        "(e.g. ['Grade']). Unknown attribute names are ignored."
+                    ),
                 },
                 "status": {
                     "type": "string",
@@ -348,6 +363,17 @@ def update_rfq_draft(
         inferred = query_extractor._infer_category(str(product_name))
         if inferred:
             draft["category"] = inferred
+
+    # Attributes the user marked as must-match (only ones already present are flagged).
+    if kwargs.get("must_match"):
+        chat_draft_assist.set_must_match(details, kwargs["must_match"])
+        draft["product_details"] = details
+
+    # An HSN code the user typed: validated like GET /hsn/code/{code}; a known code is a manual pick.
+    if kwargs.get("hsn_code"):
+        hsn_status, _item = chat_draft_assist.apply_explicit_hsn(draft, kwargs["hsn_code"])
+        if hsn_status in ("unknown", "invalid") and isinstance(kwargs.get("_notes"), list):
+            kwargs["_notes"].append(chat_draft_assist.unrecognised_hsn_note(kwargs["hsn_code"]))
 
     # 3. Description
     description = kwargs.get("description")

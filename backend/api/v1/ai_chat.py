@@ -146,6 +146,8 @@ async def chat_message(
         conversation_id=result.get("conversation_id"),
         routed_agent=result.get("routed_agent"),
         matched_candidates=result.get("matched_candidates"),
+        draft_suggestions=result.get("draft_suggestions"),
+        draft_moderation=result.get("draft_moderation"),
     )
 
 

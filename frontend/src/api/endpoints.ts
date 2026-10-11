@@ -399,6 +399,8 @@ export interface AIChatResponse {
   counterparty_message?: AICounterpartyMessage | null;
   conversation_id?: string | null;
   routed_agent?: AgentInfo | null;
+  draft_suggestions?: AIDraftSuggestions | null;
+  draft_moderation?: AIDraftModeration | null;
 }
 
 export interface AIToolStep {
@@ -406,6 +408,39 @@ export interface AIToolStep {
   title: string;
   status: "running" | "completed";
   args?: Record<string, any> | string | null;
+}
+
+export interface AIDraftHsnSuggestion {
+  code: string;
+  description?: string;
+  formatted_title?: string;
+  category?: string;
+  confidence?: string;
+}
+
+export interface AIDraftSpecSuggestion {
+  key: string;
+  label: string;
+  placeholder?: string;
+  input_type?: string;
+  options?: string[];
+  explanation?: string | null;
+  must_match?: boolean;
+}
+
+export interface AIDraftSuggestions {
+  hsn?: AIDraftHsnSuggestion | null;
+  specs?: AIDraftSpecSuggestion[] | null;
+  /** The product name each part was computed for (a change of product recomputes it). */
+  hsn_for?: string | null;
+  specs_for?: string | null;
+}
+
+export interface AIDraftModeration {
+  text_hash: string;
+  is_safe: boolean;
+  reason?: string | null;
+  category?: string | null;
 }
 
 export interface AIChatChunk {
@@ -420,6 +455,8 @@ export interface AIChatChunk {
   conversation_id?: string | null;
   matched_candidates?: MatchCandidate[] | null;
   routed_agent?: AgentInfo | null;
+  draft_suggestions?: AIDraftSuggestions | null;
+  draft_moderation?: AIDraftModeration | null;
   /** When true, `content` replaces the text streamed so far instead of appending. */
   replace_content?: boolean;
   done: boolean;

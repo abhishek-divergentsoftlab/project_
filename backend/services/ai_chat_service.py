@@ -29,7 +29,7 @@ from models.user import User
 from services import answer_engine, rfq_tool_service
 from services.answer_engine import AnswerContext
 from services.agent_registry import AgentDefinition, GENERAL_ASSISTANT
-from services import ai_query_parser, chat_permissions
+from services import ai_query_parser, chat_draft_assist, chat_permissions
 from services.agent_router import agent_for_intent, agent_for_tools, agent_info
 
 logger = logging.getLogger(__name__)
@@ -325,6 +325,7 @@ def build_rfq_system_prompt(
     older_history_summary: Optional[str] = None,
     counterparty_context: Optional[str] = None,
     user: Optional[User] = None,
+    draft_helpers: str = "",
 ) -> str:
     """Construct dynamic prompt instructing assistant on the exact question sequence and matches."""
     status_lines = []
@@ -561,6 +562,8 @@ def build_rfq_system_prompt(
         SYSTEM_BUSINESS_PROMPT,
         f"\nACTIVE PROCUREMENT STATE SCRATCHPAD:\n{status_str}",
     ]
+    if draft_helpers and (allowed_tools is None or "update_rfq_draft" in allowed_tools or "create_rfq" in allowed_tools):
+        prompt_parts.append(draft_helpers)
     if older_history_summary:
         prompt_parts.append(f"\nCONVERSATION HISTORICAL CONTEXT (Pruned older turns):\n- {older_history_summary}")
     if matches_section:
@@ -606,6 +609,7 @@ def _process_tool_call(
     current_draft: dict[str, Any],
     locked_role: Optional[str] = None,
     user_text: Optional[str] = None,
+    notes: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     """Execute update_rfq_draft tool call arguments into the draft dictionary.
 
@@ -632,6 +636,8 @@ def _process_tool_call(
                 logger.info("Ignoring model quantity %s not given by the user", args["quantity_value"])
                 args.pop("quantity_value", None)
                 args.pop("quantity_unit", None)
+            if notes is not None:
+                args["_notes"] = notes
             return rfq_tool_service.update_rfq_draft(existing_draft=current_draft, **args)
     return current_draft
 
@@ -650,11 +656,18 @@ async def execute_create_rfq_call(
     tool_args: dict[str, Any],
     db: Optional[AsyncSession] = None,
     user: Optional[User] = None,
+    assist: Optional[chat_draft_assist.DraftAssist] = None,
 ) -> tuple[Optional[dict[str, Any]], Optional[str]]:
     """Execute create_rfq tool call, validating role and submitting to database."""
     readiness = rfq_tool_service.evaluate_rfq_readiness(draft)
     if not readiness["has_role"] or not readiness["has_product"]:
         return None, "Role (buyer/seller) and Product name are required before creating an RFQ."
+
+    if assist is not None:
+        # The form blocks submit on an unsafe listing; so does chat (rfq_service still moderates server-side).
+        blocked = await assist.block_reason(draft)
+        if blocked:
+            return None, blocked
 
     title = tool_args.get("title")
     status = tool_args.get("status", "active")
@@ -1481,6 +1494,8 @@ async def update_conversation_after_turn(
     matched_candidates: Optional[list[dict[str, Any]]] = None,
     active_connection_id: Optional[str] = None,
     last_counterparty_message: Optional[dict[str, Any]] = None,
+    draft_suggestions: Optional[dict[str, Any]] = None,
+    draft_moderation: Optional[dict[str, Any]] = None,
 ) -> None:
     """Update conversation state, title, and timestamp."""
     from sqlalchemy.orm.attributes import flag_modified
@@ -1504,6 +1519,10 @@ async def update_conversation_after_turn(
         state_update["readiness"] = readiness
     if matched_candidates is not None:
         state_update["matched_candidates"] = matched_candidates
+    if draft_suggestions is not None:
+        state_update["draft_suggestions"] = draft_suggestions
+    if draft_moderation is not None:
+        state_update["draft_moderation"] = draft_moderation
     if active_connection_id is not None:
         state_update["active_connection_id"] = str(active_connection_id)
     if last_counterparty_message is not None:
@@ -1657,7 +1676,9 @@ class _ActionRunner:
         active_connection_id: Optional[Union[str, uuid.UUID]],
         connection_hint: Any,
         on_step: Optional[Any] = None,
+        assist: Optional[chat_draft_assist.DraftAssist] = None,
     ) -> None:
+        self.assist = assist
         self.draft = draft
         self.draft_guards = draft_guards
         self.db = db
@@ -1686,7 +1707,9 @@ class _ActionRunner:
         if name == "create_rfq":
             if self.created_rfq_obj:
                 return {"ok": True, "note": "already created in this turn", "rfq": self.created_rfq_obj}
-            obj, err = await execute_create_rfq_call(self.draft, raw_args, db=self.db, user=self.user)
+            obj, err = await execute_create_rfq_call(
+                self.draft, raw_args, db=self.db, user=self.user, assist=self.assist
+            )
             self.created_rfq_obj = obj
             if err:
                 self.err_reply = f"⚠️ {err}"
@@ -1754,9 +1777,12 @@ class _ActionRunner:
             return {"ok": True, "closed": obj} if obj else {"ok": False, "error": err}
 
         if name == "update_rfq_draft":
+            notes = self.assist.notes if self.assist is not None else None
             self.draft = _process_tool_call(
-                {"function": {"name": name, "arguments": raw_args}}, self.draft, **self.draft_guards
+                {"function": {"name": name, "arguments": raw_args}}, self.draft, notes=notes, **self.draft_guards
             )
+            if self.assist is not None:
+                chat_draft_assist.apply_spec_suggestions(self.draft, self.assist.suggestions.get("specs"))
             self._step(
                 {
                     "name": "update_rfq_draft",
@@ -1814,6 +1840,8 @@ class TurnResult:
     conversation_id: Optional[uuid.UUID]
     routed_agent: dict[str, Any]
     matched_candidates: Optional[list[dict[str, Any]]] = None
+    draft_suggestions: Optional[dict[str, Any]] = None
+    draft_moderation: Optional[dict[str, Any]] = None
 
     def as_response(self) -> dict[str, Any]:
         return {
@@ -1826,6 +1854,8 @@ class TurnResult:
             "conversation_id": self.conversation_id,
             "routed_agent": self.routed_agent,
             "matched_candidates": self.matched_candidates,
+            "draft_suggestions": self.draft_suggestions,
+            "draft_moderation": self.draft_moderation,
         }
 
 
@@ -2001,6 +2031,19 @@ def _last_user_and_previous_assistant(messages: list[Any]) -> tuple[str, str]:
     return last_user, ""
 
 
+def _reply_extras(
+    assist: chat_draft_assist.DraftAssist, reply: str, draft: dict[str, Any], created: Optional[dict[str, Any]]
+) -> str:
+    """Sentences added to a reply: unrecognised HSN codes and a content-policy warning for the current draft."""
+    if created:
+        return ""
+    lines = [n for n in assist.notes if n not in reply]
+    warning = assist.current_warning(draft) if assist.moderation_checked_now else None
+    if warning and warning not in reply and "content policy" not in reply:
+        lines.append(f"⚠️ {warning}")
+    return "\n".join(lines)
+
+
 async def _run_chat_turn(
     messages: list[Any],
     current_rfq: Optional[dict[str, Any]] = None,
@@ -2036,6 +2079,7 @@ async def _run_chat_turn(
             logger.exception("Failed to initialize conversation: %s", exc)
 
     state = (conversation.state or {}) if conversation else {}
+    assist = chat_draft_assist.DraftAssist(state)
     if conversation is not None and isinstance(state.get("rfq_draft"), dict):
         # The server's draft is authoritative; the client copy is only for stateless calls.
         current_rfq = dict(state["rfq_draft"])
@@ -2127,6 +2171,25 @@ async def _run_chat_turn(
             draft["location"] = _draft_location(
                 _clean_city_name(req_linguistic.city) or req_linguistic.city, req_linguistic.country
             )
+    # The form's helpers: a typed or accepted HSN, must-match phrases, then fresh suggestions and moderation.
+    if chat_draft_assist.product_name(draft) and not chat_permissions.is_information_request(last_user_content):
+        typed_hsn = chat_draft_assist.explicit_hsn_code(last_user_content)
+        if typed_hsn:
+            hsn_status, _hsn_item = chat_draft_assist.apply_explicit_hsn(draft, typed_hsn)
+            if hsn_status == "ok":
+                assist.applied_hsn = True
+            elif hsn_status in ("unknown", "invalid"):
+                assist.notes.append(chat_draft_assist.unrecognised_hsn_note(typed_hsn))
+        elif assist.suggestions.get("hsn_for") == chat_draft_assist.product_name(draft) and chat_draft_assist.accepts_hsn(
+            last_user_content, previous_assistant, assist.pending_hsn
+        ):
+            pending = assist.pending_hsn or {}
+            chat_draft_assist.apply_hsn(draft, str(pending["code"]), pending.get("category"))
+            assist.applied_hsn = True
+    if assist.applied_hsn:
+        allowed.add("update_rfq_draft")
+    chat_draft_assist.must_match_from_text(draft, last_user_content)
+    await assist.refresh(draft)
     readiness = rfq_tool_service.evaluate_rfq_readiness(draft)
     window_messages, older_summary = build_sliding_window_messages(messages, max_history_turns=8)
     tool_cards: list[dict[str, Any]] = []
@@ -2141,6 +2204,8 @@ async def _run_chat_turn(
         shown = cards_state["match_cards"] or client_cands
         if shown and chunk.get("done") and "matched_candidates" not in chunk:
             chunk["matched_candidates"] = shown
+        if chunk.get("done"):
+            chunk["draft_suggestions"], chunk["draft_moderation"] = assist.public()
         return chunk
 
     def wire(
@@ -2182,6 +2247,13 @@ async def _run_chat_turn(
         cards: Optional[list[dict[str, Any]]] = None,
     ) -> ChatEvent:
         """Persist the turn once and build its last event."""
+        if kind != "error":
+            extra = _reply_extras(assist, reply, draft, created)
+            if extra:
+                reply = f"{reply.rstrip()}\n\n{extra}" if reply.strip() else extra
+                wire_content = f"{(wire_content or '').rstrip()}\n\n{extra}".lstrip() if wire_content is not None else None
+        if not draft:
+            assist.reset()  # the draft was submitted or never existed
         persisted = reply.strip() if kind == "error" else reply
         if db is not None and conversation is not None:
             try:
@@ -2210,6 +2282,8 @@ async def _run_chat_turn(
                     matched_candidates=cards or matched_candidates,
                     active_connection_id=active_connection_id,
                     last_counterparty_message=cp_msg or last_counterparty_msg,
+                    draft_suggestions=assist.suggestions,
+                    draft_moderation=assist.moderation or {},
                 )
             except Exception as exc:
                 logger.exception("Failed to persist turn: %s", exc)
@@ -2222,6 +2296,7 @@ async def _run_chat_turn(
             created_rfq=created, counterparty_message=cp_msg,
             conversation_id=conversation.id if conversation else None, routed_agent=agent_state["info"],
             matched_candidates=(cards_state["match_cards"] or client_cands) or None,
+            draft_suggestions=chunk.get("draft_suggestions"), draft_moderation=chunk.get("draft_moderation"),
         )
         return ChatEvent(kind, chunk, result)
 
@@ -2245,6 +2320,7 @@ async def _run_chat_turn(
         older_history_summary=older_summary,
         counterparty_context=counterparty_context,
         user=user,
+        draft_helpers=assist.prompt_section(draft),
     )
     prepared_messages: list[dict[str, Any]] = [{"role": "system", "content": dynamic_system_prompt}, *window_messages]
 
@@ -2260,7 +2336,7 @@ async def _run_chat_turn(
                 thinking="User requested to finalize and publish RFQ. Validating required fields and submitting listing to marketplace database..."
             ))
             create_args = {"status": "draft"} if chat_permissions.wants_draft_status(last_user_content) else {}
-            created, err = await execute_create_rfq_call(draft, create_args, db=db, user=user)
+            created, err = await execute_create_rfq_call(draft, create_args, db=db, user=user, assist=assist)
             step = create_step(created, err)
             yield ChatEvent("tool_step", wire(tool_step=step, created=created))
             reply = format_created_rfq_text(created) if created else f"⚠️ {err or 'Failed to create RFQ.'}"
@@ -2318,6 +2394,7 @@ async def _run_chat_turn(
             active_connection_id=active_connection_id,
             connection_hint=_connection_hint(last_user_content, focus),
             on_step=queue.put_nowait,
+            assist=assist,
         )
 
         def status(text: str) -> ChatEvent:
@@ -2336,7 +2413,12 @@ async def _run_chat_turn(
                 context=AnswerContext(
                     rfq_id=str(rfq_id) if rfq_id else None,
                     draft=lambda: runner.draft,
-                    extra_allowed_text=_engine_allowed_text(matched_candidates, counterparty_context, last_counterparty_msg),
+                    extra_allowed_text="\n".join(
+                        t for t in (
+                            _engine_allowed_text(matched_candidates, counterparty_context, last_counterparty_msg),
+                            assist.extra_allowed_text(draft),
+                        ) if t
+                    ),
                     on_progress=lambda event: queue.put_nowait({"__progress": event}),
                     drafting="update_rfq_draft" in allowed
                     and chat_permissions.effective_intent(last_user_content, parsed_intent)
@@ -2367,6 +2449,10 @@ async def _run_chat_turn(
         engine_result = task.result()
 
         draft = runner.draft
+        chat_draft_assist.must_match_from_text(draft, last_user_content)
+        chat_draft_assist.apply_spec_suggestions(draft, assist.suggestions.get("specs"))
+        if not runner.created_rfq_obj:
+            await assist.refresh(draft)  # a product or text the model just recorded
         readiness = rfq_tool_service.evaluate_rfq_readiness(draft)
         created_rfq_obj = runner.created_rfq_obj
         counterparty_msg_obj = runner.counterparty_msg_obj
@@ -2475,6 +2561,7 @@ async def _run_chat_turn(
 
         if not total_content.strip() and thinking and not counterparty_msg_obj and not created_rfq_obj:
             total_content, thinking = thinking, None
+        assist.note_reply(total_content)
 
         if total_content.strip() and not created_rfq_obj:
             yield ChatEvent("replace_content", wire(content=total_content, replace=True))

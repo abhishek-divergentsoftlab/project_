@@ -57,6 +57,8 @@ class AIChatResponse(BaseModel):
     conversation_id: Optional[uuid.UUID] = None
     routed_agent: Optional[dict[str, Any]] = None
     matched_candidates: Optional[list[dict[str, Any]]] = None
+    draft_suggestions: Optional[dict[str, Any]] = None
+    draft_moderation: Optional[dict[str, Any]] = None
 
 
 class AIConversationSummary(BaseModel):

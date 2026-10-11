@@ -570,6 +570,11 @@ async def suggest_hsn_for_product(
 ) -> Optional[HsnSuggestionOut]:
     """Smart classification assistant: maps consumer products & brands (e.g. 'sun glasses', 'soft drink', 'cococola')
     to standard HSN codes & categories using AI and semantic trade dictionaries."""
+    return await suggest_hsn(text)
+
+
+async def suggest_hsn(text: str) -> Optional[HsnSuggestionOut]:
+    """Shared implementation of GET /hsn/suggest (also used by the AI chat)."""
     clean = text.strip().lower()
     if not clean:
         return None
@@ -977,6 +982,17 @@ def get_hsn_categories() -> list[dict[str, Any]]:
 def get_hsn_by_code(code: str) -> HsnItemOut:
     """Fetch details of a specific HSN code."""
     c = code.strip()
+    item = lookup_hsn_item(c)
+    if item is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"HSN code {c} not found in master database",
+        )
+    return item
+
+
+def lookup_hsn_item(c: str) -> Optional[HsnItemOut]:
+    """Shared implementation of GET /hsn/code/{code}; None when the code is unknown."""
     conn = _get_db()
     cur = conn.cursor()
     try:
@@ -992,10 +1008,7 @@ def get_hsn_by_code(code: str) -> HsnItemOut:
         ).fetchone()
 
         if not row:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"HSN code {c} not found in master database",
-            )
+            return None
 
         return HsnItemOut(
             code=row["code"],
