@@ -10,9 +10,9 @@ confirms a proposal the assistant made in the previous turn.
 Rules, in one place:
 - ``update_rfq_draft``: the user is giving RFQ details or is in a drafting flow.
   It only edits the private draft, so it is the loosest gate.
-- ``create_rfq`` / ``close_rfq`` / ``draft_counterparty_message``: an explicit
-  command (create/post/publish the RFQ, close/cancel it, message/contact the
-  counterparty) or a bare "yes" that answers an assistant proposal of that action.
+- ``create_rfq`` / ``close_rfq`` / ``publish_rfq`` / ``edit_rfq`` / ``draft_counterparty_message``: an explicit
+  command (create/post/publish the RFQ, close/cancel it, publish a saved draft, edit a saved RFQ,
+  message/contact the counterparty) or a bare "yes" that answers an assistant proposal of that action.
 - Decisions use the user's text and the parser intent only. Assistant text is
   consulted solely to see whether a bare "yes" answers a proposal; model output
   can never grant itself a tool, and the model's tool arguments never change
@@ -37,7 +37,9 @@ INFORMATION_INTENTS = frozenset(
 # Intents where the user states their own trade.
 DRAFTING_INTENTS = frozenset({"buy_request", "sell_offer", "rfq_drafting"})
 
-ALL_ACTION_TOOLS = ("update_rfq_draft", "create_rfq", "draft_counterparty_message", "close_rfq")
+ALL_ACTION_TOOLS = (
+    "update_rfq_draft", "create_rfq", "draft_counterparty_message", "close_rfq", "publish_rfq", "edit_rfq",
+)
 
 # "please include delivery to Pune", "change the quantity to 500": edits to the draft.
 DRAFT_FIELD_UPDATE_RE = re.compile(
@@ -235,6 +237,203 @@ def close_rfq_target(message: str) -> Optional[str]:
     return " ".join(words) or None
 
 
+# ---- publish a saved draft RFQ, edit a saved RFQ ---------------------------
+_PUBLISH_WORD_RE = re.compile(r"\b(publish|post|go\s+live|live)\b", re.IGNORECASE)
+_PROPOSES_PUBLISH_RE = re.compile(r"\b(publish|post|go\s+live)\b", re.IGNORECASE)
+_PROPOSES_SAVE_RE = re.compile(r"\bsave\b[^.?!]{0,40}\b(changes|edits|updates|it)\b", re.IGNORECASE)
+_RFQ_OBJECT = r"(?:rfqs?|listings?|postings?|requirements?)"
+_UUID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.IGNORECASE)
+_POLITE_RE = r"^\s*(please\s+)?(can|could|would|will)\s+(you|u)\s+(please\s+)?"
+_MY_WORDS = r"(?:this|the|my|our|that|draft|saved|existing|current|posted|active|meri|mera|mere|apni|apna)"
+
+PUBLISH_RFQ_INTENT_REGEXES = [
+    re.compile(p, re.IGNORECASE)
+    for p in [
+        # "publish my rice rfq", "post the draft listing", "go live with my cotton rfq"
+        rf"\b(publish|post|go\s+live\s+with|make\s+live)\s+(?:{_MY_WORDS}\s+)?(?:[\w-]+\s+){{0,3}}?{_RFQ_OBJECT}\b",
+        r"\b(publish|post)\s+(it|this|that)\b",
+        r"\byes\s*,?\s*(please\s*)?(publish|post)\b",
+        r"^(publish|post)[.!]*$",
+        # Hinglish: "meri rice rfq publish kar do", "rfq publish kar do", "publish kar do"
+        rf"\b{_RFQ_OBJECT}\s+(publish|post|live)\s+kar\s*(do|de|dijiye|dena|dain|den|o)?\b",
+        r"\b(publish|post|live)\s+kar\s*(do|de|dijiye|dena|dain|den|o)\b",
+        r"\b(publish|post)\s+kardo\b",
+    ]
+]
+
+
+def check_publish_rfq_intent(user_message: str, previous_assistant: Optional[str] = None) -> bool:
+    """True for an explicit request to publish (post, go live with) the RFQ, same guards as create/close.
+
+    Whether it means the chat draft or a saved draft RFQ is decided by the caller from the conversation.
+    A bare "yes" counts only when the assistant's previous turn proposed publishing.
+    """
+    if not user_message:
+        return False
+    text = user_message.strip()
+    if _CREATE_NEGATION_RE.search(text):
+        return False
+    if is_question(text) and not re.match(_POLITE_RE + r"(publish|post)\b", text, re.IGNORECASE):
+        return False
+    if _BARE_AFFIRMATIVE_RE.match(text):
+        return previous_assistant is not None and bool(_PROPOSES_PUBLISH_RE.search(previous_assistant))
+    if _NON_RFQ_OBJECT_RE.search(text) and not re.search(r"\b(rfq|listing)\b", text, re.IGNORECASE):
+        return False
+    return any(rx.search(text) for rx in PUBLISH_RFQ_INTENT_REGEXES)
+
+
+def says_publish(user_message: str) -> bool:
+    """The message uses a publish word (not merely "create"); a hold-back such as "don't publish" does not count."""
+    text = user_message or ""
+    return bool(_PUBLISH_WORD_RE.search(text)) and not any(rx.search(text) for rx in _HOLD_PUBLISH_RES)
+
+
+_PUBLISH_TARGET_RE = re.compile(
+    rf"\b(?:publish|post|go\s+live\s+with|make\s+live)\s+(?:{_MY_WORDS}\s+)?((?:[\w-]+\s+){{0,3}}?){_RFQ_OBJECT}\b", re.IGNORECASE
+)
+_HINGLISH_TARGET_RE = re.compile(
+    rf"\b(?:meri|mera|mere|apni|apna)\s+((?:[\w-]+\s+){{0,3}}?){_RFQ_OBJECT}\b", re.IGNORECASE
+)
+_EDIT_TARGET_RES = [
+    re.compile(
+        rf"\b(?:edit|change|update|modify|amend|revise)\s+(?:{_MY_WORDS}\s+)?((?:[\w-]+\s+){{0,3}}?){_RFQ_OBJECT}\b", re.IGNORECASE
+    ),
+    re.compile(
+        rf"\b(?:of|in|for|on)\s+(?:my|the|this|our|that)\s+((?:[\w-]+\s+){{0,3}}?){_RFQ_OBJECT}\b", re.IGNORECASE
+    ),
+]
+_TARGET_FILLER |= frozenset({"draft", "saved", "existing", "posted", "published", "meri", "mera", "mere", "apni", "apna", "to", "of", "in", "for", "on", "rfq", "listing", "id"})
+
+
+def _target_from(match: Optional[re.Match]) -> Optional[str]:
+    if not match:
+        return None
+    words = [w for w in match.group(1).split() if w.lower() not in _TARGET_FILLER]
+    return " ".join(words) or None
+
+
+def publish_rfq_target(message: str) -> Optional[str]:
+    """The saved RFQ named in a publish command (an id, or "rice" in "publish my rice rfq"), or None."""
+    text = message or ""
+    uid = _UUID_RE.search(text)
+    if uid:
+        return uid.group(0)
+    return _target_from(_PUBLISH_TARGET_RE.search(text)) or _target_from(_HINGLISH_TARGET_RE.search(text))
+
+
+EDIT_RFQ_INTENT_REGEXES = [
+    re.compile(p, re.IGNORECASE)
+    for p in [
+        # "edit my rice rfq", "update the cotton listing"
+        rf"\b(edit|change|update|modify|amend|revise)\s+(?:{_MY_WORDS}\s+)?(?:[\w-]+\s+){{0,3}}?{_RFQ_OBJECT}\b",
+        # "change the quantity of my rice rfq to 600 kg"
+        rf"\b(edit|change|update|modify|amend|revise)\b.{{0,60}}?\b(of|in|for|on)\s+(my|the|this|our|that)\s+(?:[\w-]+\s+){{0,3}}?{_RFQ_OBJECT}\b",
+        # Hinglish: "meri rice rfq badlo", "meri rfq edit karo", "rfq update kar do"
+        rf"\b(meri|mera|mere|apni|apna)\s+(?:[\w-]+\s+){{0,3}}?{_RFQ_OBJECT}\s+(badlo|badal|badlao|edit|update|change|modify|sudhaar|sudharo|theek)\b",
+        rf"\b{_RFQ_OBJECT}\s+(badlo|badal|edit|update|change|modify)\s+(kar|karo|kardo|do|de|dijiye)\b",
+    ]
+]
+# "update the rfq to include delivery" mid-draft edits the chat draft: an edit needs a saved-RFQ cue.
+_SAVED_CUE_RE = re.compile(
+    rf"\b(my|our|meri|mera|mere|apni|apna|saved|existing|posted|published|active|draft)\s+(?:[\w-]+\s+){{0,3}}?{_RFQ_OBJECT}\b"
+    rf"|\b(the|this|that)\s+(?:[\w-]+\s+){{1,3}}?{_RFQ_OBJECT}\b",
+    re.IGNORECASE,
+)
+
+
+def check_edit_rfq_intent(user_message: str) -> bool:
+    """True for an explicit request to edit a saved RFQ ("edit my rice RFQ", "meri rice RFQ badlo")."""
+    if not user_message:
+        return False
+    text = user_message.strip()
+    if _CREATE_NEGATION_RE.search(text):
+        return False
+    if is_question(text) and not re.match(_POLITE_RE + r"(edit|change|update|modify|amend|revise)\b", text, re.IGNORECASE):
+        return False
+    if not (_UUID_RE.search(text) or _SAVED_CUE_RE.search(text)):
+        return False
+    return any(rx.search(text) for rx in EDIT_RFQ_INTENT_REGEXES)
+
+
+def edit_rfq_target(message: str) -> Optional[str]:
+    """The saved RFQ named in an edit command (an id, or "rice" in "edit my rice rfq"), or None."""
+    text = message or ""
+    uid = _UUID_RE.search(text)
+    if uid:
+        return uid.group(0)
+    for rx in _EDIT_TARGET_RES:
+        target = _target_from(rx.search(text))
+        if target:
+            return target
+    return _target_from(_HINGLISH_TARGET_RE.search(text))
+
+
+_EDIT_FIELD_WORDS_RE = re.compile(
+    r"\b(change|update|edit|set|modify|amend|revise|replace)\b.{0,60}?\b(description|title|notes?|hsn|category|min(?:imum)?\s+order|moq)\b",
+    re.IGNORECASE,
+)
+
+
+def edit_command_has_change(message: str) -> bool:
+    """The edit command also states the change ("change the quantity of my rice RFQ to 600 kg")."""
+    text = _UUID_RE.sub(" ", message or "")
+    return bool(DRAFT_FIELD_UPDATE_RE.search(text) or _EDIT_FIELD_WORDS_RE.search(text))
+
+
+# Saving edits: only meaningful while an RFQ is being edited.
+_SAVE_EDIT_REGEXES = [
+    re.compile(p, re.IGNORECASE)
+    for p in [
+        r"^\s*(ok(ay)?\s*,?\s*)?(please\s+)?(save|update|apply|submit|done|confirm)(\s+(it|this|that|the\s+changes|changes|my\s+changes|all|the\s+rfq|rfq))?\s*[.!]*\s*$",
+        r"\b(save|apply|confirm|commit)\s+(the\s+|my\s+|these\s+|all\s+)?(changes|edits|updates)\b",
+        r"\bdone\s*,?\s*(please\s+)?(save|update)\b",
+        r"\b(update|save)\s+(it|this|that|the\s+rfq|my\s+rfq)\b",
+        r"\b(looks\s+good|that'?s\s+all)\s*,?\s*(please\s+)?(save|update)\b",
+        # Hinglish: "changes save karo", "save kar do", "update kar do"
+        r"\b(changes?|badlav|edits?)\s+(save|update)\s+kar\s*(o|do|de|dijiye|dena)?\b",
+        r"\b(save|update)\s+kar\s*(o|do|de|dijiye|dena|dain)\b",
+        r"\b(save|update)\s+kardo\b",
+    ]
+]
+_CANCEL_EDIT_REGEXES = [
+    re.compile(p, re.IGNORECASE)
+    for p in [
+        r"\b(cancel|discard|abandon|stop|exit|leave|drop|undo)\s+(the\s+|my\s+|this\s+|these\s+|all\s+)?(editing|edit|changes|edits)\b",
+        r"\b(edit|changes?|edits)\s+(cancel|discard|band|ruk|rok)\s*(kar\s*(o|do|de|dijiye)?|karo)?\b",
+        r"\bnever\s*mind\s+(the\s+)?(edit|changes)\b",
+    ]
+]
+
+
+def check_save_edit_intent(user_message: str, previous_assistant: Optional[str] = None) -> bool:
+    """Save (or publish/create, which means save while editing) the RFQ being edited.
+
+    Negated and questioning messages never count; a bare "yes" counts when the assistant offered to save.
+    """
+    if not user_message:
+        return False
+    text = user_message.strip()
+    if _CREATE_NEGATION_RE.search(text):
+        return False
+    if is_question(text) and not re.match(_POLITE_RE + r"(save|update|apply|publish|post)\b", text, re.IGNORECASE):
+        return False
+    if _BARE_AFFIRMATIVE_RE.match(text):
+        return bool(previous_assistant) and bool(_PROPOSES_SAVE_RE.search(previous_assistant or "") or _PROPOSES_PUBLISH_RE.search(previous_assistant or ""))
+    if any(rx.search(text) for rx in _SAVE_EDIT_REGEXES):
+        return True
+    return check_create_rfq_intent(text, previous_assistant) or check_publish_rfq_intent(text, previous_assistant)
+
+
+def check_cancel_edit_intent(user_message: str) -> bool:
+    """Leave edit mode without saving ("cancel edit", "discard changes")."""
+    text = (user_message or "").strip()
+    if not text:
+        return False
+    if is_question(text) and not re.match(_POLITE_RE + r"(cancel|discard)\b", text, re.IGNORECASE):
+        return False
+    return any(rx.search(text) for rx in _CANCEL_EDIT_REGEXES)
+
+
 _CP_TARGET = r"(seller|supplier|buyer|counterparty|vendor|them|him|her|user|that\s+user|this\s+user|counter\s+user)s?"
 
 COUNTERPARTY_MESSAGE_INTENT_REGEXES = [
@@ -416,12 +615,22 @@ def allowed_action_tools(
     ) or (affirmative and bool(_PROPOSES_MESSAGE_RE.search(previous)))
     wants_create = check_create_rfq_intent(text, previous_assistant=previous)
     wants_close = check_close_rfq_intent(text) or (affirmative and bool(_PROPOSES_CLOSE_RE.search(previous)))
+    wants_publish = check_publish_rfq_intent(text, previous_assistant=previous)
+    wants_edit = check_edit_rfq_intent(text)
+    editing = bool(state.get("editing_rfq_id"))
 
     allowed: set[str] = set()
     if wants_message:
         allowed.add("draft_counterparty_message")
+    elif editing and (wants_create or wants_publish):
+        # Saving an edit is never "create a new RFQ"; the chat turn handles it.
+        allowed.add("update_rfq_draft")
+    elif wants_edit and not _drafting_in_progress(draft):
+        allowed.add("edit_rfq")
     elif wants_create:
         allowed.update({"create_rfq", "update_rfq_draft"})
+    elif wants_publish:
+        allowed.add("publish_rfq")
     elif wants_close:
         allowed.add("close_rfq")
     elif _gives_rfq_details(text, draft, intent):

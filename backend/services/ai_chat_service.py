@@ -29,7 +29,7 @@ from models.user import User
 from services import answer_engine, rfq_tool_service
 from services.answer_engine import AnswerContext
 from services.agent_registry import AgentDefinition, GENERAL_ASSISTANT
-from services import ai_query_parser, chat_draft_assist, chat_permissions
+from services import ai_query_parser, chat_draft_assist, chat_permissions, chat_rfq_edit
 from services.agent_router import agent_for_intent, agent_for_tools, agent_info
 
 logger = logging.getLogger(__name__)
@@ -326,6 +326,7 @@ def build_rfq_system_prompt(
     counterparty_context: Optional[str] = None,
     user: Optional[User] = None,
     draft_helpers: str = "",
+    editing_title: Optional[str] = None,
 ) -> str:
     """Construct dynamic prompt instructing assistant on the exact question sequence and matches."""
     status_lines = []
@@ -362,6 +363,12 @@ def build_rfq_system_prompt(
         status_str = "- No active RFQ being drafted (Market Analysis / Advisory Inquiry)"
     else:
         status_str = "\n".join(status_lines)
+    if editing_title:
+        status_str = (
+            f'- EDITING the saved RFQ "{editing_title}". Apply the user\'s changes to this draft; the role cannot be '
+            'changed. The changes are stored only when the user says "save changes" (or "cancel edit" to discard). '
+            "Never create a new RFQ and never claim the changes are saved before then.\n"
+        ) + status_str
 
     missing_opts = []
     if not draft.get("quantity"):
@@ -718,6 +725,40 @@ async def execute_create_rfq_call(
         }, None
 
 
+async def _resolve_user_rfq(
+    db: AsyncSession, user: User, ref: Any, statuses: tuple[Any, ...]
+) -> Optional[Any]:
+    """The RFQ a user's command names: by id (any owner, so callers can refuse with a clear message), else
+    the newest of the user's own RFQs in ``statuses`` whose title, category or product name contains ``ref``."""
+    from models.rfq import RFQ
+
+    search_term = str(ref or "").strip()
+    if not search_term:
+        return None
+    try:
+        found = await db.get(RFQ, uuid.UUID(search_term))
+    except Exception:
+        found = None
+    if found is not None:
+        return found
+    stmt = (
+        select(RFQ)
+        .where(
+            RFQ.user_id == user.id,
+            RFQ.status.in_(list(statuses)),
+            or_(
+                RFQ.title.ilike(f"%{search_term}%"),
+                RFQ.category.ilike(f"%{search_term}%"),
+                text("rfqs.product_details->>'name' ILIKE :search_term"),
+            ),
+        )
+        .params(search_term=f"%{search_term}%")
+        .order_by(RFQ.created_at.desc())
+        .limit(1)
+    )
+    return (await db.execute(stmt)).scalars().first()
+
+
 async def execute_close_rfq_call(
     rfq_id_str: Optional[str] = None,
     conversation: Optional[Conversation] = None,
@@ -741,33 +782,7 @@ async def execute_close_rfq_call(
 
     target_rfq = None
     if rfq_id_str:
-        try:
-            target_rfq = await db.get(RFQ, uuid.UUID(str(rfq_id_str)))
-        except Exception:
-            target_rfq = None
-
-        if not target_rfq:
-            # Search user's active RFQs matching keyword in title or product name
-            search_term = str(rfq_id_str).strip()
-            if search_term:
-                search_stmt = (
-                    select(RFQ)
-                    .where(
-                        RFQ.user_id == user.id,
-                        RFQ.status == RFQStatus.ACTIVE,
-                        or_(
-                            RFQ.title.ilike(f"%{search_term}%"),
-                            RFQ.category.ilike(f"%{search_term}%"),
-                            text("rfqs.product_details->>'name' ILIKE :search_term"),
-                        ),
-                    )
-                    .params(search_term=f"%{search_term}%")
-                    .order_by(RFQ.created_at.desc())
-                    .limit(1)
-                )
-                res = await db.execute(search_stmt)
-                target_rfq = res.scalar_one_or_none()
-
+        target_rfq = await _resolve_user_rfq(db, user, rfq_id_str, (RFQStatus.ACTIVE,))
         if not target_rfq:
             return None, f"No active RFQ matching '{rfq_id_str}' was found in your listings."
 
@@ -820,6 +835,129 @@ async def execute_close_rfq_call(
     except Exception as exc:
         logger.exception("Failed to close RFQ from chat: %s", exc)
         return None, f"Failed to close RFQ: {str(exc)}"
+
+
+async def execute_publish_rfq_call(
+    rfq_id_str: Optional[str] = None,
+    conversation: Optional[Conversation] = None,
+    db: Optional[AsyncSession] = None,
+    user: Optional[User] = None,
+) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Publish one of the user's draft RFQs (the form's "Publish now").
+
+    Which RFQ: the one named by id or keyword; else the draft this conversation created last;
+    else the user's only draft; otherwise nothing is published and the user is asked which one.
+    """
+    if db is None or user is None:
+        return None, "Database session not available."
+
+    from models.rfq import RFQ
+    from models.enums import RFQStatus
+    from services import rfq_service
+
+    target = None
+    if rfq_id_str:
+        target = await _resolve_user_rfq(db, user, rfq_id_str, (RFQStatus.DRAFT,))
+        if target is None:
+            return None, f"No draft RFQ matching '{rfq_id_str}' was found in your listings."
+    else:
+        last_id = (conversation.state or {}).get("last_created_rfq_id") if conversation else None
+        if last_id:
+            try:
+                last = await db.get(RFQ, uuid.UUID(str(last_id)))
+            except Exception:
+                last = None
+            if last is not None and last.user_id == user.id and last.status == RFQStatus.DRAFT:
+                target = last
+        if target is None:
+            drafts = (
+                await db.execute(
+                    select(RFQ)
+                    .where(RFQ.user_id == user.id, RFQ.status == RFQStatus.DRAFT)
+                    .order_by(RFQ.created_at.desc())
+                    .limit(5)
+                )
+            ).scalars().all()
+            if not drafts:
+                return None, "You have no draft RFQs to publish."
+            if len(drafts) > 1:
+                titles = "; ".join(f"'{d.title}'" for d in drafts)
+                return None, f"You have several draft RFQs ({titles}). Tell me which one to publish, for example \"publish my rice RFQ\"."
+            target = drafts[0]
+
+    if target.user_id != user.id:
+        return None, "You do not have permission to publish this RFQ."
+    if target.status == RFQStatus.ACTIVE:
+        return None, f"'{target.title}' is already published."
+    try:
+        published = await rfq_service.publish_rfq(db, target)
+    except rfq_service.RFQError as exc:
+        return None, f"Could not publish '{target.title}': {exc}"
+    except Exception as exc:
+        logger.exception("Failed to publish RFQ from chat: %s", exc)
+        return None, f"Failed to publish RFQ: {str(exc)}"
+    return {
+        "id": str(published.id),
+        "title": published.title,
+        "role": published.role.value,
+        "status": published.status.value,
+        "category": published.category,
+    }, None
+
+
+async def execute_save_rfq_edit_call(
+    draft: dict[str, Any],
+    snapshot: dict[str, Any],
+    rfq_id_str: str,
+    db: Optional[AsyncSession] = None,
+    user: Optional[User] = None,
+    assist: Optional[chat_draft_assist.DraftAssist] = None,
+) -> tuple[Optional[dict[str, Any]], Optional[str], bool]:
+    """Save the chat's edits to the RFQ being edited: ``(rfq, error, changed)``.
+
+    Only fields that differ from the loaded RFQ are sent, as the form's PATCH does. Nothing is
+    sent (``changed`` False) when the draft equals what was loaded.
+    """
+    if db is None or user is None:
+        return None, "Database session not available.", False
+
+    from models.rfq import RFQ
+    from services import rfq_service
+
+    try:
+        target = await db.get(RFQ, uuid.UUID(str(rfq_id_str)))
+    except Exception:
+        target = None
+    if target is None:
+        return None, "The RFQ you were editing could not be found.", False
+    if target.user_id != user.id:
+        return None, "You do not have permission to edit this RFQ.", False
+
+    try:
+        patch = chat_rfq_edit.build_rfq_patch(draft, snapshot)
+    except rfq_tool_service.RFQDraftInvalid as exc:
+        problems = "; ".join(f"{f}: {m}" for f, m in exc.errors)
+        return None, f"I couldn't save the changes yet — please fix: {problems}", True
+    if patch is None:
+        return None, None, False
+    if assist is not None:
+        blocked = await assist.block_reason(draft)
+        if blocked:
+            return None, blocked, True
+    try:
+        updated = await rfq_service.update_rfq(db, target, patch)
+    except rfq_service.RFQError as exc:
+        return None, f"Could not save the changes to '{target.title}': {exc}", True
+    except Exception as exc:
+        logger.exception("Failed to update RFQ from chat: %s", exc)
+        return None, f"Failed to update RFQ: {str(exc)}", True
+    return {
+        "id": str(updated.id),
+        "title": updated.title,
+        "role": updated.role.value,
+        "status": updated.status.value,
+        "category": updated.category,
+    }, None, True
 
 
 def _connection_relevance(
@@ -1236,6 +1374,14 @@ def _draft_location(city: str, stated_country: Optional[str] = None) -> dict[str
     return out
 
 
+def _published_text(published: dict[str, Any]) -> str:
+    rfq_id = published.get("id", "")
+    return (
+        f"🎉 **RFQ Published!** '{published.get('title', 'RFQ')}' (ID: `{rfq_id}`) is now live in the Marketplace.\n\n"
+        f"[View RFQ in Marketplace](/marketplace?rfq={rfq_id})"
+    )
+
+
 def format_created_rfq_text(created_rfq: dict[str, Any]) -> str:
     """Format celebratory message when an RFQ is created."""
     rfq_id = created_rfq.get("id", "")
@@ -1496,8 +1642,9 @@ async def update_conversation_after_turn(
     last_counterparty_message: Optional[dict[str, Any]] = None,
     draft_suggestions: Optional[dict[str, Any]] = None,
     draft_moderation: Optional[dict[str, Any]] = None,
+    state_patch: Optional[dict[str, Any]] = None,
 ) -> None:
-    """Update conversation state, title, and timestamp."""
+    """Update conversation state, title, and timestamp. ``state_patch`` sets keys (a None value removes the key)."""
     from sqlalchemy.orm.attributes import flag_modified
 
     # Query fresh committed state directly from DB to avoid overwriting concurrent turns/tabs
@@ -1529,6 +1676,11 @@ async def update_conversation_after_turn(
         state_update["last_counterparty_message"] = last_counterparty_message
         if last_counterparty_message.get("connection_id"):
             state_update["active_connection_id"] = str(last_counterparty_message["connection_id"])
+    for key, value in (state_patch or {}).items():
+        if value is None:
+            state_update.pop(key, None)
+        else:
+            state_update[key] = value
     import json
     conversation.state = state_update
     if rfq_id is not None:
@@ -1842,6 +1994,7 @@ class TurnResult:
     matched_candidates: Optional[list[dict[str, Any]]] = None
     draft_suggestions: Optional[dict[str, Any]] = None
     draft_moderation: Optional[dict[str, Any]] = None
+    editing_rfq_id: Optional[str] = None
 
     def as_response(self) -> dict[str, Any]:
         return {
@@ -1856,6 +2009,7 @@ class TurnResult:
             "matched_candidates": self.matched_candidates,
             "draft_suggestions": self.draft_suggestions,
             "draft_moderation": self.draft_moderation,
+            "editing_rfq_id": self.editing_rfq_id,
         }
 
 
@@ -1880,7 +2034,8 @@ def _action_tool_specs(names: set[str]) -> list[dict[str, Any]]:
         "draft_counterparty_message": rfq_tool_service.DRAFT_COUNTERPARTY_MESSAGE_TOOL,
         "close_rfq": rfq_tool_service.CLOSE_RFQ_TOOL,
     }
-    return [table[n] for n in chat_permissions.ALL_ACTION_TOOLS if n in names]
+    # publish_rfq and edit_rfq are explicit-command shortcuts handled before the model runs: no model-facing spec.
+    return [table[n] for n in chat_permissions.ALL_ACTION_TOOLS if n in table and n in names]
 
 
 def _cards_from_tool_results(tool_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2044,6 +2199,123 @@ def _reply_extras(
     return "\n".join(lines)
 
 
+async def _plan_rfq_lifecycle(
+    db: Optional[AsyncSession],
+    user: Optional[User],
+    conversation: Optional[Conversation],
+    text: str,
+    previous_assistant: str,
+    current_rfq: Optional[dict[str, Any]],
+    editing_id: Optional[str],
+    editing_title: str,
+) -> Optional[dict[str, Any]]:
+    """Does this message publish a saved draft RFQ, load an RFQ for editing, or save/cancel an edit?
+
+    Returns ``{"kind": publish | edit_load | save | cancel | reply, ...}`` or None when the message is
+    an ordinary turn (including "create the RFQ" for the chat's own draft).
+    """
+    from models.rfq import RFQ
+
+    if db is None or user is None or not (text or "").strip():
+        return None
+    perms = chat_permissions
+    if editing_id:
+        if perms.check_cancel_edit_intent(text):
+            return {"kind": "cancel"}
+        if perms.check_save_edit_intent(text, previous_assistant):
+            return {"kind": "save", "publish": perms.says_publish(text) and not perms.wants_draft_status(text)}
+        if perms.check_edit_rfq_intent(text) and perms.edit_rfq_target(text):
+            return {"kind": "reply", "reply": (
+                f"You're editing '{editing_title}'. Say \"save changes\" or \"cancel edit\" first, then I can edit another RFQ."
+            )}
+        return None
+
+    state = (conversation.state or {}) if conversation else {}
+    drafting = chat_permissions._drafting_in_progress(current_rfq or {})
+    editable = (RFQStatus.DRAFT, RFQStatus.ACTIVE)
+
+    if perms.check_edit_rfq_intent(text):
+        target = perms.edit_rfq_target(text)
+        rfq = None
+        if target:
+            rfq = await _resolve_user_rfq(db, user, target, editable)
+            if rfq is None:
+                rfq = await _resolve_user_rfq(db, user, target, (RFQStatus.CLOSED, RFQStatus.EXPIRED))
+            if rfq is None:
+                if drafting:
+                    return None  # "update the rfq ..." about the chat's own draft
+                return {"kind": "reply", "reply": f"No RFQ matching '{target}' was found in your listings."}
+        elif drafting:
+            return None
+        else:
+            last_id = state.get("last_created_rfq_id")
+            if last_id:
+                try:
+                    last = await db.get(RFQ, uuid.UUID(str(last_id)))
+                except Exception:
+                    last = None
+                if last is not None and last.user_id == user.id and last.status in editable:
+                    rfq = last
+            if rfq is None:
+                rows = (
+                    await db.execute(
+                        select(RFQ)
+                        .where(RFQ.user_id == user.id, RFQ.status.in_(list(editable)))
+                        .order_by(RFQ.created_at.desc())
+                        .limit(5)
+                    )
+                ).scalars().all()
+                if not rows:
+                    return {"kind": "reply", "reply": "You have no RFQs that can be edited yet."}
+                if len(rows) > 1:
+                    titles = "; ".join(f"'{r.title}'" for r in rows)
+                    return {"kind": "reply", "reply": (
+                        f"You have several RFQs ({titles}). Tell me which one to edit, for example \"edit my rice RFQ\"."
+                    )}
+                rfq = rows[0]
+        if rfq.user_id != user.id:
+            return {"kind": "reply", "reply": "You do not have permission to edit this RFQ."}
+        if rfq.status not in editable:
+            return {"kind": "reply", "reply": (
+                f"'{rfq.title}' is {rfq.status.value} and can no longer be edited. "
+                "You can create a new RFQ from it instead."
+            )}
+        return {"kind": "edit_load", "rfq": rfq}
+
+    if perms.check_publish_rfq_intent(text, previous_assistant):
+        target = perms.publish_rfq_target(text)
+        if target:
+            if drafting and await _resolve_user_rfq(db, user, target, (RFQStatus.DRAFT,)) is None:
+                return None  # the chat's own draft is being named: create it
+            return {"kind": "publish", "target": target}
+        if drafting:
+            return None
+        has_draft = (
+            await db.execute(
+                select(func.count()).select_from(RFQ).where(RFQ.user_id == user.id, RFQ.status == RFQStatus.DRAFT)
+            )
+        ).scalar_one()
+        return {"kind": "publish", "target": None} if has_draft else None
+    return None
+
+
+def _edit_summary(draft: dict[str, Any]) -> str:
+    """One line of the current values of an RFQ loaded for editing."""
+    parts: list[str] = []
+    qty = draft.get("quantity") or {}
+    if qty:
+        parts.append(f"quantity {qty.get('value')} {qty.get('unit')}")
+    price = draft.get("price_target") or {}
+    if price:
+        parts.append(f"target price {price.get('amount')} {price.get('currency')}" + (f"/{price['per_unit']}" if price.get("per_unit") else ""))
+    loc = draft.get("location") or {}
+    if loc.get("city"):
+        parts.append(f"location {loc['city']}")
+    if (draft.get("deadline") or {}).get("date"):
+        parts.append(f"deadline {draft['deadline']['date']}")
+    return ", ".join(parts) or "no quantity, price, location or deadline yet"
+
+
 async def _run_chat_turn(
     messages: list[Any],
     current_rfq: Optional[dict[str, Any]] = None,
@@ -2084,6 +2356,13 @@ async def _run_chat_turn(
         # The server's draft is authoritative; the client copy is only for stateless calls.
         current_rfq = dict(state["rfq_draft"])
 
+    editing_id = state.get("editing_rfq_id") if conversation else None
+    editing_snapshot = state.get("editing_snapshot") if conversation else None
+    if not (editing_id and isinstance(editing_snapshot, dict)):
+        editing_id, editing_snapshot = None, None
+    edit_ctx: dict[str, Any] = {"id": editing_id, "snapshot": editing_snapshot}
+    state_patch: dict[str, Any] = {}
+
     client_cands = list(matched_candidates or [])
     last_counterparty_msg = state.get("last_counterparty_message") if conversation else None
     if conversation and not active_connection_id and state.get("active_connection_id"):
@@ -2102,10 +2381,29 @@ async def _run_chat_turn(
     parse = ai_query_parser.cached(last_user_content)
     parsed_intent = parse.intent if parse else None
 
+    lifecycle = await _plan_rfq_lifecycle(
+        db, user, conversation, last_user_content, previous_assistant, current_rfq,
+        editing_id, str((editing_snapshot or {}).get("title") or ""),
+    )
+    edit_loaded_rfq = None
+    if lifecycle and lifecycle["kind"] == "edit_load":
+        edit_loaded_rfq = lifecycle["rfq"]
+        loaded = chat_rfq_edit.rfq_to_draft(edit_loaded_rfq)
+        if chat_permissions._drafting_in_progress(current_rfq or {}):
+            assist.notes.append("Your unsent chat draft was replaced by the RFQ you are editing.")
+        current_rfq = json.loads(json.dumps(loaded))
+        editing_id, editing_snapshot = str(edit_loaded_rfq.id), loaded
+        edit_ctx.update(id=editing_id, snapshot=editing_snapshot)
+        state_patch.update(editing_rfq_id=editing_id, editing_snapshot=editing_snapshot)
+        assist.reset()
+        edit_note = f"✏️ Editing '{edit_loaded_rfq.title}'. Say \"save changes\" when you're done, or \"cancel edit\" to discard."
+        assist.notes.append(edit_note)
+
     allowed = chat_permissions.allowed_action_tools(
         last_user_content,
         current_rfq,
         {
+            "editing_rfq_id": editing_id,
             "previous_assistant": previous_assistant,
             "active_connection_id": active_connection_id,
             "last_counterparty_message": last_counterparty_msg,
@@ -2113,14 +2411,26 @@ async def _run_chat_turn(
         },
         parsed_intent,
     )
+    if lifecycle and lifecycle["kind"] == "publish":
+        allowed = {"publish_rfq"}
+    elif lifecycle and lifecycle["kind"] == "edit_load":
+        allowed = {"edit_rfq"}
+        if chat_permissions.edit_command_has_change(last_user_content):
+            allowed.add("update_rfq_draft")
+    elif editing_id:
+        allowed.discard("create_rfq")  # while editing, "create" means save
     is_counterparty_msg = "draft_counterparty_message" in allowed
 
-    draft = rfq_tool_service.preprocess_message_to_rfq(
-        last_user_content,
-        current_rfq,
-        has_active_connection=bool(active_connection_id),
-        has_previous_counterparty_msg=has_prev_counterparty,
-    )
+    if lifecycle:
+        # A lifecycle command ("publish my rice rfq", "save changes") carries no draft details to extract.
+        draft = json.loads(json.dumps(current_rfq or {}))
+    else:
+        draft = rfq_tool_service.preprocess_message_to_rfq(
+            last_user_content,
+            current_rfq,
+            has_active_connection=bool(active_connection_id),
+            has_previous_counterparty_msg=has_prev_counterparty,
+        )
 
     if not client_cands and is_counterparty_msg and isinstance(state.get("matched_candidates"), list):
         matched_candidates = state["matched_candidates"]  # "message the first one" needs last turn's listings
@@ -2189,6 +2499,14 @@ async def _run_chat_turn(
     if assist.applied_hsn:
         allowed.add("update_rfq_draft")
     chat_draft_assist.must_match_from_text(draft, last_user_content)
+
+    def lock_role() -> None:
+        if edit_ctx["snapshot"] and chat_rfq_edit.enforce_locked_role(draft, edit_ctx["snapshot"]):
+            note = f"The role cannot be changed while editing an RFQ; it stays {str(edit_ctx['snapshot']['role']).upper()}."
+            if note not in assist.notes:
+                assist.notes.append(note)
+
+    lock_role()
     await assist.refresh(draft)
     readiness = rfq_tool_service.evaluate_rfq_readiness(draft)
     window_messages, older_summary = build_sliding_window_messages(messages, max_history_turns=8)
@@ -2206,6 +2524,7 @@ async def _run_chat_turn(
             chunk["matched_candidates"] = shown
         if chunk.get("done"):
             chunk["draft_suggestions"], chunk["draft_moderation"] = assist.public()
+            chunk["editing_rfq_id"] = edit_ctx["id"]
         return chunk
 
     def wire(
@@ -2284,6 +2603,7 @@ async def _run_chat_turn(
                     last_counterparty_message=cp_msg or last_counterparty_msg,
                     draft_suggestions=assist.suggestions,
                     draft_moderation=assist.moderation or {},
+                    state_patch=state_patch,
                 )
             except Exception as exc:
                 logger.exception("Failed to persist turn: %s", exc)
@@ -2297,6 +2617,7 @@ async def _run_chat_turn(
             conversation_id=conversation.id if conversation else None, routed_agent=agent_state["info"],
             matched_candidates=(cards_state["match_cards"] or client_cands) or None,
             draft_suggestions=chunk.get("draft_suggestions"), draft_moderation=chunk.get("draft_moderation"),
+            editing_rfq_id=edit_ctx["id"],
         )
         return ChatEvent(kind, chunk, result)
 
@@ -2321,6 +2642,7 @@ async def _run_chat_turn(
         counterparty_context=counterparty_context,
         user=user,
         draft_helpers=assist.prompt_section(draft),
+        editing_title=str((editing_snapshot or {}).get("title") or "") if editing_id else None,
     )
     prepared_messages: list[dict[str, Any]] = [{"role": "system", "content": dynamic_system_prompt}, *window_messages]
 
@@ -2329,6 +2651,103 @@ async def _run_chat_turn(
         return
 
     # ---- explicit-command shortcuts (create / close) --------------------
+    # ---- lifecycle shortcuts: publish a saved draft, edit a saved RFQ ----------
+    kind = lifecycle["kind"] if lifecycle else None
+    if kind == "reply":
+        yield await finish(reply=f"⚠️ {lifecycle['reply']}")
+        return
+
+    if kind == "publish":
+        agent_state["info"] = agent_info(agent_for_tools(["publish_rfq"]) or routed_agent)
+        published, err = await execute_publish_rfq_call(
+            rfq_id_str=lifecycle.get("target"), conversation=conversation, db=db, user=user
+        )
+        step = {
+            "name": "publish_rfq",
+            "title": "Publishing Marketplace RFQ",
+            "status": "completed" if published else "failed",
+            "args": {"title": published["title"], "id": published["id"]} if published else {"error": err},
+        }
+        reply = f"⚠️ {err or 'Could not publish the RFQ.'}" if not published else _published_text(published)
+        yield await finish(reply=reply, tool_step=step, created=published)
+        return
+
+    if kind == "cancel":
+        title = str((edit_ctx["snapshot"] or {}).get("title") or "the RFQ")
+        draft.clear()
+        readiness = rfq_tool_service.evaluate_rfq_readiness(draft)
+        state_patch.update(editing_rfq_id=None, editing_snapshot=None)
+        edit_ctx.update(id=None, snapshot=None)
+        yield await finish(reply=f"Edit cancelled. No changes were saved to '{title}'.")
+        return
+
+    if kind == "save":
+        agent_state["info"] = agent_info(agent_for_tools(["edit_rfq"]) or routed_agent)
+        snapshot = edit_ctx["snapshot"] or {}
+        fields = sorted(chat_rfq_edit.changed_fields(draft, snapshot))
+        saved, err, changed = await execute_save_rfq_edit_call(
+            draft, snapshot, str(edit_ctx["id"]), db=db, user=user, assist=assist
+        )
+        title = str(snapshot.get("title") or "the RFQ")
+        step = {
+            "name": "update_rfq",
+            "title": "Saving RFQ Changes",
+            "status": "completed" if saved else "failed",
+            "args": {"title": saved["title"], "id": saved["id"], "fields": fields} if saved else {"error": err},
+        }
+        if err:
+            yield await finish(reply=f"⚠️ {err}", tool_step=step)
+            return
+        if not changed and not lifecycle.get("publish"):
+            yield await finish(reply=(
+                f"There is nothing to save: '{title}' is unchanged. Tell me what to change, "
+                "or say \"cancel edit\" to leave edit mode."
+            ))
+            return
+        result, reply = None, ""
+        if saved:
+            result = saved
+            title = saved["title"]
+            reply = f"✅ **RFQ Updated:** '{title}' (ID: `{saved['id']}`) saved. Changed: {', '.join(f.replace('_', ' ') for f in fields)}."
+        if lifecycle.get("publish") and (saved is None or saved["status"] == "draft"):
+            published, perr = await execute_publish_rfq_call(
+                rfq_id_str=str(edit_ctx["id"]), conversation=conversation, db=db, user=user
+            )
+            if published:
+                result = published
+                reply = (reply + "\n\n" if reply else "") + _published_text(published)
+                step = {"name": "publish_rfq", "title": "Publishing Marketplace RFQ", "status": "completed",
+                        "args": {"title": published["title"], "id": published["id"]}}
+            else:
+                reply = (reply + "\n\n" if reply else "") + f"⚠️ {perr}"
+        draft.clear()
+        readiness = rfq_tool_service.evaluate_rfq_readiness(draft)
+        state_patch.update(editing_rfq_id=None, editing_snapshot=None)
+        edit_ctx.update(id=None, snapshot=None)
+        yield await finish(reply=reply, tool_step=step, created=result)
+        return
+
+    if kind == "edit_load":
+        agent_state["info"] = agent_info(agent_for_tools(["edit_rfq"]) or routed_agent)
+        step = {
+            "name": "edit_rfq",
+            "title": "Loading RFQ for Editing",
+            "status": "completed",
+            "args": {"title": edit_loaded_rfq.title, "id": str(edit_loaded_rfq.id)},
+        }
+        if "update_rfq_draft" in allowed:
+            yield ChatEvent("tool_step", wire(tool_step=step))
+        else:
+            reply = (
+                f"✏️ **Editing '{edit_loaded_rfq.title}'** ({edit_loaded_rfq.status.value}). "
+                f"Current: {_edit_summary(draft)}.\n\n"
+                "Tell me what to change, then say \"save changes\" (or \"cancel edit\" to discard)."
+            )
+            if edit_note in assist.notes:
+                assist.notes.remove(edit_note)
+            yield await finish(reply=reply, tool_step=step)
+            return
+
     if "create_rfq" in allowed:
         agent_state["info"] = agent_info(agent_for_tools(["create_rfq"]) or routed_agent)
         if readiness["has_role"] and readiness["has_product"]:
@@ -2341,6 +2760,7 @@ async def _run_chat_turn(
             yield ChatEvent("tool_step", wire(tool_step=step, created=created))
             reply = format_created_rfq_text(created) if created else f"⚠️ {err or 'Failed to create RFQ.'}"
             if created:
+                state_patch["last_created_rfq_id"] = created["id"]
                 draft.clear()  # the RFQ exists now; a second "create" must start from a fresh draft
                 readiness = rfq_tool_service.evaluate_rfq_readiness(draft)
             yield await finish(
@@ -2449,6 +2869,7 @@ async def _run_chat_turn(
         engine_result = task.result()
 
         draft = runner.draft
+        lock_role()
         chat_draft_assist.must_match_from_text(draft, last_user_content)
         chat_draft_assist.apply_spec_suggestions(draft, assist.suggestions.get("specs"))
         if not runner.created_rfq_obj:
@@ -2573,6 +2994,7 @@ async def _run_chat_turn(
                 tool_step=captured_tool_step, cp_msg=counterparty_msg_obj,
             )
         elif created_rfq_obj:
+            state_patch["last_created_rfq_id"] = created_rfq_obj["id"]
             draft.clear()
             readiness = rfq_tool_service.evaluate_rfq_readiness(draft)
             yield await finish(

@@ -401,6 +401,8 @@ export interface AIChatResponse {
   routed_agent?: AgentInfo | null;
   draft_suggestions?: AIDraftSuggestions | null;
   draft_moderation?: AIDraftModeration | null;
+  /** Id of the saved RFQ being edited in this conversation (edit mode), if any. */
+  editing_rfq_id?: string | null;
 }
 
 export interface AIToolStep {
@@ -457,6 +459,8 @@ export interface AIChatChunk {
   routed_agent?: AgentInfo | null;
   draft_suggestions?: AIDraftSuggestions | null;
   draft_moderation?: AIDraftModeration | null;
+  /** Id of the saved RFQ being edited (edit mode); sent on the final chunk. */
+  editing_rfq_id?: string | null;
   /** When true, `content` replaces the text streamed so far instead of appending. */
   replace_content?: boolean;
   done: boolean;

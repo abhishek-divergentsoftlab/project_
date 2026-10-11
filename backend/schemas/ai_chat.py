@@ -59,6 +59,9 @@ class AIChatResponse(BaseModel):
     matched_candidates: Optional[list[dict[str, Any]]] = None
     draft_suggestions: Optional[dict[str, Any]] = None
     draft_moderation: Optional[dict[str, Any]] = None
+    editing_rfq_id: Optional[str] = Field(
+        default=None, description="Id of the saved RFQ being edited in this conversation, if any."
+    )
 
 
 class AIConversationSummary(BaseModel):

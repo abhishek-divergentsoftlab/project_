@@ -148,6 +148,7 @@ async def chat_message(
         matched_candidates=result.get("matched_candidates"),
         draft_suggestions=result.get("draft_suggestions"),
         draft_moderation=result.get("draft_moderation"),
+        editing_rfq_id=result.get("editing_rfq_id"),
     )
 
 
