@@ -29,7 +29,7 @@ from models.user import User
 from services import answer_engine, rfq_tool_service
 from services.answer_engine import AnswerContext
 from services.agent_registry import AgentDefinition, GENERAL_ASSISTANT
-from services import ai_query_parser, chat_draft_assist, chat_permissions, chat_rfq_edit
+from services import ai_query_parser, chat_conversation, chat_draft_assist, chat_permissions, chat_rfq_edit
 from services.agent_router import agent_for_intent, agent_for_tools, agent_info
 
 logger = logging.getLogger(__name__)
@@ -327,6 +327,8 @@ def build_rfq_system_prompt(
     user: Optional[User] = None,
     draft_helpers: str = "",
     editing_title: Optional[str] = None,
+    next_ask: Optional[str] = None,
+    recap_next: bool = False,
 ) -> str:
     """Construct dynamic prompt instructing assistant on the exact question sequence and matches."""
     status_lines = []
@@ -393,7 +395,19 @@ def build_rfq_system_prompt(
         role_hint = f"Focus: counterparty trust and verification. The user's own KYC status is '{kyc_val}'."
     else:
         role_hint = _AGENT_ROLE_HINTS.get(agent_id, "")
-    if drafting and not readiness["has_role"]:
+    captured = "; ".join(opts) if opts else "none yet"
+    if drafting and recap_next:
+        flow_directive = (
+            f"RFQ DRAFT: all the questions are done. Captured: {captured}. Acknowledge what was captured in one short "
+            "sentence. Do NOT ask any question and do not offer to create the RFQ: a summary with the publish-or-draft "
+            "question is added automatically after your reply."
+        )
+    elif drafting and next_ask:
+        flow_directive = (
+            f"RFQ DRAFT: Captured so far: {captured}. Acknowledge what was captured in one short sentence, then "
+            f"ask only this: \"{next_ask}\" Do not ask about any other field and do not offer to create the RFQ yet."
+        )
+    elif drafting and not readiness["has_role"]:
         flow_directive = "RFQ DRAFT: role is missing. Ask in ONE brief sentence whether the user wants to BUY or SELL goods."
     elif drafting and not readiness["has_product"]:
         flow_directive = (
@@ -2299,6 +2313,152 @@ async def _plan_rfq_lifecycle(
     return None
 
 
+_INLINE_MY = r"(?:this|the|my|our|that|meri|mera|mere|apni|apna)"
+_INLINE_OBJ = r"(?:rfqs?|listings?|postings?|requirements?)"
+_INLINE_UUID_RE = re.compile(
+    r"(?:\b(?:of|in|for|on)\s+)?(?:\b(?:my|the|this)\s+)?(?:\b(?:rfq|listing)\s+)?(?:\bid\s+)?"
+    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+    re.IGNORECASE,
+)
+_INLINE_COMMAND_RE = re.compile(
+    r"\b(?:(?:and|then|aur|phir)\s+|&\s*)?(?:please\s+)?(?:save|apply|confirm|commit|publish|post|go\s+live)\b"
+    r"(?:\s+(?:it|this|that|the|my|these|all|changes|edits|updates|rfq|listing))*"
+    r"(?:\s+kar(?:o|do|dena|dijiye)?(?:\s+(?:do|dena|dijiye))?)?",
+    re.IGNORECASE,
+)
+_INLINE_PRICE_WORD_RE = re.compile(r"\b(price|rate|cost|budget|amount)\b", re.IGNORECASE)
+_INLINE_QTY_WORD_RE = re.compile(r"\b(quantity|qty|volume|units?)\b", re.IGNORECASE)
+# Only these fields are ever taken from an edit command's change text: never product, category or role.
+_INLINE_FIELDS = ("quantity", "price_target", "location", "deadline")
+
+
+def _strip_edit_command(message: str) -> str:
+    """The change text left in an edit/save command once the saved-RFQ reference and "save" words are removed."""
+    text = message or ""
+    target = chat_permissions.edit_rfq_target(text)
+    if target and _INLINE_UUID_RE.search(target):
+        text = _INLINE_UUID_RE.sub(" ", text)
+    else:
+        fillers = r"(?:(?:draft|saved|existing|current|posted|published|active)\s+)*"
+        named = r"\s+".join(re.escape(w) for w in target.split()) + r"\s+" if target else ""
+        text = re.sub(
+            rf"(?:\b(?:of|in|for|on)\s+)?\b{_INLINE_MY}\s+{fillers}{named}{_INLINE_OBJ}\b",
+            " ", text, count=1, flags=re.IGNORECASE,
+        )
+    text = _INLINE_COMMAND_RE.sub(" ", text)
+    return re.sub(r"\s+", " ", text).strip(" ,.;:-")
+
+
+def apply_inline_changes(draft: dict[str, Any], message: str) -> list[str]:
+    """Apply what an edit/save command states ("change the quantity of my rice RFQ to 600 kg") to ``draft``.
+
+    The rule pre-processor runs on the change text alone, and only the quantity, price, location and
+    deadline it finds are taken. Returns the draft fields that were set.
+    """
+    remainder = _strip_edit_command(message)
+    if not remainder:
+        return []
+    found = rfq_tool_service.preprocess_message_to_rfq(remainder, {})
+    if (
+        found.get("quantity")
+        and not found.get("price_target")
+        and _INLINE_PRICE_WORD_RE.search(remainder)
+        and not _INLINE_QTY_WORD_RE.search(remainder)
+    ):
+        found.pop("quantity")  # "set price to 50": the figure is the price, not a quantity
+    applied: list[str] = []
+    for key in _INLINE_FIELDS:
+        if found.get(key):
+            draft[key] = found[key]
+            applied.append(key)
+    return applied
+
+
+async def _save_edit_flow(
+    draft: dict[str, Any],
+    snapshot: dict[str, Any],
+    edit_id: str,
+    publish: bool,
+    conversation: Optional[Conversation],
+    db: Optional[AsyncSession],
+    user: Optional[User],
+    assist: chat_draft_assist.DraftAssist,
+) -> tuple[str, Optional[dict[str, Any]], Optional[dict[str, Any]], bool, bool]:
+    """Save the edited RFQ (and publish it when asked): ``(reply, tool_step, created_rfq, done, ok)``.
+
+    ``done`` means edit mode ends (the save went through, or the save+publish was attempted);
+    ``ok`` is False for any refusal or failure shown in the reply.
+    """
+    fields = sorted(chat_rfq_edit.changed_fields(draft, snapshot))
+    saved, err, changed = await execute_save_rfq_edit_call(draft, snapshot, edit_id, db=db, user=user, assist=assist)
+    title = str(snapshot.get("title") or "the RFQ")
+    step: Optional[dict[str, Any]] = {
+        "name": "update_rfq",
+        "title": "Saving RFQ Changes",
+        "status": "completed" if saved else "failed",
+        "args": {"title": saved["title"], "id": saved["id"], "fields": fields} if saved else {"error": err},
+    }
+    if err:
+        return f"⚠️ {err}", step, None, False, False
+    if not changed and not publish:
+        return (
+            f"There is nothing to save: '{title}' is unchanged. Tell me what to change, "
+            "or say \"cancel edit\" to leave edit mode."
+        ), None, None, False, False
+    result, reply, ok = None, "", True
+    if saved:
+        result = saved
+        title = saved["title"]
+        reply = f"✅ **RFQ Updated:** '{title}' (ID: `{saved['id']}`) saved. Changed: {', '.join(f.replace('_', ' ') for f in fields)}."
+    if publish and (saved is None or saved["status"] == "draft"):
+        published, perr = await execute_publish_rfq_call(
+            rfq_id_str=edit_id, conversation=conversation, db=db, user=user
+        )
+        if published:
+            result = published
+            reply = (reply + "\n\n" if reply else "") + _published_text(published)
+            step = {"name": "publish_rfq", "title": "Publishing Marketplace RFQ", "status": "completed",
+                    "args": {"title": published["title"], "id": published["id"]}}
+        else:
+            ok = False
+            reply = (reply + "\n\n" if reply else "") + f"⚠️ {perr}"
+    return reply, step, result, True, ok
+
+
+_CONVO_RESET: dict[str, Any] = {
+    "recap_hash": None, "recap_awaiting": None, "declined_fields": None, "asked_fields": None,
+    "last_asked": None, "auto_role": None, "auto_role_noted": None, "recap_publish": None,
+}
+_ANSWER_FIELDS = {"quantity": "quantity", "price": "price", "location": "location", "dispatch": "deadline"}
+_OPTIONAL_ASKS = ("quantity", "min_order", "price", "location", "dispatch", "hsn")
+
+
+def _apply_answer(draft: dict[str, Any], field: str, message: str) -> bool:
+    """File a reply to ONE question (the one just asked) under that field when the general parser missed it."""
+    from services import query_extractor
+
+    key = _ANSWER_FIELDS.get(field)
+    if not key or not (message or "").strip():
+        return False
+    ans = query_extractor.parse_answer(key, message)
+    if ans is None:
+        return False
+    if field == "quantity" and ans.quantity_value is not None and not draft.get("quantity"):
+        draft["quantity"] = {"value": float(ans.quantity_value), "unit": ans.quantity_unit or "pcs"}
+    elif field == "price" and ans.price_amount is not None and not draft.get("price_target"):
+        price: dict[str, Any] = {"amount": float(ans.price_amount), "currency": ans.price_currency or "INR"}
+        if ans.price_per_unit:
+            price["per_unit"] = ans.price_per_unit
+        draft["price_target"] = price
+    elif field == "location" and ans.city and not (draft.get("location") or {}).get("city"):
+        draft["location"] = _draft_location(ans.city, ans.country)
+    elif field == "dispatch" and ans.deadline_days is not None and not draft.get("deadline"):
+        draft["deadline"] = {"in_days": int(ans.deadline_days)}
+    else:
+        return False
+    return True
+
+
 def _edit_summary(draft: dict[str, Any]) -> str:
     """One line of the current values of an RFQ loaded for editing."""
     parts: list[str] = []
@@ -2363,6 +2523,33 @@ async def _run_chat_turn(
     edit_ctx: dict[str, Any] = {"id": editing_id, "snapshot": editing_snapshot}
     state_patch: dict[str, Any] = {}
 
+    # What the conversation remembers between turns (see chat_conversation): the recap the user was shown,
+    # the fields they declined, how often each was asked, and the register (English / Hinglish).
+    gating = conversation is not None
+    recap_hash = state.get("recap_hash") if gating else None
+    recap_awaiting = state.get("recap_awaiting") if gating else None
+    declined: list[str] = [str(x) for x in (state.get("declined_fields") or [])] if gating else []
+    asked: dict[str, int] = dict(state.get("asked_fields") or {}) if gating else {}
+    last_asked = state.get("last_asked") if gating else None
+    lang = chat_conversation.pick_lang(last_user_content, state.get("lang") if gating else None)
+    if gating and lang == "hinglish" and state.get("lang") != "hinglish":
+        state_patch["lang"] = "hinglish"
+    recap_reply: Optional[str] = None
+    decline: Optional[str] = None
+    if gating and recap_awaiting and chat_conversation.draft_hash(current_rfq) == recap_hash:
+        recap_reply = chat_conversation.classify_recap_reply(last_user_content)
+    if gating and not editing_id and last_asked and not recap_reply and not recap_awaiting:
+        decline = chat_conversation.detect_decline(last_user_content)
+        if decline == "all":
+            declined = list(dict.fromkeys([
+                *declined, *_OPTIONAL_ASKS,
+                *(f"spec:{lbl}" for lbl in chat_conversation.unfilled_spec_labels(current_rfq or {}, assist.suggestions)),
+            ]))
+            state_patch["declined_fields"] = declined
+        elif decline == "one" and str(last_asked) not in ("role", "product") and str(last_asked) not in declined:
+            declined.append(str(last_asked))
+            state_patch["declined_fields"] = declined
+
     client_cands = list(matched_candidates or [])
     last_counterparty_msg = state.get("last_counterparty_message") if conversation else None
     if conversation and not active_connection_id and state.get("active_connection_id"):
@@ -2385,6 +2572,15 @@ async def _run_chat_turn(
         db, user, conversation, last_user_content, previous_assistant, current_rfq,
         editing_id, str((editing_snapshot or {}).get("title") or ""),
     )
+    forced_create: Optional[str] = None  # "yes" | "draft": a bare answer to the recap question
+    if recap_reply and not lifecycle:
+        if editing_id and recap_awaiting == "edit":
+            lifecycle = {"kind": "save", "publish": False} if recap_reply in ("yes", "draft") else {"kind": "recap_no"}
+        elif not editing_id and recap_awaiting == "create":
+            if recap_reply == "no":
+                lifecycle = {"kind": "recap_no"}
+            else:
+                forced_create = recap_reply
     edit_loaded_rfq = None
     if lifecycle and lifecycle["kind"] == "edit_load":
         edit_loaded_rfq = lifecycle["rfq"]
@@ -2419,11 +2615,22 @@ async def _run_chat_turn(
             allowed.add("update_rfq_draft")
     elif editing_id:
         allowed.discard("create_rfq")  # while editing, "create" means save
+    if forced_create:
+        allowed = {"create_rfq", "update_rfq_draft"}
     is_counterparty_msg = "draft_counterparty_message" in allowed
+    if (
+        gating and last_asked and not editing_id and not lifecycle and not allowed
+        and not chat_permissions.is_information_request(last_user_content)
+    ):
+        allowed.add("update_rfq_draft")  # a reply to the question the assistant just asked
 
-    if lifecycle:
+    if lifecycle or forced_create or decline:
         # A lifecycle command ("publish my rice rfq", "save changes") carries no draft details to extract.
         draft = json.loads(json.dumps(current_rfq or {}))
+        if lifecycle and lifecycle["kind"] in ("edit_load", "save") and chat_permissions.edit_command_has_change(last_user_content):
+            applied_inline = apply_inline_changes(draft, last_user_content)
+            if applied_inline:
+                logger.info("Applied inline edit fields %s", applied_inline)
     else:
         draft = rfq_tool_service.preprocess_message_to_rfq(
             last_user_content,
@@ -2507,8 +2714,68 @@ async def _run_chat_turn(
                 assist.notes.append(note)
 
     lock_role()
+
+    # An account that can post on one side only never gets asked which side; a stated side it cannot post is refused.
+    account_roles = {r for r in ("buyer", "seller") if user.can_post_as(r)} if user is not None else {"buyer", "seller"}
+    sole_role = next(iter(account_roles)) if len(account_roles) == 1 else None
+    role_refused = False
+
+    def enforce_account_role() -> None:
+        nonlocal role_refused
+        if edit_ctx["snapshot"] or "update_rfq_draft" not in allowed or sole_role is None:
+            return
+        stated = str(draft.get("role") or "").lower()
+        if stated and stated != sole_role:
+            draft.pop("role", None)
+            role_refused = True
+            if lang == "hinglish":
+                note = (
+                    f"Aapka account sirf {sole_role} ke roop mein post kar sakta hai, isliye main {stated} RFQ nahi bana sakta. "
+                    f"Kya main ise {sole_role} ke roop mein bana dun?"
+                )
+            else:
+                note = (
+                    f"Your account can only post as a {sole_role}, so I can't create a {stated} RFQ from it. "
+                    f"Would you like me to draft it as a {sole_role} instead?"
+                )
+            if note not in assist.notes:
+                assist.notes.append(note)
+        elif (
+            not stated and chat_draft_assist.product_name(draft) and not role_refused
+            # "publish it" with nothing drafted is not a product: leave the role question to the create path
+            and not ("create_rfq" in allowed and not chat_draft_assist.product_name(current_rfq or {}))
+        ):
+            draft["role"] = sole_role
+            state_patch["auto_role"] = sole_role
+
+    enforce_account_role()
+    if (
+        gating and last_asked in _ANSWER_FIELDS and "update_rfq_draft" in allowed and not edit_ctx["snapshot"]
+        and not chat_permissions.is_question(last_user_content)
+    ):
+        _apply_answer(draft, str(last_asked), last_user_content)
     await assist.refresh(draft)
     readiness = rfq_tool_service.evaluate_rfq_readiness(draft)
+
+    # One question at a time, most important first; None when this turn is not a drafting turn.
+    drafting_turn = bool(
+        gating and not edit_ctx["id"] and not lifecycle and not forced_create and not role_refused
+        and "update_rfq_draft" in allowed and "create_rfq" not in allowed and not is_counterparty_msg
+        and chat_permissions._drafting_in_progress(draft)
+        and not chat_permissions.is_question(last_user_content)
+        and not chat_permissions.is_information_request(last_user_content)
+    )
+
+    def pick_next() -> str:
+        return chat_conversation.next_question(
+            draft, assist.suggestions, role=draft.get("role") or sole_role, declined=declined, asked=asked
+        )
+
+    ask_field = pick_next() if drafting_turn else None
+    ask_text = (
+        chat_conversation.question_text(ask_field, {**draft, "role": draft.get("role") or sole_role}, assist.suggestions, lang)
+        if ask_field and ask_field != "recap" else None
+    )
     window_messages, older_summary = build_sliding_window_messages(messages, max_history_turns=8)
     tool_cards: list[dict[str, Any]] = []
     cards_state: dict[str, list[dict[str, Any]]] = {"match_cards": []}
@@ -2643,6 +2910,8 @@ async def _run_chat_turn(
         user=user,
         draft_helpers=assist.prompt_section(draft),
         editing_title=str((editing_snapshot or {}).get("title") or "") if editing_id else None,
+        next_ask=ask_text,
+        recap_next=ask_field == "recap",
     )
     prepared_messages: list[dict[str, Any]] = [{"role": "system", "content": dynamic_system_prompt}, *window_messages]
 
@@ -2672,6 +2941,21 @@ async def _run_chat_turn(
         yield await finish(reply=reply, tool_step=step, created=published)
         return
 
+    if kind == "recap_no":
+        state_patch.update(recap_hash=None, recap_awaiting=None)
+        if edit_ctx["id"]:
+            reply = (
+                "Theek hai, kuch save nahi kiya. Aap kya badalna chahte hain?" if lang == "hinglish"
+                else "No problem, nothing was saved. What would you like to change?"
+            )
+        else:
+            reply = (
+                "Theek hai, maine kuch create nahi kiya. Aap kya badalna chahte hain?" if lang == "hinglish"
+                else "No problem, I haven't created anything. What would you like to change?"
+            )
+        yield await finish(reply=reply)
+        return
+
     if kind == "cancel":
         title = str((edit_ctx["snapshot"] or {}).get("title") or "the RFQ")
         draft.clear()
@@ -2683,47 +2967,39 @@ async def _run_chat_turn(
 
     if kind == "save":
         agent_state["info"] = agent_info(agent_for_tools(["edit_rfq"]) or routed_agent)
-        snapshot = edit_ctx["snapshot"] or {}
-        fields = sorted(chat_rfq_edit.changed_fields(draft, snapshot))
-        saved, err, changed = await execute_save_rfq_edit_call(
-            draft, snapshot, str(edit_ctx["id"]), db=db, user=user, assist=assist
+        snap = edit_ctx["snapshot"] or {}
+        changed_now = list(chat_rfq_edit.changed_fields(draft, snap))
+        new_hash = chat_conversation.draft_hash(draft)
+        # Saving needs a confirmed recap of the changes, unless the same message states the change and says save.
+        confirmed = (
+            not gating
+            or chat_permissions.edit_command_has_change(last_user_content)
+            or (recap_awaiting == "edit" and recap_hash == new_hash)
         )
-        title = str(snapshot.get("title") or "the RFQ")
-        step = {
-            "name": "update_rfq",
-            "title": "Saving RFQ Changes",
-            "status": "completed" if saved else "failed",
-            "args": {"title": saved["title"], "id": saved["id"], "fields": fields} if saved else {"error": err},
-        }
-        if err:
-            yield await finish(reply=f"⚠️ {err}", tool_step=step)
+        problem = False
+        if changed_now and not confirmed:  # an invalid or blocked change is reported now, not after a recap
+            try:
+                chat_rfq_edit.build_rfq_patch(draft, snap)
+            except rfq_tool_service.RFQDraftInvalid:
+                problem = True
+            problem = problem or bool(await assist.block_reason(draft))
+        if changed_now and not confirmed and not problem:
+            wants_publish = bool(lifecycle.get("publish"))
+            state_patch.update(recap_hash=new_hash, recap_awaiting="edit", recap_publish=wants_publish or None)
+            yield await finish(reply=chat_conversation.build_edit_recap(draft, snap, changed_now, lang, publish=wants_publish))
             return
-        if not changed and not lifecycle.get("publish"):
-            yield await finish(reply=(
-                f"There is nothing to save: '{title}' is unchanged. Tell me what to change, "
-                "or say \"cancel edit\" to leave edit mode."
-            ))
-            return
-        result, reply = None, ""
-        if saved:
-            result = saved
-            title = saved["title"]
-            reply = f"✅ **RFQ Updated:** '{title}' (ID: `{saved['id']}`) saved. Changed: {', '.join(f.replace('_', ' ') for f in fields)}."
-        if lifecycle.get("publish") and (saved is None or saved["status"] == "draft"):
-            published, perr = await execute_publish_rfq_call(
-                rfq_id_str=str(edit_ctx["id"]), conversation=conversation, db=db, user=user
-            )
-            if published:
-                result = published
-                reply = (reply + "\n\n" if reply else "") + _published_text(published)
-                step = {"name": "publish_rfq", "title": "Publishing Marketplace RFQ", "status": "completed",
-                        "args": {"title": published["title"], "id": published["id"]}}
-            else:
-                reply = (reply + "\n\n" if reply else "") + f"⚠️ {perr}"
-        draft.clear()
-        readiness = rfq_tool_service.evaluate_rfq_readiness(draft)
-        state_patch.update(editing_rfq_id=None, editing_snapshot=None)
-        edit_ctx.update(id=None, snapshot=None)
+        publish_after = bool(lifecycle.get("publish")) or bool(
+            gating and recap_awaiting == "edit" and recap_hash == new_hash and state.get("recap_publish")
+        )
+        reply, step, result, done, _ok = await _save_edit_flow(
+            draft, edit_ctx["snapshot"] or {}, str(edit_ctx["id"]), publish_after,
+            conversation, db, user, assist,
+        )
+        if done:
+            draft.clear()
+            readiness = rfq_tool_service.evaluate_rfq_readiness(draft)
+            state_patch.update(editing_rfq_id=None, editing_snapshot=None, **_CONVO_RESET)
+            edit_ctx.update(id=None, snapshot=None)
         yield await finish(reply=reply, tool_step=step, created=result)
         return
 
@@ -2750,17 +3026,36 @@ async def _run_chat_turn(
 
     if "create_rfq" in allowed:
         agent_state["info"] = agent_info(agent_for_tools(["create_rfq"]) or routed_agent)
+        explicit_draft = recap_reply == "draft" or chat_permissions.wants_draft_status(last_user_content)
+        # The user must have seen what will be posted: the recap of this exact draft, or an explicit "save as draft".
+        confirmed = (
+            not gating or bool(forced_create) or explicit_draft
+            or (recap_awaiting == "create" and recap_hash == chat_conversation.draft_hash(draft))
+        )
+        if (
+            readiness["has_role"] and readiness["has_product"] and not confirmed
+            and not await assist.block_reason(draft)  # unsafe content is refused by the create call, not recapped
+        ):
+            auto = state.get("auto_role") or state_patch.get("auto_role")
+            note = auto if auto and not state.get("auto_role_noted") else None
+            state_patch.update(
+                recap_hash=chat_conversation.draft_hash(draft), recap_awaiting="create", last_asked=None,
+                **({"auto_role_noted": True} if note else {}),
+            )
+            yield await finish(reply=chat_conversation.build_recap(draft, lang, role_note=note))
+            return
         if readiness["has_role"] and readiness["has_product"]:
             yield ChatEvent("status", wire(
                 thinking="User requested to finalize and publish RFQ. Validating required fields and submitting listing to marketplace database..."
             ))
-            create_args = {"status": "draft"} if chat_permissions.wants_draft_status(last_user_content) else {}
+            create_args = {"status": "draft"} if explicit_draft else {}
             created, err = await execute_create_rfq_call(draft, create_args, db=db, user=user, assist=assist)
             step = create_step(created, err)
             yield ChatEvent("tool_step", wire(tool_step=step, created=created))
             reply = format_created_rfq_text(created) if created else f"⚠️ {err or 'Failed to create RFQ.'}"
             if created:
                 state_patch["last_created_rfq_id"] = created["id"]
+                state_patch.update(_CONVO_RESET)
                 draft.clear()  # the RFQ exists now; a second "create" must start from a fresh draft
                 readiness = rfq_tool_service.evaluate_rfq_readiness(draft)
             yield await finish(
@@ -2799,6 +3094,32 @@ async def _run_chat_turn(
             reply = f"⚠️ {err or 'Could not close the RFQ.'}"
         yield await finish(reply=reply, tool_step=step, created=closed)
         return
+
+    def conversation_tail(reply_text: str) -> str:
+        """The deterministic end of a drafting reply: the one next question, or the recap once everything is asked."""
+        if not drafting_turn or role_refused or not draft:
+            return ""
+        field = pick_next()
+        if field == "recap":
+            if assist.current_warning(draft):
+                return ""
+            h = chat_conversation.draft_hash(draft)
+            if recap_awaiting == "create" and recap_hash == h:
+                return "" if "?" in reply_text else chat_conversation.recap_question(lang)
+            auto = state.get("auto_role") or state_patch.get("auto_role")
+            note = auto if auto and not state.get("auto_role_noted") else None
+            state_patch.update(
+                recap_hash=h, recap_awaiting="create", last_asked=None, asked_fields=dict(asked),
+                **({"auto_role_noted": True} if note else {}),
+            )
+            return chat_conversation.build_recap(draft, lang, role_note=note)
+        asked[field] = asked.get(field, 0) + 1
+        state_patch.update(asked_fields=dict(asked), last_asked=field)
+        if "?" in reply_text:
+            return ""
+        return chat_conversation.question_text(
+            field, {**draft, "role": draft.get("role") or sole_role}, assist.suggestions, lang
+        )
 
     # ---- answer: read tools + allowed action tools ----------------------
     captured_tool_step: Optional[dict[str, Any]] = None
@@ -2872,6 +3193,7 @@ async def _run_chat_turn(
         lock_role()
         chat_draft_assist.must_match_from_text(draft, last_user_content)
         chat_draft_assist.apply_spec_suggestions(draft, assist.suggestions.get("specs"))
+        enforce_account_role()  # the model may have recorded a role this account cannot post
         if not runner.created_rfq_obj:
             await assist.refresh(draft)  # a product or text the model just recorded
         readiness = rfq_tool_service.evaluate_rfq_readiness(draft)
@@ -2995,6 +3317,7 @@ async def _run_chat_turn(
             )
         elif created_rfq_obj:
             state_patch["last_created_rfq_id"] = created_rfq_obj["id"]
+            state_patch.update(_CONVO_RESET)
             draft.clear()
             readiness = rfq_tool_service.evaluate_rfq_readiness(draft)
             yield await finish(
@@ -3009,14 +3332,23 @@ async def _run_chat_turn(
             )
             if wants_links and "/marketplace?rfq=" not in total_content and not total_content.startswith("⚠️"):
                 appendix = build_rfq_link_appendix(tool_cards)
+            tail = conversation_tail(total_content)
+            if tail:
+                assist.note_reply(tail)
+                appendix = f"{appendix}\n\n{tail}" if appendix else f"\n\n{tail}"
             yield await finish(
                 reply=total_content + appendix, wire_content=appendix, thinking=thinking,
                 tool_step=captured_tool_step, cards=cards_state["match_cards"] or tool_cards or None,
             )
         else:
-            yield await finish(
-                reply=format_rfq_summary_text(draft, readiness), thinking=thinking, tool_step=captured_tool_step
-            )
+            tail = conversation_tail("")
+            if tail:
+                assist.note_reply(tail)
+                ack = "Theek hai, note kar liya." if lang == "hinglish" else "Noted."
+                summary = f"{ack}\n\n{tail}"
+            else:
+                summary = format_rfq_summary_text(draft, readiness)
+            yield await finish(reply=summary, thinking=thinking, tool_step=captured_tool_step)
     except httpx.TimeoutException:
         yield await finish(kind="error", reply=_TIMED_OUT, tool_step=captured_tool_step)
     except Exception as exc:

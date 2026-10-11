@@ -372,6 +372,13 @@ async def test_ai_chat_create_rfq_execution(client: AsyncClient, make_actor):
         },
     )
     assert res.status_code == 200
+    recap = res.json()
+    assert recap["created_rfq"] is None and "Shall I publish it now" in recap["reply"]  # confirm first
+    res = await actor.post(
+        "/ai-chat/message",
+        json={"messages": [{"role": "user", "content": "yes"}], "conversation_id": recap["conversation_id"]},
+    )
+    assert res.status_code == 200
     data = res.json()
     assert data["created_rfq"] is not None
     assert "id" in data["created_rfq"]
@@ -404,6 +411,13 @@ async def test_ai_chat_create_this_rfq_exact_phrase(client: AsyncClient, make_ac
             ],
             "current_rfq": draft,
         },
+    )
+    assert res.status_code == 200
+    recap = res.json()
+    assert recap["created_rfq"] is None and "Shall I publish it now" in recap["reply"]  # confirm first
+    res = await actor.post(
+        "/ai-chat/message",
+        json={"messages": [{"role": "user", "content": "create this RFQ"}], "conversation_id": recap["conversation_id"]},
     )
     assert res.status_code == 200
     data = res.json()

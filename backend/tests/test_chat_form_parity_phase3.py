@@ -308,7 +308,9 @@ async def test_create_rfq_tool_refuses_unsafe_listing():
 async def test_safe_listing_still_creates_and_moderation_is_cached(client, db, make_actor):
     user = await make_actor("buyer")
     with _Helpers() as h, patch("services.answer_engine._chat", side_effect=AssertionError("no model")):
-        data = await _msg(user, "create the rfq", BASE)
+        recap = await _msg(user, "create the rfq", BASE)
+        assert recap["created_rfq"] is None and "Shall I publish it now" in recap["reply"]
+        data = await _msg(user, "yes", cid=recap["conversation_id"])
     assert data["created_rfq"]
     assert h.mod.await_count == 1  # checked once, create reused the cache
     assert data["draft_moderation"] is None  # draft cleared after create

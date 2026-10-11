@@ -167,6 +167,12 @@ async def test_server_draft_wins_over_client_draft_and_is_cleared_after_create(c
             "messages": [{"role": "user", "content": "create the rfq"}], "current_rfq": BASE,
         })
     assert res.status_code == 200, res.text
+    recap = res.json()
+    assert recap["created_rfq"] is None and "Shall I publish it now" in recap["reply"]  # the recap comes first
+    res = await user.post("/ai-chat/message", json={
+        "messages": [{"role": "user", "content": "yes"}], "conversation_id": recap["conversation_id"],
+    })
+    assert res.status_code == 200, res.text
     data = res.json()
     assert data["created_rfq"] and data["created_rfq"]["title"] == "Basmati Rice"
     assert data["rfq_draft"] == {}

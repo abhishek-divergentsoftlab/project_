@@ -102,13 +102,19 @@ _QUESTION_START_RE = re.compile(
     re.IGNORECASE,
 )
 _BARE_AFFIRMATIVE_RE = re.compile(
-    r"^\s*(yes|yeah|yep|yup|ok|okay|sure|haan|han|ha|ji|ji\s+haan|confirm|confirmed|go\s+ahead|do\s+it)\s*[.!]*\s*$",
+    r"^\s*(yes|yeah|yep|yup|ok|okay|sure|haan|han|ha|ji|ji\s+haan|confirm|confirmed|go\s+ahead|do\s+it|theek\s+hai|thik\s+hai|sahi\s+hai|haan\s+ji|kar\s+do|kardo)\s*[.!]*\s*$",
     re.IGNORECASE,
 )
 _NON_RFQ_OBJECT_RE = re.compile(
     r"\b(message|msg|mail|email|letter|note|reply|description|table|summary|list|chart|report)\b", re.IGNORECASE
 )
 _ASKED_TO_CREATE_RE = re.compile(r"\b(create|publish|post|submit|raise)\b", re.IGNORECASE)
+# The recap question ends a draft summary: "Shall I publish it now, or save it as a draft?" /
+# "Ise abhi publish karun ya draft mein save karun?". A bare "yes" after it confirms creating the RFQ.
+_PROPOSES_RECAP_RE = re.compile(
+    r"\bshall\s+i\s+publish\b|\bpublish\s+karun\b|\bsave\s+it\s+as\s+a\s+draft\b|\bdraft\s+mein\s+save\s+karun\b",
+    re.IGNORECASE,
+)
 
 
 # "save as draft", "keep it as a draft", "draft me save karo", "draft bana do".
@@ -171,7 +177,7 @@ def check_create_rfq_intent(user_message: str, previous_assistant: Optional[str]
     if is_question(text) and not _CREATE_REQUEST_QUESTION_RE.search(text):
         return False
     if previous_assistant is not None and _BARE_AFFIRMATIVE_RE.match(text):
-        return bool(_ASKED_TO_CREATE_RE.search(previous_assistant))
+        return bool(_ASKED_TO_CREATE_RE.search(previous_assistant) or _PROPOSES_RECAP_RE.search(previous_assistant))
     # "create a message for the seller", "message bana do": the object is not the RFQ.
     if _NON_RFQ_OBJECT_RE.search(text) and not re.search(r"\b(rfq|listing)\b", text, re.IGNORECASE):
         return False
@@ -240,7 +246,9 @@ def close_rfq_target(message: str) -> Optional[str]:
 # ---- publish a saved draft RFQ, edit a saved RFQ ---------------------------
 _PUBLISH_WORD_RE = re.compile(r"\b(publish|post|go\s+live|live)\b", re.IGNORECASE)
 _PROPOSES_PUBLISH_RE = re.compile(r"\b(publish|post|go\s+live)\b", re.IGNORECASE)
-_PROPOSES_SAVE_RE = re.compile(r"\bsave\b[^.?!]{0,40}\b(changes|edits|updates|it)\b", re.IGNORECASE)
+_PROPOSES_SAVE_RE = re.compile(
+    r"\bsave\b[^.?!]{0,40}\b(changes|edits|updates|it)\b|\b(changes|edits)\s+save\s+karun\b", re.IGNORECASE
+)
 _RFQ_OBJECT = r"(?:rfqs?|listings?|postings?|requirements?)"
 _UUID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.IGNORECASE)
 _POLITE_RE = r"^\s*(please\s+)?(can|could|would|will)\s+(you|u)\s+(please\s+)?"
@@ -374,10 +382,19 @@ _EDIT_FIELD_WORDS_RE = re.compile(
 )
 
 
+# "price 50 kar do", "qty 600": a field word followed by its new value.
+_EDIT_FIELD_VALUE_RE = re.compile(
+    r"\b(?:price|rate|cost|budget|qty|quantity|moq)\b\s*(?:to|=|:|-)?\s*(?:inr|rs\.?|usd|eur|\u20b9|\$)?\s*\d",
+    re.IGNORECASE,
+)
+
+
 def edit_command_has_change(message: str) -> bool:
     """The edit command also states the change ("change the quantity of my rice RFQ to 600 kg")."""
     text = _UUID_RE.sub(" ", message or "")
-    return bool(DRAFT_FIELD_UPDATE_RE.search(text) or _EDIT_FIELD_WORDS_RE.search(text))
+    return bool(
+        DRAFT_FIELD_UPDATE_RE.search(text) or _EDIT_FIELD_WORDS_RE.search(text) or _EDIT_FIELD_VALUE_RE.search(text)
+    )
 
 
 # Saving edits: only meaningful while an RFQ is being edited.
@@ -386,6 +403,8 @@ _SAVE_EDIT_REGEXES = [
     for p in [
         r"^\s*(ok(ay)?\s*,?\s*)?(please\s+)?(save|update|apply|submit|done|confirm)(\s+(it|this|that|the\s+changes|changes|my\s+changes|all|the\s+rfq|rfq))?\s*[.!]*\s*$",
         r"\b(save|apply|confirm|commit)\s+(the\s+|my\s+|these\s+|all\s+)?(changes|edits|updates)\b",
+        # "set price to 50 and save", "change qty to 600 then save it": a change with the save in the same message
+        r"\b(?:and|then|&|plus|aur|phir)\s+(?:please\s+)?(?:save|apply|confirm)(?:\s+(?:it|this|that|the\s+changes|changes|all))?\s*[.!]*\s*$",
         r"\bdone\s*,?\s*(please\s+)?(save|update)\b",
         r"\b(update|save)\s+(it|this|that|the\s+rfq|my\s+rfq)\b",
         r"\b(looks\s+good|that'?s\s+all)\s*,?\s*(please\s+)?(save|update)\b",

@@ -236,7 +236,9 @@ async def test_publish_with_chat_draft_creates_instead_of_publishing(client, db,
     user = await make_actor("buyer")
     existing = await _draft_rfq(make_rfq, user, title="Old draft", product="wheat")
     with _Helpers(), NO_MODEL:
-        data = await _msg(user, "publish it", BASE)
+        recap = await _msg(user, "publish it", BASE)
+        assert recap["created_rfq"] is None and "Shall I publish it now" in recap["reply"]
+        data = await _msg(user, "publish", cid=recap["conversation_id"])
     assert data["created_rfq"]["id"] != existing["id"] and data["created_rfq"]["status"] == "active"
     assert (await _row(db, existing["id"])).status == "draft"
     assert await _count(db) == 2
@@ -322,7 +324,9 @@ async def test_edit_with_change_in_same_message_then_save_sends_only_changed_fie
         return await real(db_, rfq_, payload)
 
     with _Helpers(), NO_MODEL, patch.object(rfq_service, "update_rfq", spy):
-        saved = await _msg(user, "save changes", cid=data["conversation_id"])
+        recap = await _msg(user, "save changes", cid=data["conversation_id"])
+        assert "Quantity:** 500 kg -> 600 kg" in recap["reply"] and not seen  # changed fields only, nothing saved yet
+        saved = await _msg(user, "yes", cid=data["conversation_id"])
     assert len(seen) == 1
     assert set(seen[0].model_dump(exclude_unset=True)) == {"quantity"}
     assert "RFQ Updated" in saved["reply"] and saved["created_rfq"]["id"] == rfq["id"]
@@ -386,7 +390,9 @@ async def test_save_and_publish_an_edited_draft(client, db, make_actor, make_rfq
     with _Helpers(), _tool_chat({"quantity_value": 700, "quantity_unit": "kg"}):
         first = await _msg(user, "change the quantity of my rice RFQ to 700 kg")
     with _Helpers(), NO_MODEL:
-        data = await _msg(user, "publish it", cid=first["conversation_id"])
+        recap = await _msg(user, "publish it", cid=first["conversation_id"])
+        assert "Save these changes and publish" in recap["reply"] and recap["editing_rfq_id"] is not None
+        data = await _msg(user, "yes", cid=first["conversation_id"])
     assert "RFQ Updated" in data["reply"] and "RFQ Published" in data["reply"]
     assert data["created_rfq"]["status"] == "active" and data["editing_rfq_id"] is None
     row = await _row(db, rfq["id"])
@@ -449,3 +455,49 @@ async def test_stream_done_payload_carries_editing_rfq_id(client, db, make_actor
     chunks = [json.loads(l[6:]) for l in res.text.splitlines() if l.startswith("data: ") and l[6:].strip().startswith("{")]
     done = [c for c in chunks if c.get("done")]
     assert done and done[-1]["editing_rfq_id"] == rfq["id"]
+
+
+# ---- inline change in the same message as an edit / save command ------------------------
+async def test_edit_command_with_change_applies_without_the_model(client, db, make_actor, make_rfq):
+    user = await make_actor("buyer")
+    rfq = await _draft_rfq(make_rfq, user)
+
+    with _Helpers(), _script("Okay."):  # the model says nothing useful and calls no tool
+        data = await _msg(user, "change the quantity of my rice RFQ to 600 kg")
+    assert data["editing_rfq_id"] == rfq["id"]
+    d = data["rfq_draft"]
+    assert d["quantity"] == {"value": 600, "unit": "kg"}
+    assert d["product_details"]["name"].lower() == "basmati rice" and d["role"] == "buyer"
+    assert d["category"] == "Agriculture" and d["title"] == "Rice 500 kg"
+
+
+async def test_set_price_and_save_applies_then_saves(client, db, make_actor, make_rfq):
+    user = await make_actor("buyer")
+    rfq = await _draft_rfq(make_rfq, user)
+    with _Helpers(), _script("ok"):
+        first = await _msg(user, "edit my rice rfq")
+    cid = first["conversation_id"]
+    seen = []
+    real = rfq_service.update_rfq
+
+    async def spy(db_, rfq_, payload):
+        seen.append(payload)
+        return await real(db_, rfq_, payload)
+
+    with _Helpers(), NO_MODEL, patch.object(rfq_service, "update_rfq", spy):
+        data = await _msg(user, "set price to 75 INR per kg and save changes", cid=cid)
+    assert len(seen) == 1 and set(seen[0].model_dump(exclude_unset=True)) == {"price_target"}
+    assert "RFQ Updated" in data["reply"] and data["editing_rfq_id"] is None
+    assert float((await _row(db, rfq["id"], "price_amount")).price_amount) == 75
+
+
+def test_inline_change_never_touches_product_category_or_role():
+    draft = {"role": "buyer", "category": "Agriculture", "product_details": {"name": "Basmati Rice"}}
+    applied = ai_chat_service.apply_inline_changes(draft, "update my rice rfq to sell wheat 20 tonnes in Pune")
+    assert draft["role"] == "buyer" and draft["category"] == "Agriculture"
+    assert draft["product_details"] == {"name": "Basmati Rice"}
+    assert set(applied) <= {"quantity", "price_target", "location", "deadline"}
+    assert ai_chat_service.apply_inline_changes({}, "edit my rice rfq") == []
+    d = {}
+    ai_chat_service.apply_inline_changes(d, "set price to 50")
+    assert "quantity" not in d  # a bare price figure is not a quantity

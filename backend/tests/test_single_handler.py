@@ -120,7 +120,14 @@ async def test_close_rfq_shortcut_works_on_message_and_stream(client, db, make_a
 
 
 async def test_create_rfq_shortcut_is_identical_on_both_endpoints(client, db, make_actor, make_rfq):
+    # An unconfirmed "create the rfq" shows the recap on both endpoints; a draft save is explicit, so it creates.
     body = {"messages": [{"role": "user", "content": "create the rfq"}], "current_rfq": RICE_DRAFT}
+    with patch("services.answer_engine._chat", side_effect=AssertionError("model must not be called")):
+        recap_msg, recap_stream = await _run_both(make_actor, db, make_rfq, body)
+    assert not recap_msg["created"] and not recap_stream["created"]
+    assert "Shall I publish it now" in recap_msg["text"]
+    assert _normalise(recap_msg) == _normalise(recap_stream)
+    body = {"messages": [{"role": "user", "content": "save it as a draft"}], "current_rfq": RICE_DRAFT}
     with patch("services.answer_engine._chat", side_effect=AssertionError("model must not be called")):
         msg, stream = await _run_both(make_actor, db, make_rfq, body)
     assert msg["created"] and stream["created"]
