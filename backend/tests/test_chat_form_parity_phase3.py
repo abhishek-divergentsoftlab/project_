@@ -114,7 +114,8 @@ async def test_suggestion_is_stored_not_applied_and_offered_in_prompt(client, db
     assert st["draft_suggestions"]["hsn_for"] == "Basmati Rice"
     assert "hsn_code" not in (st["rfq_draft"].get("product_details") or {})
     assert data["draft_suggestions"]["hsn"]["code"] == "1006"
-    assert any("Suggested HSN 1006" in s for s in seen)
+    # The suggestion is fetched while the model works, so this turn's prompt cannot carry it; the flow makes the offer.
+    assert "Suggested HSN 1006" in data["reply"]
     # Offered once: the reply quoted the code, so the next prompt does not re-offer.
     assert st["draft_suggestions"].get("hsn_offered") is True
 
@@ -219,7 +220,9 @@ async def test_specs_stored_and_unfilled_labels_in_prompt(client, db, make_actor
     assert [s["label"] for s in st["draft_suggestions"]["specs"]] == ["Grade", "Origin"]
     assert st["draft_suggestions"]["specs_for"] == "Basmati Rice"
     assert data["draft_suggestions"]["specs"]
-    assert any("Grade, Origin" in s for s in seen)
+    # the questions are the flow's: the model is not told to ask about specs (the price question comes first here)
+    assert not any("Optional specifications" in s for s in seen)
+    assert "target price" in data["reply"]
 
 
 async def test_spec_value_filed_under_label_with_preset_must_match(client, db, make_actor):
@@ -293,7 +296,7 @@ async def test_unsafe_turn_appends_warning_to_reply(client, db, make_actor):
     user = await make_actor("buyer")
     with _Helpers(mod=UNSAFE), _script("Noted, anything else?"):
         data = await _msg(user, "I need 600 kg for delivery in Indore", BASE)
-    assert data["reply"].startswith("Noted, anything else?")
+    assert data["reply"].startswith("Added: ") and "Noted, anything else?" not in data["reply"]  # the flow asks, not the model
     assert "may violate our content policy: Prohibited item: weapons" in data["reply"]
 
 
@@ -387,7 +390,7 @@ async def test_turn_survives_all_helpers_failing(client, db, make_actor):
     with patch.object(cda, "_fetch_hsn_suggestion", boom), patch.object(cda, "_fetch_spec_suggestions", boom), \
          patch.object(cda, "_fetch_moderation", boom), _script("Which city?"):
         data = await _msg(user, "I need 600 kg for delivery in Indore", BASE)
-    assert data["reply"] == "Which city?"
+    assert data["reply"].endswith("Which city?") and "RFQ draft" not in data["reply"]
 
 
 async def test_nothing_runs_without_a_product():

@@ -15,6 +15,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional, Union
 
@@ -27,6 +28,7 @@ from services import answer_verifier, drafting_reply, market_data_tools, rfq_too
 from services.answer_verifier import Verification
 
 logger = logging.getLogger(__name__)
+timing_log = logging.getLogger("chat.timing")
 
 MAX_TOOL_ROUNDS = 4
 DRAFT_ACTION_TOOLS = frozenset({"update_rfq_draft", "create_rfq"})
@@ -42,8 +44,9 @@ class AnswerContext:
     rfq_id: Optional[str] = None
     # The live RFQ draft; its values may be repeated back to the user.
     draft: Union[None, dict[str, Any], Callable[[], dict[str, Any]]] = None
-    # Other text whose numbers the answer may quote (e.g. the matched-candidate cards in the prompt).
-    extra_allowed_text: str = ""
+    # Other text whose numbers the answer may quote (e.g. the matched-candidate cards in the prompt, the suggested specs
+    # and their options). A callable is read when the answer is verified, so late-arriving facts still count.
+    extra_allowed_text: Union[str, Callable[[], str]] = ""
     on_progress: Optional[ProgressCallback] = None
     # True when the user is drafting an RFQ this turn (parser intent buy_request / sell_offer).
     drafting: bool = False
@@ -53,6 +56,12 @@ class AnswerContext:
     # The conversation's next step for the live draft, used by the drafting fallback reply: the next
     # question, "" when the caller appends the recap itself, None when there is no flow (legacy wording).
     drafting_closing: Optional[Callable[[dict[str, Any]], Optional[str]]] = None
+    # Awaited just before an answer is verified: the caller's background work (the draft helpers' suggestions) that
+    # feeds ``extra_allowed_text`` is finished by then, so a suggestion the reply quotes is never "unverified".
+    before_verify: Optional[Callable[[], Awaitable[None]]] = None
+    # The caller words the whole reply itself (a drafting turn: the acknowledgement is computed from the draft), so
+    # once the model's tool calls have been run there is no second model call for text.
+    tool_round_only: bool = False
 
 
 @dataclass
@@ -97,7 +106,9 @@ async def _chat(messages: list[dict[str, Any]], tools: Optional[list[dict[str, A
         payload["tools"] = tools
     url = f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/chat"
     async with httpx.AsyncClient(timeout=float(settings.AI_CHAT_TIMEOUT_SECONDS)) as client:
+        started = time.perf_counter()
         response = await client.post(url, json=payload)
+    timing_log.debug("model call %.2fs (tools offered: %s)", time.perf_counter() - started, bool(tools))
     if response.status_code != 200:
         raise RuntimeError(f"Ollama returned HTTP {response.status_code}")
     return response.json().get("message") or {}
@@ -129,8 +140,11 @@ async def _run_rounds(
     action_results: list[dict[str, Any]],
     context: Optional[AnswerContext],
     thinking_out: list[str],
+    tool_round_only: bool = False,
 ) -> str:
-    """Call the model, run its tool calls, repeat; returns the final text (may be empty)."""
+    """Call the model, run its tool calls, repeat; returns the final text (may be empty).
+
+    With ``tool_round_only`` the loop ends after the first round that made tool calls, with no text."""
     for round_no in range(1, max_rounds + 1):
         message = await _chat(messages, tools)
         if message.get("thinking"):
@@ -161,6 +175,8 @@ async def _run_rounds(
             else:
                 logger.warning("Skipping tool call '%s' that was not offered", name)
                 messages.append(_tool_message(name, {"ok": False, "error": f"tool '{name}' is not available"}))
+        if tool_round_only:
+            return ""
 
     # Rounds exhausted: ask for the answer without offering tools again.
     message = await _chat(messages, None)
@@ -229,7 +245,10 @@ async def answer(
     earlier_user_text = "\n".join(
         str(m.get("content") or "") for m in history_messages if isinstance(m, dict) and m.get("role") == "user"
     )
-    extra_text = "\n".join(t for t in ((context.extra_allowed_text if context else ""), earlier_user_text) if t)
+    def _extra_text() -> str:
+        extra_ctx = context.extra_allowed_text if context else ""
+        extra_ctx = extra_ctx() if callable(extra_ctx) else extra_ctx
+        return "\n".join(t for t in (extra_ctx, earlier_user_text) if t)
 
     def _current_draft() -> Optional[dict[str, Any]]:
         d = context.draft if context else None
@@ -268,10 +287,10 @@ async def answer(
         text = await _run_rounds(
             db, user, messages, tools, max_rounds=MAX_TOOL_ROUNDS, action_names=action_names,
             tool_executor=tool_executor, tool_results=tool_results, action_results=action_results,
-            context=context, thinking_out=thinking,
+            context=context, thinking_out=thinking, tool_round_only=bool(context and context.tool_round_only),
         )
         if not text:
-            if tool_results:
+            if tool_results and not (context and context.tool_round_only):
                 return _fallback()
             return AnswerResult(
                 text="", tool_results=tool_results, verification=check,
@@ -280,8 +299,10 @@ async def answer(
             )
 
         await _progress(context, {"event": "verifying"})
+        if context and context.before_verify:
+            await context.before_verify()
         check = answer_verifier.verify(
-            text, _verification_inputs(tool_results, action_results), user_message, _verification_draft(), extra_text
+            text, _verification_inputs(tool_results, action_results), user_message, _verification_draft(), _extra_text()
         )
         if not check.ok:
             logger.info("Answer failed verification (%s); retrying once", check.problems())
@@ -294,7 +315,7 @@ async def answer(
                 context=context, thinking_out=thinking,
             )
             check = answer_verifier.verify(
-                text, _verification_inputs(tool_results, action_results), user_message, _verification_draft(), extra_text
+                text, _verification_inputs(tool_results, action_results), user_message, _verification_draft(), _extra_text()
             )
             if not check.ok or not text:
                 logger.warning("Answer failed verification twice; using facts-only answer")

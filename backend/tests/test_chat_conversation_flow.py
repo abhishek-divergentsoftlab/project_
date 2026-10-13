@@ -324,14 +324,15 @@ async def test_model_question_is_kept_and_only_one_question_is_appended_when_it_
     assert silent["reply"].count("?") == 1 and "price" in silent["reply"].lower()
 
 
-async def test_prompt_directive_names_exactly_one_question(client, db, make_actor):
+async def test_prompt_directive_only_acknowledges_and_the_flow_asks_exactly_one_question(client, db, make_actor):
     user = await make_actor("buyer")
     seen: list[str] = []
     with _Helpers(), _script("Noted.", seen=seen):
-        await _msg(user, "I want to buy basmati rice 500 kg")
+        d = await _msg(user, "I want to buy basmati rice 500 kg")
     prompt = seen[0]
-    assert "ask only this" in prompt and "target price per unit" in prompt
-    assert "delivery location" not in prompt.split("ask only this")[1]
+    assert "ONE short sentence" in prompt and "Do NOT ask any question" in prompt and "ask only this" not in prompt
+    # the question is appended by the flow, once, and only that one
+    assert d["reply"].count("?") == 1 and "target price per unit" in d["reply"] and "delivery location" not in d["reply"]
 
 
 async def test_suggested_specs_are_asked_in_one_question_then_the_hsn_offer(client, db, make_actor):
@@ -346,10 +347,11 @@ async def test_suggested_specs_are_asked_in_one_question_then_the_hsn_offer(clie
         cid = d["conversation_id"]
         assert "tell me a few specs" in d["reply"]
         assert "• Grain Length — Long, Extra long" in d["reply"] and "• Moisture" in d["reply"]
+        # the HSN suggestion is offered in one line right after the spec question, in the same reply
+        assert "Suggested HSN 100630 \u2013 Rice. Reply 'yes' to use it." in d["reply"]
+        assert d["reply"].index("• Moisture") < d["reply"].index("Suggested HSN")
         d = await _msg(user, "skip", cid=cid)
-        assert "HSN 100630" in d["reply"] and "tell me a few specs" not in d["reply"]
-        d = await _msg(user, "skip", cid=cid)
-        assert RECAP_Q in d["reply"]
+        assert RECAP_Q in d["reply"] and "tell me a few specs" not in d["reply"]
 
 
 async def test_non_drafting_questions_get_no_appended_question(client, db, make_actor):

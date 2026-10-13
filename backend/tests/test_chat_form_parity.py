@@ -188,7 +188,8 @@ async def test_server_draft_wins_over_client_draft_and_is_cleared_after_create(c
         })
     assert res2.status_code == 200, res2.text
     assert not res2.json()["created_rfq"]
-    assert "Role" in res2.json()["reply"] or "Product" in res2.json()["reply"]
+    # the RFQ was created in this conversation: the answer says so instead of asking for a role and a product again
+    assert "already published" in res2.json()["reply"] and "Basmati Rice" in res2.json()["reply"]
 
 
 @pytest.mark.asyncio

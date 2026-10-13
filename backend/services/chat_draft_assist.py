@@ -22,7 +22,9 @@ from services.categories import normalize_category
 
 logger = logging.getLogger(__name__)
 
-HSN_TIMEOUT = 3.0  # same budget as rfq_service.HSN_AI_TIMEOUT
+HSN_TIMEOUT = 3.0  # how long ONE TURN waits for the HSN suggestion at first; the fetch itself keeps running
+HSN_TASK_BUDGET = 20.0  # the background fetch's own budget (the model call it makes queues behind the chat model's)
+HSN_SETTLE_WAIT = 8.0  # extra wait, before the reply offers the suggestion, for a fetch that is still running
 SPECS_TIMEOUT = 5.0  # how long ONE TURN waits for the spec suggestions; the fetch itself keeps running
 SPECS_TASK_BUDGET = 30.0  # the background fetch's own budget
 SPECS_RECAP_WAIT = 8.0  # extra wait, before a recap, for a fetch that is still running
@@ -325,13 +327,72 @@ def cached_specs(key: SpecKey) -> Optional[list[dict[str, Any]]]:
 
 def reset_spec_state() -> None:
     """Forget cached results and cancel running fetches (tests, shutdown)."""
-    for task in list(_spec_tasks.values()):
+    for task in [*_spec_tasks.values(), *_hsn_tasks.values()]:
         try:
             task.cancel()
         except Exception:  # the loop is already closed
             pass
     _spec_tasks.clear()
     _spec_cache.clear()
+    _hsn_tasks.clear()
+    _hsn_cache.clear()
+
+
+# ---------------------------------------------------------------------------
+# The HSN suggestion runs in the background too (it asks the model, which is busy with the chat reply meanwhile).
+# ---------------------------------------------------------------------------
+_hsn_tasks: dict[str, "asyncio.Task[Optional[dict[str, Any]]]"] = {}
+_hsn_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+
+
+def hsn_key(name: str) -> str:
+    return _norm_key(name)
+
+
+def cached_hsn(key: str) -> Optional[dict[str, Any]]:
+    hit = _hsn_cache.get(key)
+    if hit is None:
+        return None
+    if time.monotonic() - hit[0] > SPECS_CACHE_TTL:
+        _hsn_cache.pop(key, None)
+        return None
+    return hit[1]
+
+
+async def _hsn_job(key: str, name: str) -> Optional[dict[str, Any]]:
+    value = await asyncio.wait_for(_fetch_hsn_suggestion(name), timeout=HSN_TASK_BUDGET)
+    if isinstance(value, dict) and value.get("code"):
+        _hsn_cache[key] = (time.monotonic(), value)
+    return value if isinstance(value, dict) else None
+
+
+def running_hsn_task(key: str) -> Optional["asyncio.Task[Optional[dict[str, Any]]]"]:
+    task = _hsn_tasks.get(key)
+    if task is None:
+        return None
+    try:
+        if task.done() or task.get_loop() is not asyncio.get_running_loop():
+            _hsn_tasks.pop(key, None)
+            return None
+    except RuntimeError:
+        return None
+    return task
+
+
+def start_hsn_task(key: str, name: str) -> "asyncio.Task[Optional[dict[str, Any]]]":
+    task = running_hsn_task(key)
+    if task is None:
+        task = asyncio.create_task(_hsn_job(key, name))
+        _hsn_tasks[key] = task
+
+        def _done(t: "asyncio.Task[Any]", k: str = key) -> None:
+            if _hsn_tasks.get(k) is t:
+                _hsn_tasks.pop(k, None)
+            if not t.cancelled() and t.exception() is not None:
+                logger.debug("Chat HSN fetch failed: %s", t.exception())
+
+        task.add_done_callback(_done)
+    return task
 
 
 async def _spec_job(key: SpecKey, name: str, category: Optional[str], role: Optional[str]) -> list[dict[str, Any]]:
@@ -435,7 +496,11 @@ class DraftAssist:
             sug["hsn"] = None
             sug["hsn_for"] = name
         elif sug.get("hsn_for") != name:
-            jobs["hsn"] = _guard(_fetch_hsn_suggestion(name), HSN_TIMEOUT, "hsn")
+            hit_hsn = cached_hsn(hsn_key(name))
+            if hit_hsn is not None:
+                self._take_hsn(name, (True, hit_hsn, True))
+            else:
+                jobs["hsn"] = self._wait_specs(start_hsn_task(hsn_key(name), name), HSN_TIMEOUT)
         if sug.get("specs_for") != name:
             key = spec_key(name, draft.get("category"), draft.get("role"))
             hit = cached_specs(key)
@@ -454,10 +519,7 @@ class DraftAssist:
         results = await asyncio.gather(*jobs.values())
         out = dict(zip(jobs.keys(), results))
         if "hsn" in out:
-            _ok, value = out["hsn"]
-            sug["hsn_for"] = name  # attempted: not recomputed until the product changes
-            sug["hsn"] = value
-            sug.pop("hsn_offered", None)
+            self._take_hsn(name, out["hsn"])
         if "specs" in out:
             self._take_specs(name, out["specs"])
             if sug.get("specs_for") != name:
@@ -486,6 +548,37 @@ class DraftAssist:
             return
         self.suggestions["specs_for"] = name
         self.suggestions["specs"] = value if ok and isinstance(value, list) else []
+
+    def _take_hsn(self, name: str, outcome: tuple[bool, Any, bool]) -> None:
+        """Record a finished HSN fetch (a failed one counts as attempted). One still running is picked up by a later turn."""
+        ok, value, finished = outcome
+        if not finished:
+            return
+        sug = self.suggestions
+        sug["hsn_for"] = name  # attempted: not recomputed until the product changes
+        sug["hsn"] = value if ok and isinstance(value, dict) else None
+        sug.pop("hsn_offered", None)
+        sug.pop("hsn_offers", None)
+
+    def hsn_pending(self, draft: dict[str, Any]) -> bool:
+        """True while the HSN fetch for this draft's product is still running."""
+        name = product_name(draft)
+        if not name or user_hsn(draft) or self.suggestions.get("hsn_for") == name:
+            return False
+        return running_hsn_task(hsn_key(name)) is not None
+
+    async def settle_hsn(self, draft: dict[str, Any], timeout: float = HSN_SETTLE_WAIT) -> None:
+        """Wait up to ``timeout`` for a running HSN fetch (before the reply that offers it)."""
+        name = product_name(draft)
+        if not name or user_hsn(draft) or self.suggestions.get("hsn_for") == name:
+            return
+        hit = cached_hsn(hsn_key(name))
+        if hit is not None:
+            self._take_hsn(name, (True, hit, True))
+            return
+        task = running_hsn_task(hsn_key(name))
+        if task is not None:
+            self._take_hsn(name, await self._wait_specs(task, timeout))
 
     def specs_pending(self, draft: dict[str, Any]) -> bool:
         """True while the spec fetch for this draft's product is still running."""
@@ -545,13 +638,17 @@ class DraftAssist:
                 labels.append(label)
         return labels[:MAX_SPEC_PROMPTS]
 
-    def prompt_section(self, draft: dict[str, Any]) -> str:
+    def prompt_section(self, draft: dict[str, Any], flow_asks: bool = False) -> str:
+        """The helper facts for the model. With ``flow_asks`` the conversation flow makes every offer and asks every
+        question itself, so the model is told the suggestions only as facts (never to offer or ask)."""
         lines: list[str] = []
         hsn = self.pending_hsn
         if hsn and not user_hsn(draft):
             title = hsn.get("formatted_title") or hsn.get("description") or ""
             line = f"- Suggested HSN {hsn['code']} - {title} (category {hsn.get('category') or 'n/a'}); NOT applied yet."
-            if self.suggestions.get("hsn_offered"):
+            if flow_asks:
+                line += " The offer is added automatically after your reply: do not mention or offer it yourself."
+            elif self.suggestions.get("hsn_offered"):
                 line += " It was already offered; do not repeat the offer. Apply it only if the user agrees."
             else:
                 line += f" Offer it ONCE in one short sentence ('Suggested HSN {hsn['code']} - {title}; use it?')."
@@ -560,7 +657,7 @@ class DraftAssist:
             lines.append(f"- HSN {user_hsn(draft)} was just applied to the draft. Confirm it in one short sentence.")
         if hsn or user_hsn(draft):
             lines.append("- Never say that no HSN code was found while an HSN is listed above or applied to the draft.")
-        specs = self.unfilled_specs(draft)
+        specs = [] if flow_asks else self.unfilled_specs(draft)
         if specs:
             lines.append(
                 "- Optional specifications you may ask about (one short question, not all at once): " + ", ".join(specs)
@@ -573,8 +670,14 @@ class DraftAssist:
         return "\nDRAFT HELPERS (same assistance as the RFQ form):\n" + "\n".join(lines)
 
     def extra_allowed_text(self, draft: dict[str, Any]) -> str:
-        """Numbers the reply may quote: the suggested and the applied HSN code."""
+        """Numbers the reply may quote: the suggested and the applied HSN code, and the suggested specs with their
+        options (they are facts the assistant itself offered, like the HSN suggestion)."""
         parts: list[str] = []
+        for spec in self.suggestions.get("specs") or []:
+            if isinstance(spec, dict):
+                parts.append(" ".join(str(x) for x in (
+                    spec.get("label"), spec.get("key"), spec.get("placeholder"), *(spec.get("options") or [])
+                ) if x))
         hsn = self.pending_hsn
         if hsn:
             parts.append(f"HSN {hsn['code']} {hsn.get('description') or ''} {hsn.get('formatted_title') or ''}")

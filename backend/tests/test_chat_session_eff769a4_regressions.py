@@ -210,15 +210,16 @@ async def test_replayed_session_stays_buyer_asks_specs_and_creates_only_after_th
         details = d3["rfq_draft"]["product_details"]
         assert not CORE & {k.lower() for k in details}
         assert not any(isinstance(v, dict) for v in details.values())
-        assert details["pack_weight"] == "20 kg" and "pack_weight_kg" not in details
-        assert details["certification"] == ["organic", "fssai"] and details["organic"] is True
+        # The answer is filed by the deterministic layer (the model's tool call is cleaned and its duplicates dropped).
+        assert details["Pack Size"] == "20 kg" and "pack_weight" not in details and "pack_weight_kg" not in details
+        assert details["Certifications"] == "Organic, FSSAI" and details["Certifications__must_match"] is True
+        assert "certification" not in details and "organic" not in details
+        assert details["Variety"] == "Fuji" and not details.get("Variety__must_match")
+        assert "quality" not in details and not any("brix" in k.lower() for k in details)  # "minimum Brix lael": not stored
         assert d3["rfq_draft"]["price_target"]["per_unit"] == "kg"
         assert "Say 'create RFQ'" not in d3["reply"] and "create RFQ" not in d3["reply"]
-        assert d3["reply"].rstrip().endswith(RECAP_Q)
-        assert "**Target price:** USD 20 per kg" in d3["reply"] and "per per" not in d3["reply"]
-        specs_line = next(l for l in d3["reply"].splitlines() if "**Specs:**" in l)
-        assert "{" not in specs_line and "[" not in specs_line and "quantity_" not in specs_line and "price_" not in specs_line
-        assert "organic, fssai" in specs_line
+        assert d3["reply"].startswith("Added: ") and "Certifications Organic, FSSAI (must match)" in d3["reply"]
+        assert d3["reply"].rstrip().endswith("What minimum Brix do you need?")  # the garbled value is asked for, no recap yet
 
         # The real session never showed a recap after U3 (the fallback said "Say create RFQ"): forget the recap.
         await _set_state(db, recap_hash=None, recap_awaiting=None, recap_snapshot=None)
@@ -228,6 +229,10 @@ async def test_replayed_session_stays_buyer_asks_specs_and_creates_only_after_th
             d4 = await _msg(user, U4, cid=cid, log=log)
         assert d4["created_rfq"] is None and await _rfqs(db) == []
         assert d4["reply"].rstrip().endswith(RECAP_Q) and "published" not in d4["reply"].lower().replace("publish it now", "")
+        assert "**Target price:** USD 20 per kg" in d4["reply"] and "per per" not in d4["reply"]
+        specs_line = next(l for l in d4["reply"].splitlines() if "**Specs:**" in l)
+        assert "{" not in specs_line and "[" not in specs_line and "quantity_" not in specs_line and "price_" not in specs_line
+        assert "Certifications Organic, FSSAI (must match)" in specs_line and "Pack Size 20 kg" in specs_line
         assert d4["rfq_draft"]["role"] == "buyer"
         assert "grade" not in {k.lower() for k in d4["rfq_draft"]["product_details"]}
         st = await _state(db)
@@ -632,7 +637,8 @@ async def test_after_the_spec_answer_or_skip_the_recap_follows(client, db, make_
         d = await _msg(user, "variety fuji, grade A", cid=cid)
     assert d["reply"].rstrip().endswith(RECAP_Q) and "tell me a few specs" not in d["reply"]
     details = d["rfq_draft"]["product_details"]
-    assert details["Variety"] == "Fuji" and details["Variety__must_match"] is True and details["Grade"] == "A"
+    # filed from the user's words: must-match only when the user says "must" (the suggestion's preset is not applied)
+    assert details["Variety"] == "Fuji" and details["Variety__must_match"] is False and details["Grade"] == "A"
     assert "Size (mm)" not in details  # nothing is invented for a spec the user did not mention
     with _Helpers():
         d2 = await _msg(user, U1)
@@ -814,7 +820,7 @@ async def test_the_suggested_hsn_stays_grounded_and_a_no_hsn_claim_is_dropped(cl
              "quantity": {"value": 500.0, "unit": "kg"}}
     msg = "go on with it please"
     bad = "No HSN code found in marketplace data for bananas. The suggested code 0803 fits though."
-    with _BananaHelpers(specs=[]), Model().on("price 20 usd per kg", HSN_OFFER).on(msg, _tool({"product_details": {"name": "go on"}}), bad):
+    with _BananaHelpers(specs=[]), Model().on("price 20 usd per kg", HSN_OFFER).on(msg, bad):
         d1 = await _msg(user, "price 20 usd per kg", draft)
         d2 = await _msg(user, msg, cid=d1["conversation_id"])
     assert "No HSN code found" not in d2["reply"]
