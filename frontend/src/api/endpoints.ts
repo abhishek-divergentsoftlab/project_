@@ -403,6 +403,8 @@ export interface AIChatResponse {
   draft_moderation?: AIDraftModeration | null;
   /** Id of the saved RFQ being edited in this conversation (edit mode), if any. */
   editing_rfq_id?: string | null;
+  /** Short suggested answers rendered as quick-reply chips under the latest assistant message. */
+  quick_replies?: string[] | null;
 }
 
 export interface AIToolStep {
@@ -463,6 +465,8 @@ export interface AIChatChunk {
   editing_rfq_id?: string | null;
   /** When true, `content` replaces the text streamed so far instead of appending. */
   replace_content?: boolean;
+  /** Quick-reply chip texts; sent on the final chunk. */
+  quick_replies?: string[] | null;
   done: boolean;
 }
 
@@ -818,6 +822,14 @@ export interface HsnItem {
   is_service: boolean;
   aliases?: string;
   has_children?: boolean;
+  /** /hsn/search only: title that tells look-alike rows apart ("Apples — fresh"). */
+  display_title?: string | null;
+  /** Short qualifier from the nearest differing ancestor ("fresh", "dried"). */
+  context?: string | null;
+  parent_description?: string | null;
+  /** Shorter codes folded into this (most specific) row, e.g. ["080810"]. */
+  also_codes?: string[] | null;
+  recommended?: boolean | null;
 }
 
 export interface HsnChapterItem {

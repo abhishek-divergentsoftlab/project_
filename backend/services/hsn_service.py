@@ -395,3 +395,160 @@ def stored_hsn(product_details: Optional[dict]) -> Optional[str]:
 def resolve_hsn(product_details: Optional[dict], text: str) -> Optional[str]:
     """Stored HSN first, else the deterministic keyword prediction. Never the LLM."""
     return stored_hsn(product_details) or predict_hsn_from_text(text)
+
+
+# ---------------------------------------------------------------------------
+# HSN search post-processing: collapse tariff levels, disambiguate look-alike rows
+# ---------------------------------------------------------------------------
+
+# Short words that tell a user which "kind" of a product a tariff line is (checked in this order of
+# preference when the query matches several look-alike rows and we need to pick the recommended one).
+_QUALIFIER_WORDS = (
+    "fresh", "raw", "chilled", "frozen", "dried", "dehydrated", "preserved", "prepared", "processed",
+    "cooked", "roasted", "smoked", "salted", "canned", "juice", "jam", "jams", "seeds", "oil", "powder",
+    "waste", "yarn", "fabric", "fabrics", "sweetened", "unsweetened", "refined", "crude", "wild", "cultivated",
+)
+_QUALIFIER_PREFERENCE = ("fresh", "raw", "chilled", "frozen")
+_QUALIFIER_RE = re.compile(r"\b(" + "|".join(_QUALIFIER_WORDS) + r")\b", re.IGNORECASE)
+_CONTEXT_MAX_LEN = 60
+_MEANINGLESS_DESCRIPTIONS = {"", "other", "others"}
+
+
+def _norm_text(text: str) -> str:
+    """Lower-case, strip punctuation, crude singular form: 'APPLES.' == 'Apple'."""
+    words = re.sub(r"[^\w\s]", " ", (text or "").lower()).split()
+    return " ".join(w[:-1] if len(w) > 3 and w.endswith("s") and not w.endswith("ss") else w for w in words)
+
+
+def _qualifier(description: str) -> str:
+    """The short qualifier (fresh / dried / prepared or preserved ...) an ancestor description carries."""
+    # Ignore the "other than that of headings ..." tail: it names what the heading excludes.
+    head = re.split(r"\bother than\b|\bexcluding\b|;", description or "", maxsplit=1, flags=re.IGNORECASE)[0]
+    m = _QUALIFIER_RE.search(head)
+    if not m:
+        return ""
+    word = m.group(1).lower()
+    tail = re.match(r"\s+or\s+(" + "|".join(_QUALIFIER_WORDS) + r")\b", head[m.end():], re.IGNORECASE)
+    if tail:
+        word = f"{word} or {tail.group(1).lower()}"
+    return {"jams": "jam"}.get(word, word)
+
+
+def _short(description: str) -> str:
+    text = (description or "").strip().rstrip(":. ")
+    if text.isupper():
+        text = text.capitalize()
+    return text if len(text) <= _CONTEXT_MAX_LEN else text[: _CONTEXT_MAX_LEN - 1].rstrip(" ,;") + "…"
+
+
+def _collapse_levels(rows: list[dict]) -> list[dict]:
+    """Merge a shorter code into its most specific descendant when both read the same."""
+    by_key: dict[str, list[dict]] = {}
+    for r in rows:
+        by_key.setdefault(_norm_text(r["formatted_title"]), []).append(r)
+    merged: dict[str, str] = {}  # dropped code -> kept code
+    for group in by_key.values():
+        for p in group:
+            desc = [c for c in group if c is not p and c["code"].startswith(p["code"])]
+            if not desc:
+                continue
+            deepest = [c for c in desc if not any(o is not c and o["code"].startswith(c["code"]) for o in desc)]
+            if len(deepest) == 1:
+                merged[p["code"]] = deepest[0]["code"]
+    out: list[dict] = []
+    for r in rows:
+        if r["code"] in merged:
+            continue
+        r = dict(r)
+        r["also_codes"] = sorted((d for d, k in merged.items() if k == r["code"]), key=lambda c: (len(c), c))
+        out.append(r)
+    return out
+
+
+def _assign_context(rows: list[dict], descriptions: dict[str, str]) -> None:
+    """Set ``context`` / ``parent_description`` on rows whose title collides with another row's."""
+    by_key: dict[str, list[dict]] = {}
+    for r in rows:
+        by_key.setdefault(_norm_text(r["formatted_title"]), []).append(r)
+    for group in by_key.values():
+        if len(group) < 2:
+            continue
+        levels: list[tuple[str, ...]] = []
+        for size in (4, 2):
+            levels.append(tuple(r["code"][:size] if len(r["code"]) > size else "" for r in group))
+        levels.append(tuple(r["code"][:6] if len(r["code"]) > 6 else "" for r in group))
+        for ancestors in levels:
+            texts = [descriptions.get(a, "") if a else "" for a in ancestors]
+            if len({_norm_text(t) for t in texts}) < 2:
+                continue
+            if all(_norm_text(t) in _MEANINGLESS_DESCRIPTIONS for t in texts):
+                continue
+            quals = [_qualifier(t) for t in texts]
+            use_quals = all(quals) and len(set(quals)) == len(quals)
+            for r, text, qual in zip(group, texts, quals):
+                if not text or _norm_text(text) in _MEANINGLESS_DESCRIPTIONS:
+                    continue
+                r["context"] = qual if use_quals else _short(text)
+                r["parent_description"] = _short(text)
+            break
+
+
+def enrich_search_results(
+    rows: list[dict],
+    descriptions: dict[str, str],
+    query: str = "",
+    suggested_code: Optional[str] = None,
+) -> list[dict]:
+    """Make HSN search rows pickable.
+
+    ``rows`` are dicts with at least code / formatted_title / level (in search order);
+    ``descriptions`` maps ancestor codes (2/4/6 digits) to their description.
+    Adds ``display_title``, ``context``, ``parent_description``, ``also_codes`` and ``recommended``,
+    collapses 6-digit/8-digit duplicates, and orders: recommended first, then search order with
+    broader (ancestor) rows after their more specific children.
+    """
+    rows = _collapse_levels(rows)
+    _assign_context(rows, descriptions)
+
+    # Titles that still collide (same ancestors, e.g. several "Other" lines) get the code appended.
+    seen: dict[str, list[dict]] = {}
+    for r in rows:
+        title = r["formatted_title"]
+        if r.get("context"):
+            title = f"{title} — {r['context']}"
+        r["display_title"] = title
+        seen.setdefault(_norm_text(title), []).append(r)
+    for group in seen.values():
+        if len(group) > 1:
+            for r in group:
+                r["display_title"] = f"{r['display_title']} ({r['code']})"
+
+    # Recommended row: the /hsn/suggest answer when it is in the results, else (only when the query names
+    # look-alike rows) the "fresh/raw" one among the rows titled exactly like the query.
+    recommended: Optional[dict] = None
+    if suggested_code:
+        recommended = next((r for r in rows if r["code"] == suggested_code), None) or next(
+            (r for r in rows if r["code"].startswith(suggested_code)), None
+        )
+    if recommended is None:
+        q = _norm_text(query)
+        exact = [r for r in rows if r.get("context") and _norm_text(r["formatted_title"]) == q]
+        if exact:
+            def rank(r: dict) -> int:
+                first = (r["context"] or "").split(" ")[0]
+                return _QUALIFIER_PREFERENCE.index(first) if first in _QUALIFIER_PREFERENCE else len(_QUALIFIER_PREFERENCE)
+            recommended = min(exact, key=rank)
+    for r in rows:
+        r["recommended"] = r is recommended
+
+    # A broader row (e.g. the heading) goes after its specific children when those children were
+    # disambiguated or collapsed; results without look-alikes keep their search order.
+    idx = {r["code"]: i for i, r in enumerate(rows)}
+    def sort_key(r: dict) -> tuple:
+        deeper = [
+            idx[o["code"]] for o in rows
+            if o is not r and o["code"].startswith(r["code"]) and (o.get("context") or o.get("also_codes"))
+        ]
+        pos = (max(deeper) + 0.5) if deeper else idx[r["code"]]
+        return (not r["recommended"], pos, -len(r["code"]))
+    return sorted(rows, key=sort_key)

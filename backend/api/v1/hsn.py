@@ -4,10 +4,12 @@ Provides hierarchical navigation and instant full-text search across all 22,616+
 official tariff codes extracted from HSN_SAC.xlsx.
 """
 
+import asyncio
 import os
 import re
 import sqlite3
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import Annotated, Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query, status
@@ -17,6 +19,7 @@ from services.hsn_service import (
     HS_CHAPTERS,
     _COMMON_HEADING_KEYWORDS,
     classify_hsn_with_ai,
+    enrich_search_results,
     normalize_hsn,
     predict_hsn_from_text,
 )
@@ -551,6 +554,12 @@ class HsnItemOut(BaseModel):
     is_service: bool = False
     aliases: str = ""
     has_children: bool = False
+    # Search-only extras (optional, so every other endpoint keeps returning the same shape).
+    display_title: Optional[str] = None
+    context: Optional[str] = None
+    parent_description: Optional[str] = None
+    also_codes: Optional[list[str]] = None
+    recommended: Optional[bool] = None
 
 
 class HsnSuggestionOut(BaseModel):
@@ -573,8 +582,11 @@ async def suggest_hsn_for_product(
     return await suggest_hsn(text)
 
 
-async def suggest_hsn(text: str) -> Optional[HsnSuggestionOut]:
-    """Shared implementation of GET /hsn/suggest (also used by the AI chat)."""
+async def suggest_hsn(text: str, use_ai: bool = True) -> Optional[HsnSuggestionOut]:
+    """Shared implementation of GET /hsn/suggest (also used by the AI chat).
+
+    ``use_ai=False`` skips the LLM fallback (used by the instant /hsn/search ranking).
+    """
     clean = text.strip().lower()
     if not clean:
         return None
@@ -612,7 +624,7 @@ async def suggest_hsn(text: str) -> Optional[HsnSuggestionOut]:
                     logger.debug("De-spaced FTS search error: %s", e)
 
         # Step 3: AI LLM Classification fallback (Ollama)
-        if not code:
+        if not code and use_ai:
             try:
                 ai_code = await classify_hsn_with_ai(clean)
                 if ai_code:
@@ -701,6 +713,47 @@ async def suggest_hsn(text: str) -> Optional[HsnSuggestionOut]:
         conn.close()
 
 
+def _run_sync(coro):
+    """Run a coroutine from sync code, also when an event loop is already running in this thread."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
+
+
+def _enrich_text_search(
+    cur: sqlite3.Cursor, items: list[HsnItemOut], query: str, suggested: Optional[str] = None
+) -> list[HsnItemOut]:
+    """Collapse 6/8-digit duplicates, label look-alike rows ("Apples - fresh" vs "Apples - dried"), recommend one."""
+    if not items:
+        return items
+    prefixes = {c[:n] for it in items for c in [it.code] for n in (2, 4, 6) if len(c) > n}
+    rows = [it.model_dump() for it in items]
+    for r in rows:
+        r["display_title"] = r["formatted_title"]
+    placeholders = ", ".join("?" for _ in prefixes)
+    descriptions = {
+        r["code"]: r["description"]
+        for r in cur.execute(
+            f"SELECT code, description FROM hsn_codes WHERE code IN ({placeholders})", tuple(prefixes)
+        ).fetchall()
+    } if prefixes else {}
+    try:
+        if suggested is None:
+            sug = _run_sync(suggest_hsn(query, use_ai=False))
+            suggested = sug.code if sug else None
+    except Exception as e:  # ranking is best-effort, never break the search
+        logger.debug("HSN search recommendation failed: %s", e)
+    try:
+        enriched = enrich_search_results(rows, descriptions, query, suggested)
+    except Exception as e:
+        logger.warning("HSN search enrichment failed, returning plain results: %s", e)
+        return items
+    return [HsnItemOut(**r) for r in enriched]
+
+
 @router.get("/search", response_model=list[HsnItemOut])
 def search_hsn(
     q: Annotated[str, Query(min_length=1, max_length=100)],
@@ -742,7 +795,7 @@ def search_hsn(
                 (*[norm_code, *extra_codes], norm_code + "%", norm_code[:4], norm_code, *[norm_code, *extra_codes], limit),
             ).fetchall()
 
-            return [
+            items = [
                 HsnItemOut(
                     code=r["code"],
                     description=r["description"],
@@ -758,6 +811,7 @@ def search_hsn(
                 )
                 for r in rows
             ]
+            return _enrich_text_search(cur, items, clean_lower, suggested=norm_code)
 
         # Step 2: Code prefix match if query is numeric digits
         if len(digits) >= 2:
@@ -818,7 +872,7 @@ def search_hsn(
                     except Exception:
                         rows = []
 
-        return [
+        items = [
             HsnItemOut(
                 code=r["code"],
                 description=r["description"],
@@ -834,6 +888,11 @@ def search_hsn(
             )
             for r in rows
         ]
+        if len(digits) >= 2:  # code browsing: keep the plain level-by-level listing
+            for it in items:
+                it.display_title = it.formatted_title
+            return items
+        return _enrich_text_search(cur, items, clean_lower)
     finally:
         conn.close()
 

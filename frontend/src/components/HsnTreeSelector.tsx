@@ -128,6 +128,7 @@ export function HsnTreeSelector({
   const [searchResults, setSearchResults] = useState<HsnItem[]>([]);
   const [isSearching, setIsSearching] = useState(false);
   const [isSearchLoading, setIsSearchLoading] = useState(false);
+  const [showOtherMatches, setShowOtherMatches] = useState(false);
   const searchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Expansion states
@@ -241,6 +242,7 @@ export function HsnTreeSelector({
 
     setIsSearching(true);
     setIsSearchLoading(true);
+    setShowOtherMatches(false);
 
     if (searchTimeoutRef.current) {
       clearTimeout(searchTimeoutRef.current);
@@ -272,6 +274,72 @@ export function HsnTreeSelector({
       if (searchTimeoutRef.current) clearTimeout(searchTimeoutRef.current);
     };
   }, [searchQuery]);
+
+  // Search result row. Shared by the main list and the collapsed "Other matches" list.
+  const renderSearchResult = (item: HsnItem) => {
+    const isSelected = selectedItem?.hsnCode === item.code;
+    return (
+      <li
+        key={`${item.code}_${item.level}`}
+        className={`hsn-result-item ${isSelected ? "selected" : ""}`}
+        onClick={() => handleSelect(item)}
+      >
+        <div className="hsn-result-code">
+          <span className="badge-code">
+            {item.is_service ? "SAC" : "HSN"} {item.code}
+          </span>
+          {item.also_codes && item.also_codes.length > 0 && (
+            <span className="hsn-also-codes">also {item.also_codes.join(", ")}</span>
+          )}
+          <span className="badge-cat">{item.category}</span>
+        </div>
+        <div className="hsn-result-content">
+          <span className="hsn-result-title-row">
+            <strong>{item.display_title || item.formatted_title || item.description}</strong>
+            {item.context && <span className="hsn-context-pill">{item.context}</span>}
+            {item.recommended && <span className="hsn-recommended-badge">Recommended</span>}
+          </span>
+          <span className="hsn-result-sub">
+            Level {item.level} · Chapter {item.chapter}
+            {item.heading && item.heading !== item.chapter ? ` · Heading ${item.heading}` : ""}
+          </span>
+          {item.parent_description && item.context && (
+            <small className="hsn-result-desc">Under: {item.parent_description}</small>
+          )}
+          {item.description && item.description !== item.formatted_title && (
+            <small className="hsn-result-desc">{item.description}</small>
+          )}
+          {item.aliases && (
+            <div className="hsn-aliases-tag">
+              {item.aliases.startsWith("Brand match:") ? (
+                <span>💡 {item.aliases}</span>
+              ) : (
+                <span>Trade terms: {item.aliases}</span>
+              )}
+            </div>
+          )}
+        </div>
+        <button
+          type="button"
+          className="button primary small-btn hsn-select-btn"
+          onClick={(e) => {
+            e.stopPropagation();
+            handleSelect(item);
+          }}
+        >
+          Select
+        </button>
+      </li>
+    );
+  };
+
+  // With look-alike rows (same title, different kind) show the recommended and labelled rows first and
+  // tuck the rest under "Other matches"; without any, show everything.
+  const hasLookAlikes = searchResults.some((item) => item.context);
+  const primaryResults = hasLookAlikes
+    ? searchResults.filter((item) => item.recommended || item.context)
+    : searchResults;
+  const otherResults = hasLookAlikes ? searchResults.filter((item) => !(item.recommended || item.context)) : [];
 
   // Tree toggle handlers
   function toggleCategory(catName: string) {
@@ -570,54 +638,23 @@ export function HsnTreeSelector({
                   </button>
                 </div>
               ) : (
-                <ul className="hsn-result-list">
-                  {searchResults.map((item) => {
-                    const isSelected = selectedItem?.hsnCode === item.code;
-                    return (
-                      <li
-                        key={`${item.code}_${item.level}`}
-                        className={`hsn-result-item ${isSelected ? "selected" : ""}`}
-                        onClick={() => handleSelect(item)}
+                <>
+                  <ul className="hsn-result-list">{primaryResults.map(renderSearchResult)}</ul>
+                  {otherResults.length > 0 && (
+                    <div className="hsn-other-matches">
+                      <button
+                        type="button"
+                        className="hsn-other-matches-toggle"
+                        aria-expanded={showOtherMatches}
+                        onClick={() => setShowOtherMatches((v) => !v)}
                       >
-                        <div className="hsn-result-code">
-                          <span className="badge-code">
-                            {item.is_service ? "SAC" : "HSN"} {item.code}
-                          </span>
-                          <span className="badge-cat">{item.category}</span>
-                        </div>
-                        <div className="hsn-result-content">
-                          <strong>{item.formatted_title || item.description}</strong>
-                          <span className="hsn-result-sub">
-                            Level {item.level} · Chapter {item.chapter}
-                            {item.heading && item.heading !== item.chapter ? ` · Heading ${item.heading}` : ""}
-                          </span>
-                          {item.description && item.description !== item.formatted_title && (
-                            <small className="hsn-result-desc">{item.description}</small>
-                          )}
-                          {item.aliases && (
-                            <div className="hsn-aliases-tag">
-                              {item.aliases.startsWith("Brand match:") ? (
-                                <span>💡 {item.aliases}</span>
-                              ) : (
-                                <span>Trade terms: {item.aliases}</span>
-                              )}
-                            </div>
-                          )}
-                        </div>
-                        <button
-                          type="button"
-                          className="button primary small-btn hsn-select-btn"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleSelect(item);
-                          }}
-                        >
-                          Select
-                        </button>
-                      </li>
-                    );
-                  })}
-                </ul>
+                        {showOtherMatches ? <IconChevronDown size={14} /> : <IconChevronRight size={14} />}
+                        Other matches ({otherResults.length})
+                      </button>
+                      {showOtherMatches && <ul className="hsn-result-list">{otherResults.map(renderSearchResult)}</ul>}
+                    </div>
+                  )}
+                </>
               )}
             </div>
           ) : (
