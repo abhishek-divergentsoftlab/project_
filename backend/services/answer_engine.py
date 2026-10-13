@@ -47,6 +47,12 @@ class AnswerContext:
     on_progress: Optional[ProgressCallback] = None
     # True when the user is drafting an RFQ this turn (parser intent buy_request / sell_offer).
     drafting: bool = False
+    # The draft as it was BEFORE this turn's model tool call. When set, the verifier takes the draft's
+    # values from it, so the model cannot make a number "allowed" by writing it into the draft itself.
+    verify_draft: Union[None, dict[str, Any], Callable[[], dict[str, Any]]] = None
+    # The conversation's next step for the live draft, used by the drafting fallback reply: the next
+    # question, "" when the caller appends the recap itself, None when there is no flow (legacy wording).
+    drafting_closing: Optional[Callable[[dict[str, Any]], Optional[str]]] = None
 
 
 @dataclass
@@ -229,6 +235,10 @@ async def answer(
         d = context.draft if context else None
         return d() if callable(d) else d
 
+    def _verification_draft() -> Optional[dict[str, Any]]:
+        d = context.verify_draft if context and context.verify_draft is not None else (context.draft if context else None)
+        return d() if callable(d) else d
+
     def _fallback(text_when_actions: str = "", llm_error: bool = False) -> AnswerResult:
         # A turn that only performed actions has no data answer to replace; the caller words those.
         drafting = bool(context and context.drafting) or any(
@@ -236,8 +246,9 @@ async def answer(
         )
         if drafting:
             draft_now = _current_draft() or {}
+            closing = context.drafting_closing(draft_now) if context and context.drafting_closing else None
             text = drafting_reply.build_drafting_reply(
-                draft_now, rfq_tool_service.evaluate_rfq_readiness(draft_now), user_message
+                draft_now, rfq_tool_service.evaluate_rfq_readiness(draft_now), user_message, closing=closing
             )
         elif action_results and not tool_results:
             text = text_when_actions
@@ -270,7 +281,7 @@ async def answer(
 
         await _progress(context, {"event": "verifying"})
         check = answer_verifier.verify(
-            text, _verification_inputs(tool_results, action_results), user_message, _current_draft(), extra_text
+            text, _verification_inputs(tool_results, action_results), user_message, _verification_draft(), extra_text
         )
         if not check.ok:
             logger.info("Answer failed verification (%s); retrying once", check.problems())
@@ -283,7 +294,7 @@ async def answer(
                 context=context, thinking_out=thinking,
             )
             check = answer_verifier.verify(
-                text, _verification_inputs(tool_results, action_results), user_message, _current_draft(), extra_text
+                text, _verification_inputs(tool_results, action_results), user_message, _verification_draft(), extra_text
             )
             if not check.ok or not text:
                 logger.warning("Answer failed verification twice; using facts-only answer")

@@ -263,13 +263,13 @@ def test_next_question_order():
         assert cc.next_question(draft, specs) == field
         seen.append(field)
         draft[key] = value
-    assert cc.next_question(draft, specs) == "spec:Grain Length"
-    draft["product_details"]["Grain Length"] = "7mm"
-    assert cc.next_question(draft, specs, asked={"spec:Grain Length": 1}) == "spec:Moisture"
-    asked = {"spec:Grain Length": 1, "spec:Moisture": 1, "spec:Broken": 1}  # three spec questions is the cap
-    assert cc.next_question(draft, specs, asked=asked) == "hsn"
-    assert cc.next_question(draft, {**specs, "hsn_offered": True}, asked=asked) == "recap"
-    assert cc.next_question(draft, specs, declined=["hsn"], asked=asked) == "recap"
+    assert cc.next_question(draft, specs) == "specs"  # ONE combined question for the suggested specs
+    assert cc.next_question(draft, specs, asked={"specs": 1}) == "hsn"
+    assert cc.next_question(draft, specs, declined=["specs"]) == "hsn"
+    draft["product_details"].update({"Grain Length": "7mm", "Moisture": "12%", "Broken": "2%", "Age": "1 year"})
+    assert cc.next_question(draft, specs) == "hsn"  # every suggestion answered: nothing left to ask about
+    assert cc.next_question(draft, {**specs, "hsn_offered": True}) == "recap"
+    assert cc.next_question(draft, specs, declined=["hsn"]) == "recap"
 
 
 def test_buyers_are_never_asked_for_a_minimum_order_and_declined_fields_are_skipped():
@@ -334,18 +334,20 @@ async def test_prompt_directive_names_exactly_one_question(client, db, make_acto
     assert "delivery location" not in prompt.split("ask only this")[1]
 
 
-async def test_suggested_specs_are_asked_one_per_turn_then_the_hsn_offer(client, db, make_actor):
+async def test_suggested_specs_are_asked_in_one_question_then_the_hsn_offer(client, db, make_actor):
     user = await make_actor("buyer")
-    specs = [{"key": "grain_length", "label": "Grain Length"}, {"key": "moisture", "label": "Moisture"}]
+    specs = [
+        {"key": "grain_length", "label": "Grain Length", "placeholder": "", "input_type": "select", "options": ["Long", "Extra long"]},
+        {"key": "moisture", "label": "Moisture", "placeholder": ""},
+    ]
     hsn = {"code": "100630", "description": "Rice", "formatted_title": "Rice", "category": "Agriculture", "confidence": 0.9}
     with _Helpers(specs=specs, hsn=hsn), _script("Noted."):
         d = await _msg(user, "change the quantity to 500 kg", COMPLETE)
         cid = d["conversation_id"]
-        assert "Grain Length" in d["reply"] and "Moisture" not in d["reply"]
+        assert "tell me a few specs" in d["reply"]
+        assert "• Grain Length — Long, Extra long" in d["reply"] and "• Moisture" in d["reply"]
         d = await _msg(user, "skip", cid=cid)
-        assert "Moisture" in d["reply"] and "Grain Length" not in d["reply"]
-        d = await _msg(user, "skip", cid=cid)
-        assert "HSN 100630" in d["reply"]
+        assert "HSN 100630" in d["reply"] and "tell me a few specs" not in d["reply"]
         d = await _msg(user, "skip", cid=cid)
         assert RECAP_Q in d["reply"]
 

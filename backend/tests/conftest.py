@@ -144,6 +144,22 @@ async def client(database: None) -> AsyncIterator[AsyncClient]:
 
 
 @pytest.fixture(autouse=True)
+async def reset_chat_spec_suggestions() -> AsyncIterator[None]:
+    """The chat's spec suggestions are cached for a day and fetched by background tasks; neither may leak between tests."""
+    from services import chat_draft_assist
+
+    chat_draft_assist.reset_spec_state()
+    yield
+    tasks = list(chat_draft_assist._spec_tasks.values())
+    chat_draft_assist.reset_spec_state()
+    for task in tasks:
+        try:
+            await task
+        except BaseException:  # cancelled or failed: only the cleanup matters here
+            pass
+
+
+@pytest.fixture(autouse=True)
 def offline_vectors(monkeypatch: pytest.MonkeyPatch) -> None:
     """Force the SQL retrieval path and firewall the live vector index.
 

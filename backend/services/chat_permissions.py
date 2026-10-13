@@ -69,6 +69,9 @@ CREATE_INTENT_REGEXES = [
         r"\bconfirm\s+and\s+(create|crate|creat|publish|submit)\b",
         r"\bgo\s+ahead\s+and\s+(create|crate|creat|publish|submit|post)\b",
         r"^(yes|create|crate|creat|proceed|publish|submit)(\s+(the\s+)?rfq)?[.!]*$",
+        # "ok proceed", "yes go ahead", "sure, publish": an affirmative then the command, nothing else
+        r"^(?:(?:yes|yeah|yep|ok|okay|sure|haan|han|please)[\s,]+)+(?:proceed|go\s+ahead|publish|submit|create|confirm)"
+        r"(?:\s+(?:it|now|please))*[.!]*$",
         # "raise the rfq", "rais the rfq", "raise it"
         r"\b(raise|rais|raize|riase|rise)\s+(the\s+|this\s+|an?\s+|my\s+)?(rfq|listing|request|it)\b",
         # Hinglish: "rfq bana do", "haan bana do", "publish kar do", "create kar do"

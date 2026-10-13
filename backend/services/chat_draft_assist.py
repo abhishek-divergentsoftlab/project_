@@ -14,6 +14,7 @@ import asyncio
 import hashlib
 import logging
 import re
+import time
 from typing import Any, Optional
 
 from services import hsn_service
@@ -22,7 +23,10 @@ from services.categories import normalize_category
 logger = logging.getLogger(__name__)
 
 HSN_TIMEOUT = 3.0  # same budget as rfq_service.HSN_AI_TIMEOUT
-SPECS_TIMEOUT = 5.0
+SPECS_TIMEOUT = 5.0  # how long ONE TURN waits for the spec suggestions; the fetch itself keeps running
+SPECS_TASK_BUDGET = 30.0  # the background fetch's own budget
+SPECS_RECAP_WAIT = 8.0  # extra wait, before a recap, for a fetch that is still running
+SPECS_CACHE_TTL = 24 * 3600.0
 MODERATION_TIMEOUT = 4.0
 MAX_SPEC_PROMPTS = 5
 MUST_MATCH_SUFFIX = "__must_match"
@@ -105,6 +109,35 @@ def accepts_hsn(user_text: str, previous_assistant: str, suggestion: Optional[di
     return bool(_ACCEPT_HSN_RE.search(text))
 
 
+_QUALIFIER_WORDS = frozenset({
+    "fresh", "dried", "dry", "frozen", "raw", "cooked", "roasted", "boiled", "processed", "ripe", "whole", "ground",
+    "crushed", "smoked", "salted", "canned", "chilled", "husked", "milled", "polished", "refined", "crude", "unprocessed",
+})
+
+
+def hsn_qualifiers(suggestion: Optional[dict[str, Any]]) -> list[str]:
+    """The distinguishing words of a suggested HSN's description ("Fresh Or Dried" -> fresh, dried)."""
+    if not suggestion:
+        return []
+    text = f"{suggestion.get('description') or ''} {suggestion.get('formatted_title') or ''}".lower()
+    found = [w for w in dict.fromkeys(re.findall(r"[a-z]+", text)) if w in _QUALIFIER_WORDS]
+    for m in re.finditer(r"\b([a-z]+)\s+or\s+([a-z]+)\b", text):
+        found.extend(w for w in m.groups() if w not in found and w not in ("including", "other", "not"))
+    return found
+
+
+def hsn_qualifier_answer(user_text: str, suggestion: Optional[dict[str, Any]]) -> Optional[str]:
+    """A one-word answer ("fresh") that picks a qualifier of the pending HSN suggestion, or None."""
+    words = re.findall(r"[a-z]+", (user_text or "").lower())
+    if not words or len(words) > 3 or not suggestion or not suggestion.get("code"):
+        return None
+    quals = hsn_qualifiers(suggestion)
+    for w in words:
+        if w in quals:
+            return w.capitalize()
+    return None
+
+
 def lookup_hsn(raw: Any) -> tuple[str, Optional[dict[str, Any]]]:
     """Look a code up like GET /hsn/code/{code}. Returns (status, item): ok | unknown | invalid | unavailable."""
     code = hsn_service.normalize_hsn(raw)
@@ -127,8 +160,17 @@ def lookup_hsn(raw: Any) -> tuple[str, Optional[dict[str, Any]]]:
     }
 
 
-def apply_hsn(draft: dict[str, Any], code: str, category: Optional[str]) -> None:
-    """What the form's Apply does: store the code as a manual pick and take its category."""
+def category_change_note(code: str, category: str) -> str:
+    return f"Category set to {category} from HSN {code}."
+
+
+def apply_hsn(
+    draft: dict[str, Any], code: str, category: Optional[str], notes: Optional[list[str]] = None
+) -> None:
+    """What the form's Apply does: store the code as a manual pick and take its category.
+
+    When that changes the draft's category the user is told once (``notes`` is the turn's reply notes).
+    """
     details = dict(draft.get("product_details") or {})
     details["hsn_code"] = code
     details["hsn_source"] = "manual"
@@ -136,14 +178,21 @@ def apply_hsn(draft: dict[str, Any], code: str, category: Optional[str]) -> None
     if category and str(category).strip():
         normalized = normalize_category(category)
         if normalized != "General Goods" or not draft.get("category"):
+            before = draft.get("category")
             draft["category"] = normalized
+            if notes is not None and before != normalized:
+                note = category_change_note(code, normalized)
+                if note not in notes:
+                    notes.append(note)
 
 
-def apply_explicit_hsn(draft: dict[str, Any], raw: Any) -> tuple[str, Optional[dict[str, Any]]]:
+def apply_explicit_hsn(
+    draft: dict[str, Any], raw: Any, notes: Optional[list[str]] = None
+) -> tuple[str, Optional[dict[str, Any]]]:
     """Validate a typed code and apply it when known. Returns the lookup (status, item)."""
     status, item = lookup_hsn(raw)
     if status == "ok" and item:
-        apply_hsn(draft, item["code"], item.get("category"))
+        apply_hsn(draft, item["code"], item.get("category"), notes)
     return status, item
 
 
@@ -252,6 +301,78 @@ async def _fetch_spec_suggestions(name: str, category: Optional[str], role: Opti
     return out
 
 
+# ---------------------------------------------------------------------------
+# Spec suggestions run in the background: the recommender can take far longer than a turn may wait.
+# ---------------------------------------------------------------------------
+SpecKey = tuple[str, str, str]
+_spec_tasks: dict[SpecKey, "asyncio.Task[list[dict[str, Any]]]"] = {}  # strong references: a task is never garbage-collected midway
+_spec_cache: dict[SpecKey, tuple[float, list[dict[str, Any]]]] = {}
+
+
+def spec_key(name: str, category: Optional[str], role: Optional[str]) -> SpecKey:
+    return (_norm_key(name), _norm_key(category or ""), _norm_key(role or ""))
+
+
+def cached_specs(key: SpecKey) -> Optional[list[dict[str, Any]]]:
+    hit = _spec_cache.get(key)
+    if hit is None:
+        return None
+    if time.monotonic() - hit[0] > SPECS_CACHE_TTL:
+        _spec_cache.pop(key, None)
+        return None
+    return hit[1]
+
+
+def reset_spec_state() -> None:
+    """Forget cached results and cancel running fetches (tests, shutdown)."""
+    for task in list(_spec_tasks.values()):
+        try:
+            task.cancel()
+        except Exception:  # the loop is already closed
+            pass
+    _spec_tasks.clear()
+    _spec_cache.clear()
+
+
+async def _spec_job(key: SpecKey, name: str, category: Optional[str], role: Optional[str]) -> list[dict[str, Any]]:
+    value = await asyncio.wait_for(_fetch_spec_suggestions(name, category, role), timeout=SPECS_TASK_BUDGET)
+    if isinstance(value, list) and value:
+        _spec_cache[key] = (time.monotonic(), value)
+    return value if isinstance(value, list) else []
+
+
+def _spec_task_done(key: SpecKey, task: "asyncio.Task[Any]") -> None:
+    if _spec_tasks.get(key) is task:
+        _spec_tasks.pop(key, None)
+    if not task.cancelled() and task.exception() is not None:
+        logger.debug("Chat specs fetch failed: %s", task.exception())
+
+
+def running_spec_task(key: SpecKey) -> Optional["asyncio.Task[list[dict[str, Any]]]"]:
+    task = _spec_tasks.get(key)
+    if task is None:
+        return None
+    try:
+        if task.done() or task.get_loop() is not asyncio.get_running_loop():
+            _spec_tasks.pop(key, None)
+            return None
+    except RuntimeError:
+        return None
+    return task
+
+
+def start_spec_task(
+    key: SpecKey, name: str, category: Optional[str], role: Optional[str]
+) -> "asyncio.Task[list[dict[str, Any]]]":
+    """The one background fetch for this (product, category, role); started if none is running."""
+    task = running_spec_task(key)
+    if task is None:
+        task = asyncio.create_task(_spec_job(key, name, category, role))
+        _spec_tasks[key] = task
+        task.add_done_callback(lambda t, k=key: _spec_task_done(k, t))
+    return task
+
+
 async def _fetch_moderation(text: str) -> dict[str, Any]:
     from services.moderation_service import AIContentModerator
 
@@ -316,9 +437,13 @@ class DraftAssist:
         elif sug.get("hsn_for") != name:
             jobs["hsn"] = _guard(_fetch_hsn_suggestion(name), HSN_TIMEOUT, "hsn")
         if sug.get("specs_for") != name:
-            jobs["specs"] = _guard(
-                _fetch_spec_suggestions(name, draft.get("category"), draft.get("role")), SPECS_TIMEOUT, "specs"
-            )
+            key = spec_key(name, draft.get("category"), draft.get("role"))
+            hit = cached_specs(key)
+            if hit is not None:
+                sug["specs"], sug["specs_for"] = hit, name
+            else:
+                task = start_spec_task(key, name, draft.get("category"), draft.get("role"))
+                jobs["specs"] = self._wait_specs(task, SPECS_TIMEOUT)
         mtext = moderation_text(draft)
         mhash = text_hash(mtext)
         if moderate and (self.moderation or {}).get("text_hash") != mhash and mhash not in self._mod_tried:
@@ -334,14 +459,54 @@ class DraftAssist:
             sug["hsn"] = value
             sug.pop("hsn_offered", None)
         if "specs" in out:
-            ok, value = out["specs"]
-            sug["specs_for"] = name
-            sug["specs"] = value if ok and isinstance(value, list) else []
+            self._take_specs(name, out["specs"])
+            if sug.get("specs_for") != name:
+                sug["specs"] = []  # still running: never keep another product's suggestions meanwhile
         if "mod" in out:
             ok, value = out["mod"]
             if ok and isinstance(value, dict):
                 self.moderation = {"text_hash": mhash, **value}
                 self.moderation_checked_now = True
+
+    # -- spec suggestions (background) ---------------------------------
+    @staticmethod
+    async def _wait_specs(task: "asyncio.Task[Any]", timeout: float) -> tuple[bool, Any, bool]:
+        """Wait at most ``timeout`` for the fetch, without cancelling it. Returns (ok, value, finished)."""
+        done, _pending = await asyncio.wait({task}, timeout=timeout)
+        if task not in done:
+            return False, None, False
+        if task.cancelled() or task.exception() is not None:
+            return False, None, True
+        return True, task.result(), True
+
+    def _take_specs(self, name: str, outcome: tuple[bool, Any, bool]) -> None:
+        """Record a finished fetch. A fetch still running is NOT marked attempted: a later turn picks it up."""
+        ok, value, finished = outcome
+        if not finished:
+            return
+        self.suggestions["specs_for"] = name
+        self.suggestions["specs"] = value if ok and isinstance(value, list) else []
+
+    def specs_pending(self, draft: dict[str, Any]) -> bool:
+        """True while the spec fetch for this draft's product is still running."""
+        name = product_name(draft)
+        if not name or self.suggestions.get("specs_for") == name:
+            return False
+        return running_spec_task(spec_key(name, draft.get("category"), draft.get("role"))) is not None
+
+    async def settle_specs(self, draft: dict[str, Any], timeout: float = SPECS_RECAP_WAIT) -> None:
+        """Wait up to ``timeout`` for a running spec fetch (before a recap, so the suggestions are not skipped)."""
+        name = product_name(draft)
+        if not name or self.suggestions.get("specs_for") == name:
+            return
+        key = spec_key(name, draft.get("category"), draft.get("role"))
+        hit = cached_specs(key)
+        if hit is not None:
+            self.suggestions["specs"], self.suggestions["specs_for"] = hit, name
+            return
+        task = running_spec_task(key)
+        if task is not None:
+            self._take_specs(name, await self._wait_specs(task, timeout))
 
     # -- moderation ----------------------------------------------------
     async def block_reason(self, draft: dict[str, Any]) -> Optional[str]:
@@ -393,6 +558,8 @@ class DraftAssist:
             lines.append(line)
         if self.applied_hsn and user_hsn(draft):
             lines.append(f"- HSN {user_hsn(draft)} was just applied to the draft. Confirm it in one short sentence.")
+        if hsn or user_hsn(draft):
+            lines.append("- Never say that no HSN code was found while an HSN is listed above or applied to the draft.")
         specs = self.unfilled_specs(draft)
         if specs:
             lines.append(

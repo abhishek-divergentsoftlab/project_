@@ -394,7 +394,7 @@ def _extract_price(text: str) -> tuple[Optional[Decimal], Optional[str], Optiona
     read as a quantity of 2.
     """
     symbols = _CURRENCY_SYMBOLS
-    per = rf"(?:\s*(?:per|/|a|प्रति)\s*(?P<unit>[a-z\u0900-\u097f]+))?"
+    per = rf"(?:\s*(?:per\b|par\b|/|a|प्रति)\s*(?P<unit>[a-z\u0900-\u097f]+))?"
     known_units = (
         r"kg|kgs|kilo|kilos|kilogram|kilograms|quintal|quintals|qtl|ton|tons|tonne|tonnes|mt|g|gm|gram|grams|"
         r"pcs|pc|piece|pieces|unit|units|dozen|bora|boras|katta|bag|bags|meter|meters|m|l|liter|liters|litre|litres|"
@@ -411,7 +411,7 @@ def _extract_price(text: str) -> tuple[Optional[Decimal], Optional[str], Optiona
         # "at price 200 per kg", "can pay 210 per unit", "budget 200/kg", "pay 210"
         rf"(?:at|for|price|rate|budget|pay|paying|target|upto|up\s+to|max|around)\s+(?:of\s+)?(?P<amt>{_PRICE_NUMBER}){per}",
         # Bare price per unit: "1000/quintal", "15/kg", "1.5/kg", "1000 per quintal", "1.5k/quintal"
-        rf"(?:^|\s)(?P<amt>{_PRICE_NUMBER})\s*(?:/|per|प्रति)\s*(?P<unit>{known_units})\b",
+        rf"(?:^|\s)(?P<amt>{_PRICE_NUMBER})\s*(?:/|per\b|par\b|प्रति)\s*(?P<unit>{known_units})\b",
     )
 
     for pattern in patterns:

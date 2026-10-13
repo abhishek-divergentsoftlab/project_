@@ -22,7 +22,7 @@ from models.enums import RFQRole, RFQStatus
 from schemas.common import Deadline, Location, Money, Quantity
 from schemas.rfq import RFQCreate
 from schemas.rfq_structure import RFQStructure
-from services import chat_draft_assist, query_extractor
+from services import chat_draft_assist, chat_specs, query_extractor
 from services.chat_permissions import (
     check_close_rfq_intent,
     check_counterparty_message_intent,
@@ -181,11 +181,6 @@ UPDATE_RFQ_DRAFT_TOOL: dict[str, Any] = {
                         "(e.g. ['Grade']). Unknown attribute names are ignored."
                     ),
                 },
-                "status": {
-                    "type": "string",
-                    "enum": ["draft", "active"],
-                    "description": "[OPTIONAL] RFQ status.",
-                },
             },
             "required": [],
         },
@@ -314,6 +309,16 @@ def update_rfq_draft(
     """
     draft = dict(existing_draft or {})
 
+    # The form's own fields never become specs: they fill the matching draft field when it is still empty and
+    # are dropped otherwise; nested values are flattened to text.
+    kwargs = dict(kwargs)
+    if isinstance(kwargs.get("product_details"), dict):
+        clean_details, core = chat_specs.clean_product_details(kwargs["product_details"])
+        kwargs["product_details"] = clean_details
+        for key, value in chat_specs.core_as_fields(core, draft).items():
+            if kwargs.get(key) is None:
+                kwargs[key] = value
+
     # 1. Role: 'buyer' or 'seller'
     role = kwargs.get("role")
     if role:
@@ -348,10 +353,11 @@ def update_rfq_draft(
         ):
             details["name"] = str(product_name).strip()
 
-    # Merge any custom product_details passed
+    # Merge any custom product_details passed (already cleaned above).
     extra_details = kwargs.get("product_details")
     if isinstance(extra_details, dict):
         details.update(extra_details)
+        details = chat_specs.drop_unit_variants(details)
 
     if details:
         draft["product_details"] = details
@@ -371,7 +377,9 @@ def update_rfq_draft(
 
     # An HSN code the user typed: validated like GET /hsn/code/{code}; a known code is a manual pick.
     if kwargs.get("hsn_code"):
-        hsn_status, _item = chat_draft_assist.apply_explicit_hsn(draft, kwargs["hsn_code"])
+        hsn_status, _item = chat_draft_assist.apply_explicit_hsn(
+            draft, kwargs["hsn_code"], kwargs["_notes"] if isinstance(kwargs.get("_notes"), list) else None
+        )
         if hsn_status in ("unknown", "invalid") and isinstance(kwargs.get("_notes"), list):
             kwargs["_notes"].append(chat_draft_assist.unrecognised_hsn_note(kwargs["hsn_code"]))
 
@@ -408,11 +416,13 @@ def update_rfq_draft(
         try:
             amount = Decimal(str(price_val))
             cur = str(kwargs.get("price_currency") or draft.get("price_target", {}).get("currency") or "INR").upper()
-            per_u = kwargs.get("price_per_unit")
+            per_u = chat_specs.normalize_per_unit(kwargs.get("price_per_unit"))
+            if per_u is None:
+                per_u = chat_specs.normalize_per_unit((draft.get("price_target") or {}).get("per_unit"))
             draft["price_target"] = {
                 "amount": float(amount),
                 "currency": cur,
-                "per_unit": str(per_u).strip() if per_u else None,
+                "per_unit": per_u,
             }
         except Exception:
             pass
@@ -445,9 +455,7 @@ def update_rfq_draft(
             dl_dict["date"] = str(d_date).strip()
         draft["deadline"] = dl_dict
 
-    # 8. Status
-    if kwargs.get("status"):
-        draft["status"] = str(kwargs["status"]).strip().lower()
+    # 8. Status is never set here: it comes from the confirmation flow (publish or save as draft), not from a tool call.
 
     return draft
 
@@ -540,6 +548,13 @@ def preprocess_message_to_rfq(
         )
 
         existing_name = (draft.get("product_details") or {}).get("name")
+        if not is_invalid and (
+            chat_specs.is_content_free(message)
+            or (existing_name and not chat_specs.same_product(req.product, existing_name) and not chat_specs.states_product_change(message))
+        ):
+            # "continue refining it" or "variety fuji" (an answer) is not a new product for a draft that has one.
+            logger.info("Kept product %r: %r does not state a new product", existing_name, message[:60])
+            is_invalid = True
         if not is_invalid:
             extracted_kwargs["product_name"] = req.product
             if req.category:
@@ -568,7 +583,8 @@ def preprocess_message_to_rfq(
     if req.price_amount is not None:
         extracted_kwargs["price_amount"] = float(req.price_amount)
         extracted_kwargs["price_currency"] = req.price_currency or config.default_currency
-        extracted_kwargs["price_per_unit"] = req.price_per_unit
+        # Only a unit the user wrote ("per kg", "par kg", "/kg"): never guessed from the quantity's unit.
+        extracted_kwargs["price_per_unit"] = chat_specs.normalize_per_unit(query_extractor._extract_price(message)[2])
 
     # Extract deadline
     if req.deadline_days is not None:

@@ -29,7 +29,7 @@ from models.user import User
 from services import answer_engine, rfq_tool_service
 from services.answer_engine import AnswerContext
 from services.agent_registry import AgentDefinition, GENERAL_ASSISTANT
-from services import ai_query_parser, chat_conversation, chat_draft_assist, chat_permissions, chat_rfq_edit
+from services import ai_query_parser, chat_conversation, chat_draft_assist, chat_permissions, chat_rfq_edit, chat_specs
 from services.agent_router import agent_for_intent, agent_for_tools, agent_info
 
 logger = logging.getLogger(__name__)
@@ -104,26 +104,49 @@ def is_false_positive_refusal(reply_text: str, user_query: str) -> bool:
 
 
 _RFQ_CREATION_CLAIM_RE = re.compile(
-    r"(✅|🎉)[^\n]{0,60}\b(rfq|listing)\b[^\n]{0,30}\b(created|published|raised|posted|live)\b"
-    r"|\b(created|published|raised|posted)\s+successfully\b"
-    r"|\bsuccessfully\s+(created|published|raised|posted)\b"
-    r"|\brfq\s+id\s*[:：]",
+    r"(✅|🎉)[^\n]{0,60}\b(rfq|listing)\b[^\n]{0,30}\b(created|published|raised|posted|live|listed)\b"
+    r"|\b(created|published|raised|posted|listed)\s+successfully\b"
+    r"|\bsuccessfully\s+(created|published|raised|posted|listed)\b"
+    r"|\brfq\s+id\s*[:：]"
+    r"|\b(?:rfq|listing)\s+(?:has\s+been\s+|is\s+now\s+|was\s+)?(?:published|posted|created|raised|listed)\s*[:：!.]"
+    r"|\b(?:rfq|listing)\b[^\n]{0,40}\b(?:has\s+been|have\s+been|was|is\s+now)\s+(?:successfully\s+)?(?:created|published|posted|raised|listed|live)\b"
+    r"|\b(?:i(?:'ve|\s+have)?|we(?:'ve|\s+have)?)\s+(?:now\s+)?(?:published|posted|created|listed|raised)\s+(?:your|the|this|it)\b"
+    r"|\b(?:is|are)\s+now\s+live\b"
+    # Hinglish: "publish ho gaya", "post kar diya", "rfq ban gaya", "live ho gaya"
+    r"|\b(?:publish|post|create|list|live)\s+(?:ho\s+gaya|ho\s+gayi|hogaya|kar\s+diya|kar\s+di|kardiya)\b"
+    r"|\b(?:rfq|listing)\s+(?:ban\s+gaya|ban\s+gayi|bana\s+diya|bana\s+di)\b",
+    re.IGNORECASE,
+)
+# In edit mode "saved" / "updated" is the false claim ("changes saved" when nothing was saved).
+_RFQ_SAVE_CLAIM_RE = re.compile(
+    r"(✅|🎉)[^\n]{0,60}\b(saved|updated)\b"
+    r"|\b(?:saved|updated)\s+successfully\b"
+    r"|\bsuccessfully\s+(?:saved|updated)\b"
+    r"|\b(?:changes|edits|rfq|listing|draft)\b[^\n]{0,40}\b(?:has\s+been|have\s+been|was|were|is\s+now)\s+(?:successfully\s+)?(?:saved|updated|applied)\b"
+    r"|\b(?:i(?:'ve|\s+have)?)\s+(?:now\s+)?(?:saved|updated|applied)\s+(?:your|the|these|this|it)\b"
+    r"|\b(?:save|update)\s+(?:ho\s+gaya|ho\s+gayi|hogaya|kar\s+diya|kar\s+di|kardiya)\b",
     re.IGNORECASE,
 )
 
 
 def claims_rfq_created(reply_text: str) -> bool:
-    """True when a reply tells the user an RFQ was created or published."""
+    """True when a reply tells the user an RFQ was created, published, posted or listed."""
     return bool(reply_text and _RFQ_CREATION_CLAIM_RE.search(reply_text))
 
 
-def unbacked_creation_reply(draft: dict[str, Any], readiness: dict[str, Any]) -> str:
-    """Replacement for a model reply that claims an RFQ exists when none was created."""
-    return (
-        "⚠️ **Your RFQ has not been created yet.** Nothing was published to the marketplace.\n\n"
-        + format_rfq_summary_text(draft, readiness)
-        + "\n\nSay **create rfq** to publish it."
-    )
+def claims_rfq_saved(reply_text: str) -> bool:
+    """True when a reply tells the user edits were saved or an RFQ was updated."""
+    return bool(reply_text and _RFQ_SAVE_CLAIM_RE.search(reply_text))
+
+
+def unbacked_creation_reply(draft: dict[str, Any], readiness: dict[str, Any], editing: bool = False) -> str:
+    """Replacement for a model reply that claims an RFQ was published or saved when nothing was.
+
+    States only what is true; the conversation's own next question or recap follows it.
+    """
+    if editing:
+        return "⚠️ **Nothing has been saved yet.** Your changes are still pending; say \"save changes\" when you are done."
+    return "⚠️ **Your RFQ has not been created yet.** Nothing was published to the marketplace."
 
 
 async def _recover_from_false_refusal(
@@ -631,13 +654,19 @@ def _process_tool_call(
     locked_role: Optional[str] = None,
     user_text: Optional[str] = None,
     notes: Optional[list[str]] = None,
+    last_user_text: Optional[str] = None,
+    stated_product: Optional[str] = None,
 ) -> dict[str, Any]:
     """Execute update_rfq_draft tool call arguments into the draft dictionary.
 
     ``locked_role`` is the role the user stated or already had; the model may not
     flip it (it has turned "draft the rfq for supply ..." into a BUYER draft).
-    With ``user_text``, a quantity the user never wrote (the model's "1 tonne"
-    default) is dropped.
+    With ``user_text`` (everything the USER wrote in this conversation), a quantity the user
+    never wrote (the model's "1 tonne" default) is dropped, and so is every spec the user's
+    words do not support ("Class I", "Brix 14" the model made up). The model never sets
+    ``status``, and its own ``description`` is kept only when the user asked for one
+    (``last_user_text`` is the message of this turn). The product is renamed only when that message
+    states a product (``stated_product``): "continue refining it" is not the product "Continue Refinig".
     """
     fn = tool_call.get("function") or {}
     name = fn.get("name")
@@ -657,19 +686,61 @@ def _process_tool_call(
                 logger.info("Ignoring model quantity %s not given by the user", args["quantity_value"])
                 args.pop("quantity_value", None)
                 args.pop("quantity_unit", None)
+            args.pop("status", None)  # status comes from the confirmation flow only
+            if args.get("price_per_unit") is not None:
+                args["price_per_unit"] = chat_specs.normalize_per_unit(args["price_per_unit"])
+            if last_user_text is not None:
+                existing = chat_draft_assist.product_name(current_draft)
+                def renamed_ok(new_name: Any) -> bool:
+                    ok = chat_specs.rename_allowed(str(new_name), existing, last_user_text, stated_product)
+                    if not ok:
+                        logger.info(
+                            "Rejected product rename %r -> %r: %r states no such product", existing, new_name, last_user_text[:60]
+                        )
+                    return ok
+
+                if args.get("product_name") and not renamed_ok(args["product_name"]):
+                    args.pop("product_name")
+                pd = args.get("product_details")
+                if isinstance(pd, dict) and pd.get("name") and not renamed_ok(pd["name"]):
+                    args["product_details"] = {k: v for k, v in pd.items() if k != "name"}
+            if user_text is not None and isinstance(args.get("product_details"), dict):
+                flat = chat_specs.flatten_details(args["product_details"])
+                kept, dropped = chat_specs.ground_product_details(flat, user_text)
+                if dropped:
+                    logger.info("dropped ungrounded spec(s) from the model's update_rfq_draft: %s", dropped)
+                args["product_details"] = kept
+            if args.get("description") is not None and last_user_text is not None:
+                if not chat_specs.description_allowed(args["description"], last_user_text):
+                    logger.info("dropped model-written description (the user did not ask for one)")
+                    args.pop("description", None)
             if notes is not None:
                 args["_notes"] = notes
             return rfq_tool_service.update_rfq_draft(existing_draft=current_draft, **args)
     return current_draft
 
 
-def _draft_guards(messages: list[Any], last_user_content: str, draft: dict[str, Any]) -> dict[str, Any]:
+def _draft_guards(
+    messages: list[Any], last_user_content: str, draft: dict[str, Any], earlier_user_text: str = ""
+) -> dict[str, Any]:
     """Arguments for _process_tool_call that keep the model's edits honest."""
     from services import query_extractor
 
-    stated = query_extractor.detect_role(last_user_content)
+    stated = stated_role(last_user_content, bool(draft.get("role")))
     user_text = " ".join(c for r, c in (_extract_msg_fields(m) for m in messages) if r == "user")
-    return {"locked_role": stated.value if stated else draft.get("role"), "user_text": user_text}
+    if earlier_user_text:
+        user_text = f"{earlier_user_text} {user_text}"
+    from services import ai_query_parser
+
+    parse = ai_query_parser.cached(last_user_content)
+    return {
+        "locked_role": stated or draft.get("role"),
+        "user_text": user_text,
+        "last_user_text": last_user_content,
+        "stated_product": message_product(
+            parse.product if parse else None, last_user_content, query_extractor.extract(last_user_content).product
+        ),
+    }
 
 
 async def execute_create_rfq_call(
@@ -1478,6 +1549,54 @@ _OWN_ROLE_VERB_RE = re.compile(
 )
 
 
+# ---- who the user is: only their own words change the role -----------------------------------
+is_content_free = chat_specs.is_content_free
+explicit_own_role = chat_specs.explicit_own_role
+
+
+def stated_role(message: str, has_role: bool) -> Optional[str]:
+    """The role this message sets, or None. NEVER from a command, a confirmation or a recap reply.
+
+    With a role already on the draft only an explicit own-role statement changes it; with none, the
+    rule parser's reading of a message that says something (not "yes publish it") may set it.
+    """
+    from services import query_extractor
+
+    if not (message or "").strip() or is_content_free(message):
+        return None
+    explicit = explicit_own_role(message)
+    if explicit or has_role:
+        return explicit
+    detected = query_extractor.detect_role(message)
+    return detected.value if detected else None
+
+
+_META_PRODUCT_RE = re.compile(
+    r"\b(attributes?|spec(?:ification)?s?|spesications?|options?|fields?|details?|proceed|publish|post|create|submit|"
+    r"confirm|more|add|yes|okay|ok)\b",
+    re.IGNORECASE,
+)
+
+
+def message_product(ai_product: Optional[str], message: str, rule_product: Optional[str]) -> Optional[str]:
+    """The product a message names, or None.
+
+    A confirmation, a command or a greeting names none ("ok proceed" is not the product "proceed"), and
+    neither does a question about the form itself ("what attributes can I add"): the rule parser's
+    leftover words never count there. The model's product still has to appear in the user's words.
+    """
+    if is_content_free(message):
+        return None
+    grounded = _grounded_ai_product(ai_product, message)
+    if grounded:
+        return grounded
+    if not rule_product or _META_PRODUCT_RE.search(rule_product):
+        return None
+    if chat_permissions.is_question(message) and chat_conversation.asks_for_specs(message):
+        return None
+    return rule_product
+
+
 def _requested_listing_side(message: str) -> Optional[str]:
     """Which side of the market the user asked to see: "buyer details" -> "buyer"."""
     text = _SELF_ROLE_RE.sub(" ", message or "")
@@ -1551,8 +1670,10 @@ def _resolve_market_focus(
     ai = ai_extraction or {}
     req = query_extractor.extract(message)
 
-    product = _grounded_ai_product(ai.get("product"), message) or req.product
-    category = req.category or ai.get("category") or (query_extractor._infer_category(product) if product else None)
+    product = message_product(ai.get("product"), message, req.product)
+    category = None if is_content_free(message) else (
+        req.category or ai.get("category") or (query_extractor._infer_category(product) if product else None)
+    )
     if not product:
         product = previous.get("product")
         category = category or previous.get("category")
@@ -1561,12 +1682,12 @@ def _resolve_market_focus(
     role = previous.get("role")
     # Once a role is known, "buyer details" is a request to see buyers, not a
     # statement that the user is one; only an explicit own-role phrase changes it.
-    stated_role = query_extractor.detect_role(message)
-    states_own_role = bool(_OWN_ROLE_VERB_RE.search(message or "") or _SELF_ROLE_RE.search(message or ""))
     # The router model's role guess is never used: it assigns a role to almost
-    # every message ("thanks" -> buyer), which would then be written into the draft.
-    if stated_role and (not role or states_own_role or not listing_side):
-        role = stated_role.value
+    # every message ("thanks" -> buyer), which would then be written into the draft. A command or a
+    # confirmation ("yes publish it") states no role, and a known role changes only on the user's own words.
+    own = stated_role(message, bool(role))
+    if own:
+        role = own
 
     if not listing_side and role in ("buyer", "seller"):
         listing_side = "seller" if role == "buyer" else "buyer"
@@ -1716,6 +1837,25 @@ async def update_conversation_after_turn(
         },
     )
     await db.commit()
+
+
+async def _earlier_user_text(db: AsyncSession, conversation: Conversation) -> str:
+    """Everything the USER wrote in this conversation (the grounding source for the model's draft entries).
+
+    A client may send only the newest message, so the stored turns are read as well.
+    """
+    try:
+        rows = (
+            await db.execute(
+                select(Message.content)
+                .where(Message.conversation_id == conversation.id, Message.role == MessageRole.USER)
+                .order_by(Message.created_at)
+            )
+        ).scalars().all()
+    except Exception as exc:
+        logger.debug("Could not read earlier user messages: %s", exc)
+        return ""
+    return "\n".join(str(r or "") for r in rows)
 
 
 async def list_user_conversations(
@@ -2428,6 +2568,7 @@ async def _save_edit_flow(
 _CONVO_RESET: dict[str, Any] = {
     "recap_hash": None, "recap_awaiting": None, "declined_fields": None, "asked_fields": None,
     "last_asked": None, "auto_role": None, "auto_role_noted": None, "recap_publish": None,
+    "recap_snapshot": None,
 }
 _ANSWER_FIELDS = {"quantity": "quantity", "price": "price", "location": "location", "dispatch": "deadline"}
 _OPTIONAL_ASKS = ("quantity", "min_order", "price", "location", "dispatch", "hsn")
@@ -2447,8 +2588,9 @@ def _apply_answer(draft: dict[str, Any], field: str, message: str) -> bool:
         draft["quantity"] = {"value": float(ans.quantity_value), "unit": ans.quantity_unit or "pcs"}
     elif field == "price" and ans.price_amount is not None and not draft.get("price_target"):
         price: dict[str, Any] = {"amount": float(ans.price_amount), "currency": ans.price_currency or "INR"}
-        if ans.price_per_unit:
-            price["per_unit"] = ans.price_per_unit
+        per_unit = chat_specs.normalize_per_unit(ans.price_per_unit)
+        if per_unit:
+            price["per_unit"] = per_unit
         draft["price_target"] = price
     elif field == "location" and ans.city and not (draft.get("location") or {}).get("city"):
         draft["location"] = _draft_location(ans.city, ans.country)
@@ -2511,6 +2653,7 @@ async def _run_chat_turn(
             logger.exception("Failed to initialize conversation: %s", exc)
 
     state = (conversation.state or {}) if conversation else {}
+    earlier_user_text = await _earlier_user_text(db, conversation) if (db is not None and conversation is not None) else ""
     assist = chat_draft_assist.DraftAssist(state)
     if conversation is not None and isinstance(state.get("rfq_draft"), dict):
         # The server's draft is authoritative; the client copy is only for stateless calls.
@@ -2527,6 +2670,7 @@ async def _run_chat_turn(
     # the fields they declined, how often each was asked, and the register (English / Hinglish).
     gating = conversation is not None
     recap_hash = state.get("recap_hash") if gating else None
+    recap_snapshot = state.get("recap_snapshot") if gating else None  # the exact draft the recap showed
     recap_awaiting = state.get("recap_awaiting") if gating else None
     declined: list[str] = [str(x) for x in (state.get("declined_fields") or [])] if gating else []
     asked: dict[str, int] = dict(state.get("asked_fields") or {}) if gating else {}
@@ -2543,7 +2687,7 @@ async def _run_chat_turn(
         if decline == "all":
             declined = list(dict.fromkeys([
                 *declined, *_OPTIONAL_ASKS,
-                *(f"spec:{lbl}" for lbl in chat_conversation.unfilled_spec_labels(current_rfq or {}, assist.suggestions)),
+                "specs",
             ]))
             state_patch["declined_fields"] = declined
         elif decline == "one" and str(last_asked) not in ("role", "product") and str(last_asked) not in declined:
@@ -2618,15 +2762,23 @@ async def _run_chat_turn(
     if forced_create:
         allowed = {"create_rfq", "update_rfq_draft"}
     is_counterparty_msg = "draft_counterparty_message" in allowed
+    # A reply to the spec question ("quality is minimum brix, packaging carton...") can read like a lookup to the
+    # parser, but it answers the question just asked.
+    answers_specs = bool(gating and last_asked in ("specs", "hsn") and not chat_permissions.is_question(last_user_content))
     if (
         gating and last_asked and not editing_id and not lifecycle and not allowed
-        and not chat_permissions.is_information_request(last_user_content)
+        and (answers_specs or not chat_permissions.is_information_request(last_user_content))
     ):
         allowed.add("update_rfq_draft")  # a reply to the question the assistant just asked
 
+    # A confirmation or command ("yes", "ok proceed", "yes publish it") changes nothing in the draft: no pre-processing, no
+    # overlays. After a recap the draft it creates is the snapshot the user was shown.
+    confirmation_turn = bool(forced_create) or ("create_rfq" in allowed and is_content_free(last_user_content))
     if lifecycle or forced_create or decline:
         # A lifecycle command ("publish my rice rfq", "save changes") carries no draft details to extract.
         draft = json.loads(json.dumps(current_rfq or {}))
+        if forced_create and isinstance(recap_snapshot, dict) and chat_conversation.draft_hash(recap_snapshot) == recap_hash:
+            draft = json.loads(json.dumps(recap_snapshot))
         if lifecycle and lifecycle["kind"] in ("edit_load", "save") and chat_permissions.edit_command_has_change(last_user_content):
             applied_inline = apply_inline_changes(draft, last_user_content)
             if applied_inline:
@@ -2638,6 +2790,14 @@ async def _run_chat_turn(
             has_active_connection=bool(active_connection_id),
             has_previous_counterparty_msg=has_prev_counterparty,
         )
+        # A role changes only on the user's own words, never from a command or a bare confirmation.
+        prev_role = (current_rfq or {}).get("role")
+        if draft.get("role") != prev_role and draft.get("role") != stated_role(last_user_content, bool(prev_role)):
+            logger.info("Ignoring role %s -> %s read from %r", prev_role, draft.get("role"), last_user_content[:60])
+            if prev_role:
+                draft["role"] = prev_role
+            else:
+                draft.pop("role", None)
 
     if not client_cands and is_counterparty_msg and isinstance(state.get("matched_candidates"), list):
         matched_candidates = state["matched_candidates"]  # "message the first one" needs last turn's listings
@@ -2647,6 +2807,14 @@ async def _run_chat_turn(
     previous_focus = state.get("market_focus") if conversation else None
     sem_ext = {"product": parse.product, "category": parse.category, "location": parse.location} if parse else {}
     focus = _resolve_market_focus(last_user_content, previous_focus, sem_ext)
+    if (
+        gating and last_asked and not editing_id and chat_draft_assist.product_name(current_rfq)
+        and not chat_permissions.is_question(last_user_content)
+        and not chat_permissions.is_information_request(last_user_content)
+    ):
+        # An answer to the question just asked ("fuji, organic and fssai") is about the draft's product,
+        # not a new product made of the answer's words.
+        focus["product"] = chat_draft_assist.product_name(current_rfq)
 
     counterparty_context = None
     if is_counterparty_msg and db is not None and user is not None:
@@ -2666,13 +2834,17 @@ async def _run_chat_turn(
     _remember_market_focus(conversation, focus)
 
     req_linguistic = query_extractor.extract(last_user_content)
-    effective_prod = _grounded_ai_product(sem_ext.get("product"), last_user_content) or req_linguistic.product
-    effective_cat = req_linguistic.category or sem_ext.get("category") or (
-        query_extractor._infer_category(effective_prod) if effective_prod else None
+    effective_prod = message_product(sem_ext.get("product"), last_user_content, req_linguistic.product)
+    effective_cat = None if is_content_free(last_user_content) else (
+        req_linguistic.category or sem_ext.get("category") or (
+            query_extractor._infer_category(effective_prod) if effective_prod else None
+        )
     )
-    if "update_rfq_draft" in allowed:
-        stated_role = query_extractor.detect_role(last_user_content)
-        if focus["role"] and (not draft.get("role") or (stated_role and draft.get("role") != stated_role.value)):
+    if "update_rfq_draft" in allowed and not confirmation_turn:
+        own_role = stated_role(last_user_content, bool(draft.get("role")))
+        if own_role and draft.get("role") != own_role:
+            draft["role"] = own_role
+        elif focus["role"] and not draft.get("role"):
             draft["role"] = focus["role"]
         if effective_prod and not (draft.get("product_details") or {}).get("name"):
             if not isinstance(draft.get("product_details"), dict):
@@ -2689,10 +2861,31 @@ async def _run_chat_turn(
                 _clean_city_name(req_linguistic.city) or req_linguistic.city, req_linguistic.country
             )
     # The form's helpers: a typed or accepted HSN, must-match phrases, then fresh suggestions and moderation.
-    if chat_draft_assist.product_name(draft) and not chat_permissions.is_information_request(last_user_content):
+    pending = assist.pending_hsn
+    qualifier = (
+        chat_draft_assist.hsn_qualifier_answer(last_user_content, pending)
+        if (
+            pending and not confirmation_turn and not editing_id and chat_draft_assist.product_name(draft)
+            and assist.suggestions.get("hsn_for") == chat_draft_assist.product_name(draft)
+            and (assist.suggestions.get("hsn_offered") or "hsn" in previous_assistant.lower())
+            and not chat_permissions.is_question(last_user_content)
+        ) else None
+    )
+    if qualifier:
+        # "fresh" answers the fresh-or-dried distinction in the offered HSN: it accepts that HSN and is a spec
+        # (condition: Fresh), not a description.
+        chat_draft_assist.apply_hsn(draft, str(pending["code"]), pending.get("category"), assist.notes)
+        details = dict(draft.get("product_details") or {})
+        details.setdefault("condition", qualifier)
+        draft["product_details"] = details
+        assist.applied_hsn = True
+    elif (
+        chat_draft_assist.product_name(draft) and not chat_permissions.is_information_request(last_user_content)
+        and not confirmation_turn
+    ):
         typed_hsn = chat_draft_assist.explicit_hsn_code(last_user_content)
         if typed_hsn:
-            hsn_status, _hsn_item = chat_draft_assist.apply_explicit_hsn(draft, typed_hsn)
+            hsn_status, _hsn_item = chat_draft_assist.apply_explicit_hsn(draft, typed_hsn, assist.notes)
             if hsn_status == "ok":
                 assist.applied_hsn = True
             elif hsn_status in ("unknown", "invalid"):
@@ -2701,11 +2894,12 @@ async def _run_chat_turn(
             last_user_content, previous_assistant, assist.pending_hsn
         ):
             pending = assist.pending_hsn or {}
-            chat_draft_assist.apply_hsn(draft, str(pending["code"]), pending.get("category"))
+            chat_draft_assist.apply_hsn(draft, str(pending["code"]), pending.get("category"), assist.notes)
             assist.applied_hsn = True
     if assist.applied_hsn:
         allowed.add("update_rfq_draft")
-    chat_draft_assist.must_match_from_text(draft, last_user_content)
+    if not confirmation_turn:
+        chat_draft_assist.must_match_from_text(draft, last_user_content)
 
     def lock_role() -> None:
         if edit_ctx["snapshot"] and chat_rfq_edit.enforce_locked_role(draft, edit_ctx["snapshot"]):
@@ -2751,7 +2945,7 @@ async def _run_chat_turn(
     enforce_account_role()
     if (
         gating and last_asked in _ANSWER_FIELDS and "update_rfq_draft" in allowed and not edit_ctx["snapshot"]
-        and not chat_permissions.is_question(last_user_content)
+        and not confirmation_turn and not chat_permissions.is_question(last_user_content)
     ):
         _apply_answer(draft, str(last_asked), last_user_content)
     await assist.refresh(draft)
@@ -2763,7 +2957,7 @@ async def _run_chat_turn(
         and "update_rfq_draft" in allowed and "create_rfq" not in allowed and not is_counterparty_msg
         and chat_permissions._drafting_in_progress(draft)
         and not chat_permissions.is_question(last_user_content)
-        and not chat_permissions.is_information_request(last_user_content)
+        and (answers_specs or not chat_permissions.is_information_request(last_user_content))
     )
 
     def pick_next() -> str:
@@ -2771,7 +2965,11 @@ async def _run_chat_turn(
             draft, assist.suggestions, role=draft.get("role") or sole_role, declined=declined, asked=asked
         )
 
-    ask_field = pick_next() if drafting_turn else None
+    ask_field = None
+    if drafting_turn:
+        if pick_next() in ("hsn", "recap") and assist.specs_pending(draft):
+            await assist.settle_specs(draft)  # the spec question comes before the recap: give a running fetch its time
+        ask_field = pick_next()
     ask_text = (
         chat_conversation.question_text(ask_field, {**draft, "role": draft.get("role") or sole_role}, assist.suggestions, lang)
         if ask_field and ask_field != "recap" else None
@@ -2941,8 +3139,37 @@ async def _run_chat_turn(
         yield await finish(reply=reply, tool_step=step, created=published)
         return
 
+    if (
+        gating and not lifecycle and not edit_ctx["id"] and "create_rfq" not in allowed and not is_counterparty_msg
+        and chat_draft_assist.product_name(draft) and chat_conversation.asks_for_specs(last_user_content)
+    ):
+        # "what specs can I add": answered from the stored suggestions (with their options), not by a model essay.
+        if assist.specs_pending(draft):
+            await assist.settle_specs(draft)
+        listing = chat_conversation.specs_listing(draft, assist.suggestions, lang)
+        if listing:
+            asked["specs"] = max(1, asked.get("specs", 0))
+            state_patch.update(asked_fields=dict(asked), last_asked="specs")
+            yield await finish(reply=listing)
+            return
+
+    if (
+        gating and not lifecycle and not edit_ctx["id"] and "create_rfq" not in allowed and not is_counterparty_msg
+        and chat_draft_assist.product_name(draft) and chat_specs.wants_to_refine(last_user_content)
+    ):
+        # "continue refining it" / "add more details": the answer is the spec question (never the recap, never a model choice).
+        if assist.specs_pending(draft):
+            await assist.settle_specs(draft)
+        if chat_conversation.unfilled_specs(draft, assist.suggestions):
+            asked["specs"] = 1
+            state_patch.update(asked_fields=dict(asked), last_asked="specs", recap_hash=None, recap_awaiting=None)
+            yield await finish(reply=chat_conversation.question_text(
+                "specs", {**draft, "role": draft.get("role") or sole_role}, assist.suggestions, lang
+            ))
+            return
+
     if kind == "recap_no":
-        state_patch.update(recap_hash=None, recap_awaiting=None)
+        state_patch.update(recap_hash=None, recap_awaiting=None, recap_snapshot=None)
         if edit_ctx["id"]:
             reply = (
                 "Theek hai, kuch save nahi kiya. Aap kya badalna chahte hain?" if lang == "hinglish"
@@ -3028,10 +3255,11 @@ async def _run_chat_turn(
         agent_state["info"] = agent_info(agent_for_tools(["create_rfq"]) or routed_agent)
         explicit_draft = recap_reply == "draft" or chat_permissions.wants_draft_status(last_user_content)
         # The user must have seen what will be posted: the recap of this exact draft, or an explicit "save as draft".
-        confirmed = (
-            not gating or bool(forced_create) or explicit_draft
-            or (recap_awaiting == "create" and recap_hash == chat_conversation.draft_hash(draft))
-        )
+        # A bare "yes" confirms only the draft the recap showed (the snapshot); if the draft is not that, recap again.
+        draft_is_recapped = recap_awaiting == "create" and recap_hash == chat_conversation.draft_hash(draft)
+        confirmed = not gating or explicit_draft or draft_is_recapped
+        if forced_create and not draft_is_recapped:
+            logger.info("Draft differs from the recap it was confirmed against; showing a fresh recap")
         if (
             readiness["has_role"] and readiness["has_product"] and not confirmed
             and not await assist.block_reason(draft)  # unsafe content is refused by the create call, not recapped
@@ -3040,6 +3268,7 @@ async def _run_chat_turn(
             note = auto if auto and not state.get("auto_role_noted") else None
             state_patch.update(
                 recap_hash=chat_conversation.draft_hash(draft), recap_awaiting="create", last_asked=None,
+                recap_snapshot=json.loads(json.dumps(draft)),
                 **({"auto_role_noted": True} if note else {}),
             )
             yield await finish(reply=chat_conversation.build_recap(draft, lang, role_note=note))
@@ -3110,24 +3339,43 @@ async def _run_chat_turn(
             note = auto if auto and not state.get("auto_role_noted") else None
             state_patch.update(
                 recap_hash=h, recap_awaiting="create", last_asked=None, asked_fields=dict(asked),
+                recap_snapshot=json.loads(json.dumps(draft)),
                 **({"auto_role_noted": True} if note else {}),
             )
             return chat_conversation.build_recap(draft, lang, role_note=note)
         asked[field] = asked.get(field, 0) + 1
         state_patch.update(asked_fields=dict(asked), last_asked=field)
-        if "?" in reply_text:
-            return ""
-        return chat_conversation.question_text(
+        question = chat_conversation.question_text(
             field, {**draft, "role": draft.get("role") or sole_role}, assist.suggestions, lang
         )
+        if question in reply_text:
+            return ""
+        pending_code = str((assist.pending_hsn or {}).get("code") or "")
+        if field == "hsn" and pending_code and pending_code in reply_text:
+            return ""  # the model already made the HSN offer
+        if field == "specs":
+            return question  # the spec question follows even an HSN offer
+        return "" if "?" in reply_text else question
+
+    def fallback_closing(d: dict[str, Any]) -> Optional[str]:
+        """The drafting fallback's last line follows the conversation: the next question, or "" when the recap is appended."""
+        if not drafting_turn or role_refused:
+            return None
+        field = chat_conversation.next_question(
+            d, assist.suggestions, role=d.get("role") or sole_role, declined=declined, asked=asked
+        )
+        if field == "recap":
+            return ""
+        return chat_conversation.question_text(field, {**d, "role": d.get("role") or sole_role}, assist.suggestions, lang)
 
     # ---- answer: read tools + allowed action tools ----------------------
     captured_tool_step: Optional[dict[str, Any]] = None
     try:
         queue: asyncio.Queue = asyncio.Queue()
+        pre_turn_draft = json.loads(json.dumps(draft))  # what the verifier may take draft values from
         runner = _ActionRunner(
             draft=draft,
-            draft_guards=_draft_guards(messages, last_user_content, draft),
+            draft_guards=_draft_guards(messages, last_user_content, draft, earlier_user_text),
             db=db,
             user=user,
             conversation=conversation,
@@ -3164,6 +3412,8 @@ async def _run_chat_turn(
                     drafting="update_rfq_draft" in allowed
                     and chat_permissions.effective_intent(last_user_content, parsed_intent)
                     in chat_permissions.DRAFTING_INTENTS,
+                    verify_draft=pre_turn_draft,
+                    drafting_closing=fallback_closing,
                 ),
             )
         )
@@ -3197,6 +3447,8 @@ async def _run_chat_turn(
         if not runner.created_rfq_obj:
             await assist.refresh(draft)  # a product or text the model just recorded
         readiness = rfq_tool_service.evaluate_rfq_readiness(draft)
+        if drafting_turn and not role_refused and draft and pick_next() in ("hsn", "recap") and assist.specs_pending(draft):
+            await assist.settle_specs(draft)  # the spec question comes before the recap
         created_rfq_obj = runner.created_rfq_obj
         counterparty_msg_obj = runner.counterparty_msg_obj
         captured_tool_step = runner.captured_tool_step
@@ -3229,10 +3481,14 @@ async def _run_chat_turn(
         if is_false_positive_refusal(total_content, last_user_content):
             total_content = await _recover_from_false_refusal(prepared_messages, last_user_content, call_model=True) or ""
 
-        # Never let the model announce an RFQ that was not actually created.
-        if not created_rfq_obj and claims_rfq_created(total_content):
-            logger.warning("Model claimed RFQ creation without a create_rfq call; correcting reply.")
-            total_content = unbacked_creation_reply(draft, readiness)
+        # Never let the model announce an RFQ that was not actually created (published, posted, saved).
+        claim_replaced = False
+        if not created_rfq_obj and (
+            claims_rfq_created(total_content) or (edit_ctx["id"] and claims_rfq_saved(total_content))
+        ):
+            logger.warning("Model claimed RFQ creation or a save without the action; correcting reply.")
+            total_content = unbacked_creation_reply(draft, readiness, editing=bool(edit_ctx["id"]))
+            claim_replaced = True
 
         # The model may skip the message tool; compose the letter deterministically.
         if not counterparty_msg_obj and (is_counterparty_msg or _DISPATCH_REPLY_RE.search(total_content)):
@@ -3304,6 +3560,10 @@ async def _run_chat_turn(
 
         if not total_content.strip() and thinking and not counterparty_msg_obj and not created_rfq_obj:
             total_content, thinking = thinking, None
+        if total_content.strip() and not created_rfq_obj and not counterparty_msg_obj:
+            total_content = _contradiction_free(total_content, assist, draft)
+            if drafting_turn and not role_refused and draft:
+                total_content = _drop_invented_choices(total_content, assist)
         assist.note_reply(total_content)
 
         if total_content.strip() and not created_rfq_obj:
@@ -3333,6 +3593,8 @@ async def _run_chat_turn(
             if wants_links and "/marketplace?rfq=" not in total_content and not total_content.startswith("⚠️"):
                 appendix = build_rfq_link_appendix(tool_cards)
             tail = conversation_tail(total_content)
+            if not tail and claim_replaced and not edit_ctx["id"]:
+                tail = format_rfq_summary_text(draft, readiness)  # the true state, when no next question or recap applies
             if tail:
                 assist.note_reply(tail)
                 appendix = f"{appendix}\n\n{tail}" if appendix else f"\n\n{tail}"
@@ -3354,6 +3616,50 @@ async def _run_chat_turn(
     except Exception as exc:
         logger.error("Chat turn failed: %s", exc)
         yield await finish(kind="error", reply=_CONNECTION_LOST, tool_step=captured_tool_step)
+
+
+_NO_HSN_CLAIM_RE = re.compile(
+    r"\bno\s+hsn(?:\s+code)?\b|\bhsn(?:\s+code)?\s+(?:was\s+|is\s+)?not\s+found\b|\b(?:could\s*n'?t|can\s*not|can'?t|did\s*n'?t)\s+(?:find|locate)\s+(?:an?\s+)?hsn\b",
+    re.IGNORECASE,
+)
+_CHOICE_QUESTION_RE = re.compile(
+    r"\b(publish|post|refin\w*|proceed|continue|create|submit|finali[sz]e|add\s+more|ready\s+to|"
+    r"would\s+you\s+like|do\s+you\s+want|shall\s+i|want\s+me\s+to)\b",
+    re.IGNORECASE,
+)
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def _contradiction_free(reply: str, assist: chat_draft_assist.DraftAssist, draft: dict[str, Any]) -> str:
+    """Drop "no HSN code found" while a suggestion exists or an HSN is applied: a read tool coming back empty does not undo it."""
+    if not (assist.pending_hsn or chat_draft_assist.user_hsn(draft)) or not _NO_HSN_CLAIM_RE.search(reply):
+        return reply
+    logger.info("Dropped a 'no HSN found' claim that contradicts the suggested/applied HSN")
+    lines = []
+    for line in reply.split("\n"):
+        kept = [sent for sent in _SENTENCE_SPLIT_RE.split(line) if not _NO_HSN_CLAIM_RE.search(sent)]
+        if kept:
+            lines.append(" ".join(kept))
+    return "\n".join(lines).strip()
+
+
+def _drop_invented_choices(reply: str, assist: chat_draft_assist.DraftAssist) -> str:
+    """Remove model-made closing choices ("Ready to publish or continue refining?") from a drafting reply.
+
+    Questions that carry the pending HSN offer stay; the flow's own next question or recap is appended after.
+    """
+    code = str((assist.pending_hsn or {}).get("code") or "")
+    lines = []
+    for line in reply.split("\n"):
+        kept = []
+        for sent in _SENTENCE_SPLIT_RE.split(line):
+            if sent.rstrip().endswith("?") and _CHOICE_QUESTION_RE.search(sent) and not (code and code in sent):
+                logger.info("Dropped a model-invented question from a drafting reply: %r", sent[:80])
+                continue
+            kept.append(sent)
+        if kept:
+            lines.append(" ".join(kept))
+    return "\n".join(lines).strip()
 
 
 async def generate_business_chat_reply(

@@ -15,7 +15,7 @@ import json
 import re
 from typing import Any, Iterable, Optional
 
-from services import chat_draft_assist, drafting_reply
+from services import chat_draft_assist, chat_specs, drafting_reply
 
 _HASH_KEYS = (
     "role", "category", "title", "product_details", "quantity", "minimum_order", "price_target", "location",
@@ -23,7 +23,8 @@ _HASH_KEYS = (
 )
 _NOT_SPECS = {"name", "hsn_code", "hsn_source"}
 MAIN_ASK_LIMIT = 2  # a plain field is asked at most this many times before it is let go
-MAX_SPEC_QUESTIONS = 3
+MAX_SPEC_QUESTIONS = 3  # specs listed in the one combined spec question
+MAX_SPEC_LIST = 8  # specs listed when the user asks what they can add
 
 
 def draft_hash(draft: Optional[dict[str, Any]]) -> str:
@@ -63,15 +64,22 @@ def _filled(draft: dict[str, Any], field: str) -> bool:
     return False
 
 
-def unfilled_spec_labels(draft: dict[str, Any], suggestions: Optional[dict[str, Any]]) -> list[str]:
+def unfilled_specs(draft: dict[str, Any], suggestions: Optional[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The suggested specs the draft has no value for yet, must-match presets first (suggestion order otherwise)."""
     details = draft.get("product_details") or {}
     have = {chat_draft_assist._norm_key(k) for k in details}
-    out: list[str] = []
+    out: list[dict[str, Any]] = []
     for spec in (suggestions or {}).get("specs") or []:
+        if not isinstance(spec, dict):
+            continue
         label = str(spec.get("label") or spec.get("key") or "").strip()
         if label and chat_draft_assist._norm_key(label) not in have and chat_draft_assist._norm_key(spec.get("key") or "") not in have:
-            out.append(label)
-    return out
+            out.append(spec)
+    return sorted(out, key=lambda sp: 0 if sp.get("must_match") else 1)
+
+
+def unfilled_spec_labels(draft: dict[str, Any], suggestions: Optional[dict[str, Any]]) -> list[str]:
+    return [str(sp.get("label") or sp.get("key")).strip() for sp in unfilled_specs(draft, suggestions)]
 
 
 def next_question(
@@ -84,9 +92,9 @@ def next_question(
     """The ONE field to ask about next, most important first, or ``"recap"`` when nothing is left.
 
     Order: role, product, quantity, minimum order (sellers only), price, location, dispatch days,
-    suggested specs (one per turn, at most three overall), the HSN offer, then the recap.
+    the suggested specs (ONE combined question, asked once), the HSN offer, then the recap.
     Returns ``"role" | "product" | "quantity" | "min_order" | "price" | "location" | "dispatch" |
-    "spec:<label>" | "hsn" | "recap"``.
+    "specs" | "hsn" | "recap"``.
     """
     declined = set(declined)
     asked = asked or {}
@@ -104,12 +112,8 @@ def next_question(
     for field in order:
         if not _filled(draft, field) and not skip(field):
             return field
-    spec_asked = sum(1 for k in asked if k.startswith("spec:"))
-    if spec_asked < MAX_SPEC_QUESTIONS:
-        for label in unfilled_spec_labels(draft, suggestions):
-            key = f"spec:{label}"
-            if key not in declined and asked.get(key, 0) < 1:
-                return key
+    if "specs" not in declined and asked.get("specs", 0) < 1 and unfilled_specs(draft, suggestions):
+        return "specs"
     hsn = suggestions.get("hsn")
     if (
         isinstance(hsn, dict) and hsn.get("code") and not chat_draft_assist.user_hsn(draft)
@@ -133,7 +137,10 @@ _Q = {
         "location_seller": "Which city will it be dispatched from?",
         "dispatch_buyer": "Within how many days do you need it?",
         "dispatch_seller": "Within how many days can you dispatch it?",
-        "spec": "Do you have a preference for {label}? Say \"skip\" if it does not matter.",
+        "specs_buyer": "To match you with the right sellers, tell me a few specs (or say skip):",
+        "specs_seller": "To match you with the right buyers, tell me a few specs (or say skip):",
+        "specs_listing": "Here are the specs you can add for {p}:",
+        "specs_listing_end": "Tell me any values you want to set (or say skip).",
         "hsn": "I suggest HSN {code} ({title}). Shall I use it?",
         "buy": "buy", "sell": "sell",
     },
@@ -150,7 +157,10 @@ _Q = {
         "location_seller": "Maal kis shehar se dispatch hoga?",
         "dispatch_buyer": "Aapko kitne din ke andar chahiye?",
         "dispatch_seller": "Aap kitne din mein dispatch kar sakte hain?",
-        "spec": "Kya {label} ke liye koi preference hai? Zaroori na ho to \"skip\" likhiye.",
+        "specs_buyer": "Sahi sellers se match karne ke liye kuch specs bataiye (ya skip likhiye):",
+        "specs_seller": "Sahi buyers se match karne ke liye kuch specs bataiye (ya skip likhiye):",
+        "specs_listing": "{p} ke liye aap yeh specs add kar sakte hain:",
+        "specs_listing_end": "Jo values set karni hain woh bataiye (ya skip likhiye).",
         "hsn": "Main HSN {code} ({title}) suggest karta hoon. Ise use karun?",
         "buy": "kharidna", "sell": "bechna",
     },
@@ -173,12 +183,51 @@ def question_text(field: str, draft: dict[str, Any], suggestions: Optional[dict[
         return t["min_order"]
     if field in ("price", "location", "dispatch"):
         return t[f"{field}_{side}"]
-    if field.startswith("spec:"):
-        return t["spec"].format(label=field.split(":", 1)[1])
+    if field == "specs":
+        specs = unfilled_specs(draft, suggestions)[:MAX_SPEC_QUESTIONS]
+        return "\n".join([t[f"specs_{side}"], *(spec_line(sp) for sp in specs)])
     if field == "hsn":
         hsn = (suggestions or {}).get("hsn") or {}
         return t["hsn"].format(code=hsn.get("code", ""), title=hsn.get("formatted_title") or hsn.get("description") or "")
     return ""
+
+
+def spec_line(spec: dict[str, Any], max_options: int = 4) -> str:
+    """"• Variety — Fuji, Gala, Granny Smith…" (options only when the suggestion has them)."""
+    label = str(spec.get("label") or spec.get("key") or "").strip()
+    options = [str(o).strip() for o in (spec.get("options") or []) if str(o).strip()]
+    if not options:
+        return f"• {label}"
+    more = "…" if len(options) > max_options else ""
+    return f"• {label} — {', '.join(options[:max_options])}{more}"
+
+
+def specs_listing(draft: dict[str, Any], suggestions: Optional[dict[str, Any]], lang: str = "en") -> str:
+    """Every unfilled suggested spec with its options: the answer to "what specs can I add?". "" when none."""
+    t = _Q[lang if lang in _Q else "en"]
+    specs = unfilled_specs(draft, suggestions)[:MAX_SPEC_LIST]
+    if not specs:
+        return ""
+    name = chat_draft_assist.product_name(draft) or "this product"
+    head = t["specs_listing"].format(p=name.title())
+    return "\n".join([head, *(spec_line(sp, max_options=6) for sp in specs), "", t["specs_listing_end"]])
+
+
+_SPEC_WORD = r"(?:attributes?|spec(?:ification)?s?|spesifications?|spesications?|specifcations?|specs?)"
+_ASKS_SPECS_RE = re.compile(
+    rf"\b(?:what|which|show|list|tell|suggest|kya|kaun\s*(?:se|si)|konse|konsi)\b[^.?!]{{0,60}}\b{_SPEC_WORD}\b"
+    rf"|\b{_SPEC_WORD}\b[^.?!]{{0,40}}\b(?:can|could|should|may|available|options?|suggest\w*|add|include|chahiye|jod)\b",
+    re.IGNORECASE,
+)
+
+
+def asks_for_specs(message: str) -> bool:
+    """"what attributes or specification i can add": a question about which specs exist, not a value."""
+    text = (message or "").strip()
+    if not text or re.search(r"\d", text):
+        return False
+    return bool(_ASKS_SPECS_RE.search(text)) and (text.endswith("?") or bool(re.match(
+        r"^\s*(?:what|which|show|list|tell|suggest|kya|kaun|konse|konsi|can|could|should)\b", text, re.IGNORECASE)))
 
 
 # ---------------------------------------------------------------------------
@@ -216,10 +265,11 @@ def detect_decline(message: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 _YES_RE = re.compile(
     r"^\s*(?:(?:yes|yeah|yep|yup|haan|han|ha|ji|okay|ok|sure)\s*[,!.]?\s*)*"
-    r"(?:(?:please\s+)?(?:go\s+ahead|do\s+it|publish(?:\s+it)?|post(?:\s+it)?|create(?:\s+it)?(?:\s+rfq)?|confirm(?:ed)?|"
+    r"(?:(?:please\s+)?(?:go\s+ahead|do\s+it|proceed|submit(?:\s+it)?|finali[sz]e(?:\s+it)?|looks\s+good|all\s+good|"
+    r"publish(?:\s+it)?|post(?:\s+it)?|create(?:\s+it)?(?:\s+rfq)?|confirm(?:ed)?|"
     r"theek\s+hai|thik\s+hai|sahi\s+hai|publish\s+kar\s*(?:do|dijiye|o)|post\s+kar\s*(?:do|dijiye|o)|"
     r"kar\s*(?:do|dijiye|o)|kardo|please)\s*)?"
-    r"(?:ji\s*)?[.!]*\s*$",
+    r"(?:(?:now|please|ji|abhi)\s*)*[.!]*\s*$",
     re.IGNORECASE,
 )
 _DRAFT_RE = re.compile(
@@ -264,6 +314,7 @@ _L = {
         "location": "Location", "deadline_buyer": "Deadline", "deadline_seller": "Dispatch within",
         "within": "within {n} days", "days": "{n} days", "specs": "Specs", "must": "must match",
         "description": "Description", "not_set": "Not set", "per": "per", "category": "Category",
+        "no_per": "per-unit not set", "yes": "yes", "no": "no",
         "q_publish": "Shall I publish it now, or save it as a draft?",
         "role_note": "your account can only post as a {r}",
         "edit_intro": "Here is what will change:", "q_save": "Save these changes?",
@@ -279,6 +330,7 @@ _L = {
         "location": "Location", "deadline_buyer": "Deadline", "deadline_seller": "Dispatch",
         "within": "{n} din ke andar", "days": "{n} din mein", "specs": "Specs", "must": "match hona zaroori",
         "description": "Description", "not_set": "Set nahi hai", "per": "per", "category": "Category",
+        "no_per": "per-unit set nahi", "yes": "haan", "no": "nahi",
         "q_publish": "Ise abhi publish karun ya draft mein save karun?",
         "role_note": "aapka account sirf {r} ke roop mein post kar sakta hai",
         "edit_intro": "Yeh badlav honge:", "q_save": "Ye changes save karun?",
@@ -303,11 +355,13 @@ def _qty(q: Any) -> str:
     return f"{_num(q['value'])} {q.get('unit') or ''}".strip()
 
 
-def _price(p: Any, per: str) -> str:
+def _price(p: Any, t: dict[str, Any]) -> str:
+    """"USD 20 per kg"; without a per-unit the recap says so instead of guessing one."""
     if not isinstance(p, dict) or p.get("amount") is None:
         return ""
-    unit = f" {per} {p['per_unit']}" if p.get("per_unit") else ""
-    return f"{p.get('currency') or 'INR'} {_num(p['amount'])}{unit}"
+    unit = chat_specs.normalize_per_unit(p.get("per_unit"))
+    tail = f" {t['per']} {unit}" if unit else f" ({t['no_per']})"
+    return f"{p.get('currency') or 'INR'} {_num(p['amount'])}{tail}"
 
 
 def _loc(loc: Any) -> str:
@@ -326,13 +380,27 @@ def _deadline(dl: Any, t: dict[str, Any], seller: bool) -> str:
     return ""
 
 
+def _spec_value(v: Any, t: dict[str, Any]) -> str:
+    if isinstance(v, bool):
+        return t["yes"] if v else t["no"]
+    if isinstance(v, (list, tuple, set)):
+        return ", ".join(_spec_value(i, t) for i in v if i not in (None, ""))
+    if isinstance(v, dict):
+        return ", ".join(f"{k} {_spec_value(i, t)}" for k, i in v.items())
+    return _num(v) if isinstance(v, (int, float)) else str(v)
+
+
 def _specs(details: Any, t: dict[str, Any]) -> list[tuple[str, str, bool]]:
+    """The recap's specs: never the form's own fields, never a raw dict or list repr."""
     out: list[tuple[str, str, bool]] = []
     details = details if isinstance(details, dict) else {}
     for k, v in details.items():
-        if str(k) in _NOT_SPECS or str(k).endswith(chat_draft_assist.MUST_MATCH_SUFFIX):
+        if (
+            str(k) in _NOT_SPECS or str(k).endswith(chat_draft_assist.MUST_MATCH_SUFFIX)
+            or chat_specs.is_core_key(k) or v in (None, "", [], {})
+        ):
             continue
-        out.append((str(k), str(v), bool(details.get(f"{k}{chat_draft_assist.MUST_MATCH_SUFFIX}"))))
+        out.append((str(k), _spec_value(v, t), bool(details.get(f"{k}{chat_draft_assist.MUST_MATCH_SUFFIX}"))))
     return out
 
 
@@ -358,8 +426,8 @@ def build_recap(draft: dict[str, Any], lang: str = "en", role_note: Optional[str
         lines.append(f"- **{t['quantity']}:** {_qty(draft['quantity'])}")
     if seller and _qty(draft.get("minimum_order")):
         lines.append(f"- **{t['min_order']}:** {_qty(draft['minimum_order'])}")
-    if _price(draft.get("price_target"), t["per"]):
-        lines.append(f"- **{t['price_seller' if seller else 'price_buyer']}:** {_price(draft['price_target'], t['per'])}")
+    if _price(draft.get("price_target"), t):
+        lines.append(f"- **{t['price_seller' if seller else 'price_buyer']}:** {_price(draft['price_target'], t)}")
     if _loc(draft.get("location")):
         lines.append(f"- **{t['location']}:** {_loc(draft['location'])}")
     if _deadline(draft.get("deadline"), t, seller):
@@ -387,7 +455,7 @@ def _field_value(key: str, draft: dict[str, Any], t: dict[str, Any], seller: boo
     if key == "minimum_order":
         return _qty(draft.get("minimum_order"))
     if key == "price_target":
-        return _price(draft.get("price_target"), t["per"])
+        return _price(draft.get("price_target"), t)
     if key == "location":
         return _loc(draft.get("location"))
     if key == "deadline":

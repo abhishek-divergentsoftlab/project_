@@ -29,7 +29,7 @@ _QUESTIONS = {
         "price_target": "Do you have a target price in mind?",
         "deadline": "By when do you need it?",
         "deadline_sell": "By when can you supply it?",
-        "done": "Your RFQ draft looks complete. Say 'create RFQ' when you want to publish it.",
+        "done": "Your RFQ draft looks complete. Shall I publish it now, or save it as a draft?",
         "ack_buy": "Got it: you want to buy {p}.",
         "ack_sell": "Got it: you want to sell {p}.",
         "ack_loc": " Location: {c}.",
@@ -44,7 +44,7 @@ _QUESTIONS = {
         "price_target": "Kya aapke mind me koi target price hai?",
         "deadline": "Aapko yeh kab tak chahiye?",
         "deadline_sell": "Aap yeh kab tak supply kar sakte hain?",
-        "done": "Aapka RFQ draft taiyaar hai. Publish karne ke liye 'create RFQ' likhiye.",
+        "done": "Aapka RFQ draft taiyaar hai. Ise abhi publish karun ya draft mein save karun?",
         "ack_buy": "Samajh gaya: aap {p} kharidna chahte hain.",
         "ack_sell": "Samajh gaya: aap {p} bechna chahte hain.",
         "ack_loc": " Location: {c}.",
@@ -59,7 +59,7 @@ _QUESTIONS = {
         "price_target": "क्या आपके मन में कोई टारगेट प्राइस है?",
         "deadline": "आपको यह कब तक चाहिए?",
         "deadline_sell": "आप यह कब तक सप्लाई कर सकते हैं?",
-        "done": "आपका RFQ ड्राफ्ट तैयार है। पब्लिश करने के लिए 'create RFQ' लिखें।",
+        "done": "आपका RFQ ड्राफ्ट तैयार है। क्या मैं इसे अभी पब्लिश करूं या ड्राफ्ट में सेव करूं?",
         "ack_buy": "ठीक है: आप {p} खरीदना चाहते हैं।",
         "ack_sell": "ठीक है: आप {p} बेचना चाहते हैं।",
         "ack_loc": " स्थान: {c}।",
@@ -89,8 +89,14 @@ def _missing_field(draft: dict[str, Any]) -> Optional[str]:
     return None
 
 
-def build_drafting_reply(draft: dict[str, Any], readiness: dict[str, Any], user_message: str = "") -> str:
-    """One line on what was captured, then the next question. No example numbers."""
+def build_drafting_reply(
+    draft: dict[str, Any], readiness: dict[str, Any], user_message: str = "", closing: Optional[str] = None
+) -> str:
+    """One line on what was captured, then the next question. No example numbers.
+
+    ``closing`` is the conversation's own next step (the next question, or "" when the caller appends the
+    recap); None falls back to this module's field order.
+    """
     t = _QUESTIONS[detect_style(user_message)]
     role = str(draft.get("role") or "").lower()
     product = (draft.get("product_details") or {}).get("name") or draft.get("category")
@@ -105,7 +111,9 @@ def build_drafting_reply(draft: dict[str, Any], readiness: dict[str, Any], user_
         parts.append(ack)
 
     nxt = readiness.get("next_required_prompt")
-    if nxt == "role":
+    if closing is not None:
+        question = closing
+    elif nxt == "role":
         question = t["role"]
     elif nxt == "product":
         question = t["product"].format(verb=t["sell" if sell else "buy"])
@@ -117,5 +125,6 @@ def build_drafting_reply(draft: dict[str, Any], readiness: dict[str, Any], user_
             question = t[field + "_sell"]
         else:
             question = t[field]
-    parts.append(question)
+    if question:
+        parts.append(question)
     return " ".join(parts)
