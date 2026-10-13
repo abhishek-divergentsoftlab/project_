@@ -32,6 +32,7 @@ from services.answer_engine import AnswerContext
 from services.agent_registry import AgentDefinition, GENERAL_ASSISTANT
 from services import (
     ai_query_parser, chat_conversation, chat_draft_assist, chat_permissions, chat_reply, chat_rfq_edit, chat_spec_filing, chat_specs,
+    spec_catalog,
 )
 from services.agent_router import agent_for_intent, agent_for_tools, agent_info
 
@@ -643,6 +644,10 @@ def build_rfq_system_prompt(
             rule_lines.append(line)
     if allowed_tools is not None:
         rule_lines.append("- Actions not listed above are not available this turn; never claim to have performed them.")
+    rule_lines.append(
+        "- For 'which varieties / packaging / specs can I choose' call `get_spec_options`; for 'which HSN code' call `lookup_hsn`; "
+        "answer only from their results."
+    )
     rule_lines.append("- Keep responses concise, data-rich, and directly actionable.")
     rules = "\n".join(rule_lines)
     prompt_parts.append(rules)
@@ -668,6 +673,7 @@ def _process_tool_call(
     notes: Optional[list[str]] = None,
     last_user_text: Optional[str] = None,
     stated_product: Optional[str] = None,
+    spec_family: Optional[spec_catalog.Family] = None,
 ) -> dict[str, Any]:
     """Execute update_rfq_draft tool call arguments into the draft dictionary.
 
@@ -722,6 +728,11 @@ def _process_tool_call(
                 if dropped:
                     logger.info("dropped ungrounded spec(s) from the model's update_rfq_draft: %s", dropped)
                 args["product_details"] = kept
+            if spec_family is not None and isinstance(args.get("product_details"), dict):
+                # The model's keys and values in the catalogue's canonical form, before they are merged into the draft.
+                args["product_details"] = spec_family.normalize_details(args["product_details"], strip_core=True)
+                if isinstance(args.get("must_match"), (list, tuple)):
+                    args["must_match"] = [spec_family.canonical_key(str(n)) for n in args["must_match"]]
             if args.get("description") is not None and last_user_text is not None:
                 if not chat_specs.description_allowed(args["description"], last_user_text):
                     logger.info("dropped model-written description (the user did not ask for one)")
@@ -1566,6 +1577,12 @@ is_content_free = chat_specs.is_content_free
 explicit_own_role = chat_specs.explicit_own_role
 
 
+_BARE_ROLE_RE = re.compile(
+    r"(?:(?:i\s+am\s+|i'm\s+|just\s+|to\s+)?(?P<buy>buy(?:ing|er)?|purchas(?:e|ing)|khar[ie]+dn[ae]|khar[ie]+d(?:ni|na))"
+    r"|(?:i\s+am\s+|i'm\s+|just\s+|to\s+)?(?P<sell>sell(?:ing|er)?|supplier|bechna|bechne|bechni))"
+)
+
+
 def stated_role(message: str, has_role: bool) -> Optional[str]:
     """The role this message sets, or None. NEVER from a command, a confirmation or a recap reply.
 
@@ -1579,6 +1596,9 @@ def stated_role(message: str, has_role: bool) -> Optional[str]:
     explicit = explicit_own_role(message)
     if explicit or has_role:
         return explicit
+    bare = _BARE_ROLE_RE.fullmatch(" ".join(message.lower().split()).strip(" .!"))
+    if bare:  # the answer to "buying or selling?" ("Buying" is also a quick reply)
+        return "buyer" if bare.group("buy") else "seller"
     detected = query_extractor.detect_role(message)
     return detected.value if detected else None
 
@@ -2096,11 +2116,20 @@ class _ActionRunner:
 
         if name == "update_rfq_draft":
             notes = self.assist.notes if self.assist is not None else None
+            family = (
+                chat_draft_assist.family_for(
+                    {**self.draft, "product_details": {"name": raw_args.get("product_name") or chat_draft_assist.product_name(self.draft)}},
+                    self.assist.suggestions.get("specs"),
+                ) if self.assist is not None else None
+            )
             self.draft = _process_tool_call(
-                {"function": {"name": name, "arguments": raw_args}}, self.draft, notes=notes, **self.draft_guards
+                {"function": {"name": name, "arguments": raw_args}}, self.draft, notes=notes, spec_family=family,
+                **self.draft_guards,
             )
             if self.assist is not None:
-                chat_draft_assist.apply_spec_suggestions(self.draft, self.assist.suggestions.get("specs"))
+                chat_draft_assist.apply_spec_suggestions(
+                    self.draft, self.assist.suggestions.get("specs"), self.assist.suggestions.get("answered") or ()
+                )
             self._step(
                 {
                     "name": "update_rfq_draft",
@@ -2161,6 +2190,7 @@ class TurnResult:
     draft_suggestions: Optional[dict[str, Any]] = None
     draft_moderation: Optional[dict[str, Any]] = None
     editing_rfq_id: Optional[str] = None
+    quick_replies: Optional[list[str]] = None
 
     def as_response(self) -> dict[str, Any]:
         return {
@@ -2176,6 +2206,7 @@ class TurnResult:
             "draft_suggestions": self.draft_suggestions,
             "draft_moderation": self.draft_moderation,
             "editing_rfq_id": self.editing_rfq_id,
+            "quick_replies": self.quick_replies,
         }
 
 
@@ -2700,6 +2731,8 @@ async def _run_chat_turn(
     declined: list[str] = [str(x) for x in (state.get("declined_fields") or [])] if gating else []
     asked: dict[str, int] = dict(state.get("asked_fields") or {}) if gating else {}
     last_asked = state.get("last_asked") if gating else None
+    spec_focus = state.get("spec_focus") if gating else None  # the spec whose value the last question asked for
+    spec_mode = bool(state.get("spec_mode")) if gating else False  # the user is building specs by tapping labels
     lang = chat_conversation.pick_lang(last_user_content, state.get("lang") if gating else None)
     if gating and lang == "hinglish" and state.get("lang") != "hinglish":
         state_patch["lang"] = "hinglish"
@@ -2707,7 +2740,7 @@ async def _run_chat_turn(
     decline: Optional[str] = None
     if gating and recap_awaiting and chat_conversation.draft_hash(current_rfq) == recap_hash:
         recap_reply = chat_conversation.classify_recap_reply(last_user_content)
-    if gating and not editing_id and last_asked and not recap_reply and not recap_awaiting:
+    if gating and not editing_id and last_asked and not recap_reply and not recap_awaiting and not spec_focus:
         decline = chat_conversation.detect_decline(last_user_content)
         if decline == "all":
             declined = list(dict.fromkeys([
@@ -2930,8 +2963,13 @@ async def _run_chat_turn(
             assist.applied_hsn = True
     if assist.applied_hsn:
         allowed.add("update_rfq_draft")
+        # Answering the HSN offer does not answer the spec question: it is asked again until a spec is filed or skipped.
+        if "specs" not in declined and not [
+            k for k in chat_draft_assist.spec_keys(draft.get("product_details")) if k != "condition"
+        ]:
+            asked["specs"] = 0
     if not confirmation_turn:
-        chat_draft_assist.must_match_from_text(draft, last_user_content)
+        chat_draft_assist.must_match_from_text(draft, last_user_content, assist.suggestions.get("specs"))
 
     def lock_role() -> None:
         if edit_ctx["snapshot"] and chat_rfq_edit.enforce_locked_role(draft, edit_ctx["snapshot"]):
@@ -2984,19 +3022,36 @@ async def _run_chat_turn(
     # The user's answer to the spec question is filed here, before the model runs, so the model sees the updated draft and
     # nothing depends on it turning the answer into tool arguments.
     filing: Optional[chat_spec_filing.Filing] = None
+    override: dict[str, Any] = {}  # chips this turn's reply fixes itself (a spec being asked)
     if (
         gating and not edit_ctx["snapshot"] and "update_rfq_draft" in allowed and not confirmation_turn and not lifecycle
         and not forced_create and not qualifier and not decline and not recap_reply and not is_counterparty_msg
         and (last_asked in ("specs", "hsn") or recap_awaiting == "create")
         and chat_draft_assist.product_name(draft) and not _asks_something(last_user_content)
     ):
+        prev_focus = (draft.get("product_details") or {}).get(spec_focus) if spec_focus else None
         filing = chat_spec_filing.file_answer(
             draft, last_user_content, assist.suggestions.get("specs") or [],
             pending_value=state.get("spec_value_ask") if last_asked == "specs" else None,  # a bare number answers that question only
         )
         if filing.touched:
             logger.info("Filed spec answer: stored=%s must=%s ask_value=%s", filing.stored, filing.must, filing.ask_value)
+            # A spec the user answered in words is not switched to must-match by the suggestion's preset.
+            assist.suggestions["answered"] = sorted({*(assist.suggestions.get("answered") or ()), *filing.matched})
         state_patch["spec_value_ask"] = None
+        focus_attr = next((sp for sp in assist.suggestions.get("specs") or [] if sp.get("key") == spec_focus), None)
+        if focus_attr is not None and not chat_conversation.is_other(last_user_content):
+            if not filing.touched:
+                filing = chat_spec_filing.file_focus(draft, last_user_content, str(spec_focus), assist.suggestions.get("specs"))
+            elif focus_attr.get("must_match") and spec_focus in filing.stored:
+                draft["product_details"][f"{spec_focus}__must_match"] = True
+            if filing.touched:
+                now = (draft.get("product_details") or {}).get(spec_focus)
+                if focus_attr.get("multi") and isinstance(prev_focus, list) and isinstance(now, list):
+                    draft["product_details"][spec_focus] = list(dict.fromkeys([*prev_focus, *now]))  # chips accumulate
+                assist.suggestions["answered"] = sorted({*(assist.suggestions.get("answered") or ()), *filing.matched})
+                state_patch["spec_mode"] = True
+                state_patch["spec_focus"] = spec_focus if focus_attr.get("multi") else None
     mark("before the draft helpers")
     # The helpers (HSN suggestion, spec suggestions, moderation) run while the model works; the reply waits for both.
     refresh_task: Optional["asyncio.Task[None]"] = asyncio.create_task(assist.refresh(json.loads(json.dumps(draft))))
@@ -3026,9 +3081,22 @@ async def _run_chat_turn(
             return ask
         return None
 
+    def spec_pick_field() -> Optional[str]:
+        """While the user taps specs: ask for more of the open multi-choice, else offer the remaining labels."""
+        mode = spec_mode or bool(state_patch.get("spec_mode"))
+        if not mode or "specs" in declined or value_ask():
+            return None
+        focus = state_patch["spec_focus"] if "spec_focus" in state_patch else spec_focus
+        if focus:
+            return "spec_more"
+        return "spec_pick" if chat_conversation.unfilled_specs(draft, assist.suggestions) else None
+
     def pick_next() -> str:
         if value_ask():
             return "spec_value"
+        more = spec_pick_field()
+        if more:
+            return more
         return chat_conversation.next_question(
             draft, assist.suggestions, role=draft.get("role") or sole_role, declined=declined, asked=asked
         )
@@ -3037,6 +3105,27 @@ async def _run_chat_turn(
     tool_cards: list[dict[str, Any]] = []
     cards_state: dict[str, list[dict[str, Any]]] = {"match_cards": []}
     verification_meta: Optional[dict[str, Any]] = None  # set once the answer engine has run
+
+    tail_field: dict[str, Any] = {"v": None}
+
+    def spec_labels() -> dict[str, str]:
+        return chat_conversation.spec_labels(assist.suggestions.get("specs"))
+
+    def turn_quick_replies(reply_text: str) -> list[str]:
+        """The chips for the question this turn's reply ends with (built from what the turn recorded about it)."""
+        if "chips" in override:
+            return override["chips"]
+        if tail_field["v"] == "spec_pick":
+            return chat_conversation.quick_replies("spec_pick", draft, assist.suggestions)
+        if state_patch.get("recap_awaiting") == "create" and chat_conversation.recap_question(lang) in reply_text:
+            return chat_conversation.quick_replies("recap", draft)
+        ask = state_patch.get("spec_value_ask")
+        if isinstance(ask, dict):
+            return chat_conversation.quick_replies("spec_value", draft, assist.suggestions, ask)
+        asked_field = state_patch.get("last_asked")
+        if asked_field in ("role", "specs", "hsn"):
+            return chat_conversation.quick_replies(str(asked_field), draft, assist.suggestions)
+        return []
 
     # ---- event helpers -------------------------------------------------
     def emit(chunk: dict[str, Any]) -> dict[str, Any]:
@@ -3137,13 +3226,16 @@ async def _run_chat_turn(
             content=reply if wire_content is None else wire_content,
             tool_step=tool_step, created=created, cp_msg=cp_msg, done=True,
         )
+        chips = [] if kind == "error" or created or cp_msg else turn_quick_replies(reply)
+        if chips:
+            chunk["quick_replies"] = chips
         result = TurnResult(
             reply=persisted, thinking=thinking or None, rfq_draft=draft, readiness=readiness,
             created_rfq=created, counterparty_message=cp_msg,
             conversation_id=conversation.id if conversation else None, routed_agent=agent_state["info"],
             matched_candidates=(cards_state["match_cards"] or client_cands) or None,
             draft_suggestions=chunk.get("draft_suggestions"), draft_moderation=chunk.get("draft_moderation"),
-            editing_rfq_id=edit_ctx["id"],
+            editing_rfq_id=edit_ctx["id"], quick_replies=chips or None,
         )
         return ChatEvent(kind, chunk, result)
 
@@ -3204,6 +3296,40 @@ async def _run_chat_turn(
         reply = f"⚠️ {err or 'Could not publish the RFQ.'}" if not published else _published_text(published)
         yield await finish(reply=reply, tool_step=step, created=published)
         return
+
+    if (
+        gating and not lifecycle and not edit_ctx["id"] and "create_rfq" not in allowed and not is_counterparty_msg
+        and chat_draft_assist.product_name(draft) and (last_asked == "specs" or spec_mode)
+        and not chat_permissions.is_question(last_user_content)
+    ):
+        # Tapping specs: a label chip asks only that spec; Other, Skip and Done move within it.
+        if assist.specs_pending(draft):
+            await assist.settle_specs(draft)
+        specs_now = assist.suggestions.get("specs") or []
+        focus_spec = next((sp for sp in specs_now if sp.get("key") == spec_focus), None)
+        label_spec = chat_conversation.match_spec_label(last_user_content, specs_now)
+        details_now = draft.get("product_details") or {}
+        ask_reply: Optional[str] = None
+        if focus_spec and chat_conversation.is_other(last_user_content):
+            override["chips"] = []
+            ask_reply = chat_conversation.spec_type_text(focus_spec, lang)
+        elif focus_spec and (chat_conversation.is_done(last_user_content) or chat_conversation.detect_decline(last_user_content)):
+            if chat_conversation.detect_decline(last_user_content) == "one" and not chat_conversation.is_done(last_user_content):
+                assist.suggestions["skipped"] = sorted({*(assist.suggestions.get("skipped") or ()), str(spec_focus)})
+            state_patch.update(spec_focus=None, spec_mode=True, last_asked="specs")
+            if chat_conversation.unfilled_specs(draft, assist.suggestions):
+                override["chips"] = chat_conversation.quick_replies("spec_pick", draft, assist.suggestions)
+                ask_reply = chat_conversation.spec_pick_text(lang)
+        elif label_spec is not None:
+            focus = label_spec
+            state_patch.update(spec_focus=focus["key"], spec_mode=True, last_asked="specs")
+            asked["specs"] = max(1, asked.get("specs", 0))
+            state_patch["asked_fields"] = dict(asked)
+            override["chips"] = chat_conversation.focus_chips(focus, details_now)
+            ask_reply = chat_conversation.spec_ask_text(focus, lang)
+        if ask_reply is not None:
+            yield await finish(reply=ask_reply)
+            return
 
     if (
         gating and not lifecycle and not edit_ctx["id"] and "create_rfq" not in allowed and not is_counterparty_msg
@@ -3279,7 +3405,7 @@ async def _run_chat_turn(
         if changed_now and not confirmed and not problem:
             wants_publish = bool(lifecycle.get("publish"))
             state_patch.update(recap_hash=new_hash, recap_awaiting="edit", recap_publish=wants_publish or None)
-            yield await finish(reply=chat_conversation.build_edit_recap(draft, snap, changed_now, lang, publish=wants_publish))
+            yield await finish(reply=chat_conversation.build_edit_recap(draft, snap, changed_now, lang, publish=wants_publish, labels=spec_labels()))
             return
         publish_after = bool(lifecycle.get("publish")) or bool(
             gating and recap_awaiting == "edit" and recap_hash == new_hash and state.get("recap_publish")
@@ -3337,7 +3463,7 @@ async def _run_chat_turn(
                 recap_snapshot=json.loads(json.dumps(draft)),
                 **({"auto_role_noted": True} if note else {}),
             )
-            yield await finish(reply=chat_conversation.build_recap(draft, lang, role_note=note))
+            yield await finish(reply=chat_conversation.build_recap(draft, lang, role_note=note, labels=spec_labels()))
             return
         if readiness["has_role"] and readiness["has_product"]:
             yield ChatEvent("status", wire(
@@ -3417,7 +3543,7 @@ async def _run_chat_turn(
                 recap_snapshot=json.loads(json.dumps(draft)),
                 **({"auto_role_noted": True} if note else {}),
             )
-            return chat_conversation.build_recap(draft, lang, role_note=note)
+            return chat_conversation.build_recap(draft, lang, role_note=note, labels=spec_labels())
         def hsn_offer() -> str:
             """The suggested HSN, offered in one line after a spec question; twice at most, never once applied or declined."""
             hsn = assist.pending_hsn
@@ -3431,6 +3557,14 @@ async def _run_chat_turn(
             assist.suggestions["hsn_offered"] = True
             return chat_reply.hsn_line(hsn, lang)
 
+        if field in ("spec_pick", "spec_more"):
+            state_patch.update(last_asked="specs", spec_mode=True)
+            tail_field["v"] = field
+            if field == "spec_pick":
+                return chat_conversation.spec_pick_text(lang)
+            focus_spec = next((sp for sp in assist.suggestions.get("specs") or [] if sp.get("key") == state_patch.get("spec_focus")), {})
+            override["chips"] = chat_conversation.focus_chips(focus_spec, draft.get("product_details"))
+            return chat_conversation.spec_more_text(focus_spec, lang)
         if field == "spec_value":
             ask = value_ask() or {}
             asked[f"spec_value:{chat_draft_assist._norm_key(ask['label'])}"] = 1
@@ -3459,7 +3593,7 @@ async def _run_chat_turn(
         field = "spec_value" if value_ask() else chat_conversation.next_question(
             d, assist.suggestions, role=d.get("role") or sole_role, declined=declined, asked=asked
         )
-        if field in ("recap", "spec_value", "specs"):
+        if field in ("recap", "spec_value", "specs", "spec_pick", "spec_more"):
             return ""  # the recap, the value question or the spec question is appended after the reply, once
         return chat_conversation.question_text(field, {**d, "role": d.get("role") or sole_role}, assist.suggestions, lang)
 
@@ -3542,8 +3676,8 @@ async def _run_chat_turn(
         draft = runner.draft
         await settle_refresh()
         lock_role()
-        chat_draft_assist.must_match_from_text(draft, last_user_content)
-        chat_draft_assist.apply_spec_suggestions(draft, assist.suggestions.get("specs"))
+        chat_draft_assist.apply_spec_suggestions(draft, assist.suggestions.get("specs"), assist.suggestions.get("answered") or ())
+        chat_draft_assist.must_match_from_text(draft, last_user_content, assist.suggestions.get("specs"))
         if filing is not None:
             # The model must not repeat a filed spec under another key, or restate a value the next question asks for.
             dropped_specs = chat_spec_filing.prune_model_specs(draft, filing, set((pre_turn_draft.get("product_details") or {})))
@@ -3678,13 +3812,17 @@ async def _run_chat_turn(
             # opening and its own spec list are replaced by the real diff and the flow's one question.
             total_content, _claimed = chat_reply.strip_draft_claims(total_content)
             total_content = chat_reply.strip_spec_echo(
-                total_content, assist.suggestions.get("specs"), drop_lists=pick_next() in ("specs", "spec_value")
+                total_content, assist.suggestions.get("specs"), drop_lists=pick_next() in ("specs", "spec_value", "spec_pick", "spec_more")
             )
             if assist.pending_hsn and not chat_draft_assist.user_hsn(draft):
                 total_content = chat_reply.drop_unapplied_hsn_claims(total_content)
-            total_content = chat_reply.join_blocks(
-                chat_reply.build_ack(turn_start_draft, draft, lang), chat_reply.limit_model_text(total_content)
-            )
+            ack = chat_reply.build_ack(turn_start_draft, draft, lang, labels=spec_labels())
+            if ack:  # the notes of this turn ("Category set to ...") belong right after what was added, before any question
+                notes_now = [n for n in assist.notes if n not in ack and n not in total_content]
+                ack = "\n".join([ack, *notes_now])
+                if "HSN" in ack:
+                    total_content = chat_reply.drop_hsn_applied_echo(total_content)
+            total_content = chat_reply.join_blocks(ack, chat_reply.limit_model_text(total_content))
         assist.note_reply(total_content)
 
         if total_content.strip() and not created_rfq_obj:
@@ -3722,6 +3860,8 @@ async def _run_chat_turn(
             if tail:
                 assist.note_reply(tail)
                 appendix = f"{appendix}\n\n{tail}" if appendix else f"\n\n{tail}"
+            if appendix and not appendix.startswith("\n"):
+                appendix = "\n\n" + appendix
             yield await finish(
                 reply=total_content + appendix, wire_content=appendix, thinking=thinking,
                 tool_step=captured_tool_step, cards=cards_state["match_cards"] or tool_cards or None,

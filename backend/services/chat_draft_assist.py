@@ -15,9 +15,9 @@ import hashlib
 import logging
 import re
 import time
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
-from services import hsn_service
+from services import hsn_service, spec_catalog
 from services.categories import normalize_category
 
 logger = logging.getLogger(__name__)
@@ -27,7 +27,7 @@ HSN_TASK_BUDGET = 20.0  # the background fetch's own budget (the model call it m
 HSN_SETTLE_WAIT = 8.0  # extra wait, before the reply offers the suggestion, for a fetch that is still running
 SPECS_TIMEOUT = 5.0  # how long ONE TURN waits for the spec suggestions; the fetch itself keeps running
 SPECS_TASK_BUDGET = 30.0  # the background fetch's own budget
-SPECS_RECAP_WAIT = 8.0  # extra wait, before a recap, for a fetch that is still running
+SPECS_RECAP_WAIT = 25.0  # extra wait, before a recap, for a fetch that is still running (a first generation takes ~12-30 s)
 SPECS_CACHE_TTL = 24 * 3600.0
 MODERATION_TIMEOUT = 4.0
 MAX_SPEC_PROMPTS = 5
@@ -205,40 +205,47 @@ def unrecognised_hsn_note(raw: Any) -> str:
 # ---------------------------------------------------------------------------
 # Spec values and must-match
 # ---------------------------------------------------------------------------
-def apply_spec_suggestions(draft: dict[str, Any], specs: Optional[list[dict[str, Any]]]) -> None:
-    """File a value the user gave for a suggested spec under the suggestion's label (as the form's chip does).
+def family_for(draft: Optional[dict[str, Any]], specs: Optional[list[dict[str, Any]]] = None) -> spec_catalog.Family:
+    """The catalogue family of the draft's product, built in memory from the suggestions (plus the common attributes)."""
+    return spec_catalog.family_from_suggestions(
+        product_name(draft), (draft or {}).get("category"), specs, user_hsn(draft)
+    )
 
-    A model-chosen key that names a suggestion (by key or label) is renamed to the label, and
-    a suggestion that comes with must_match preset sets ``<label>__must_match``.
+
+def apply_spec_suggestions(
+    draft: dict[str, Any], specs: Optional[list[dict[str, Any]]], answered: Iterable[str] = ()
+) -> None:
+    """Put the draft's specs into the catalogue's canonical form (as the form's chips do).
+
+    Every key the user or the model wrote ("Apple Variety", "pack_weight_kg", "Packaging Type") becomes the catalogue's
+    key ("variety", "pack_size", "packaging_type") and every value its canonical value ("20000 g" -> "20 kg"). A suggestion
+    that comes with a must_match preset sets ``<key>__must_match`` unless the user already answered that spec
+    (``answered``: the keys they gave a value for) -- there is no ``False`` flag any more.
     """
     details = draft.get("product_details")
-    if not isinstance(details, dict) or not specs:
+    if not isinstance(details, dict) or not product_name(draft):
         return
-    for spec in specs:
-        label = str(spec.get("label") or spec.get("key") or "").strip()
-        if not label:
-            continue
-        wanted = {_norm_key(label), _norm_key(spec.get("key") or label)}
-        if label not in details:
-            for k in spec_keys(details):
-                if _norm_key(k) in wanted:
-                    details[label] = details.pop(k)
-                    old_flag = f"{k}{MUST_MATCH_SUFFIX}"
-                    if old_flag in details:
-                        details[f"{label}{MUST_MATCH_SUFFIX}"] = details.pop(old_flag)
-                    break
-        if spec.get("must_match") and label in details and f"{label}{MUST_MATCH_SUFFIX}" not in details:
-            details[f"{label}{MUST_MATCH_SUFFIX}"] = True
+    fam = family_for(draft, specs)
+    out = fam.normalize_details(details, strip_core=True)
+    skip = set(answered)
+    for spec in specs or []:
+        key = str(spec.get("key") or "").strip()
+        if key and spec.get("must_match") and key in out and key not in skip and f"{key}{MUST_MATCH_SUFFIX}" not in out:
+            out[f"{key}{MUST_MATCH_SUFFIX}"] = True
+    draft["product_details"] = out
 
 
-def set_must_match(details: dict[str, Any], names: Any) -> list[str]:
-    """Flag attributes already in ``details`` (case-insensitive) as must-match; unknown names are ignored."""
+def set_must_match(details: dict[str, Any], names: Any, family: Optional[spec_catalog.Family] = None) -> list[str]:
+    """Flag attributes already in ``details`` (case-insensitive; labels and synonyms with a ``family``) as must-match."""
     done: list[str] = []
     if not isinstance(details, dict) or not isinstance(names, (list, tuple, set)):
         return done
     by_norm = {_norm_key(k): k for k in spec_keys(details)}
     for name in names:
         key = by_norm.get(_norm_key(name))
+        if key is None and family is not None:
+            canonical = family.canonical_key(str(name))
+            key = canonical if canonical in details else None
         if key is not None:
             details[f"{key}{MUST_MATCH_SUFFIX}"] = True
             done.append(key)
@@ -252,18 +259,28 @@ _MUST_PHRASE = (
 )
 
 
-def must_match_from_text(draft: dict[str, Any], user_text: str) -> list[str]:
-    """Phrases like "<attr> must match", "<attr> is mandatory", "<attr> zaroori hai" flag that attribute."""
+def must_match_from_text(
+    draft: dict[str, Any], user_text: str, specs: Optional[list[dict[str, Any]]] = None
+) -> list[str]:
+    """Phrases like "<attr> must match", "<attr> is mandatory", "<attr> zaroori hai" flag that attribute.
+
+    ``<attr>`` is the spec's key, label or any synonym ("certification must of organic" flags ``certifications``).
+    """
     details = draft.get("product_details")
     text = user_text or ""
     if not isinstance(details, dict) or not text:
         return []
+    fam = family_for(draft, specs)
     done: list[str] = []
     for key in spec_keys(details):
-        words = [re.escape(w) for w in re.split(r"[\s_\-]+", str(key).strip()) if w]
-        if not words:
+        alternatives = []
+        for phrase in fam.phrases(str(key)):
+            words = [re.escape(w) for w in re.split(r"[\s_\-]+", phrase.strip()) if w]
+            if words:
+                alternatives.append(r"[\s_\-]+".join(words) + r"(?:s|es)?")
+        if not alternatives:
             continue
-        key_re = r"[\s_\-]+".join(words)
+        key_re = "(?:" + "|".join(alternatives) + ")"
         pattern = rf"(?<!\w){key_re}(?!\w)[^.;!?\n]{{0,30}}?{_MUST_PHRASE}"
         if re.search(pattern, text, re.IGNORECASE):
             details[f"{key}{MUST_MATCH_SUFFIX}"] = True
@@ -290,17 +307,9 @@ async def _fetch_hsn_suggestion(name: str) -> Optional[dict[str, Any]]:
 
 
 async def _fetch_spec_suggestions(name: str, category: Optional[str], role: Optional[str]) -> list[dict[str, Any]]:
-    from schemas.rfq import SuggestedAttribute
-    from services import attribute_recommender
-
-    attrs, _source = await attribute_recommender.recommend_product_attributes(name, category, role)
-    out: list[dict[str, Any]] = []
-    for a in attrs or []:
-        try:
-            out.append(SuggestedAttribute(**a).model_dump())
-        except Exception:
-            continue
-    return out
+    """The product family's attributes from the spec catalogue (generated once by the recommender, then stored)."""
+    family = await spec_catalog.ensure_family(name, category, None, role)
+    return family.suggestions() if family.persisted else []
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +407,7 @@ def start_hsn_task(key: str, name: str) -> "asyncio.Task[Optional[dict[str, Any]
 async def _spec_job(key: SpecKey, name: str, category: Optional[str], role: Optional[str]) -> list[dict[str, Any]]:
     value = await asyncio.wait_for(_fetch_spec_suggestions(name, category, role), timeout=SPECS_TASK_BUDGET)
     if isinstance(value, list) and value:
+        value = spec_catalog.canonicalize_suggestions(name, category, value)
         _spec_cache[key] = (time.monotonic(), value)
     return value if isinstance(value, list) else []
 

@@ -24,7 +24,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from services import chat_draft_assist, chat_specs
+from services import chat_draft_assist, chat_specs, spec_catalog, unit_converter
 
 MUST_SUFFIX = chat_draft_assist.MUST_MATCH_SUFFIX
 
@@ -53,6 +53,7 @@ _SYNONYMS: dict[str, tuple[str, ...]] = {
     "certification": ("certificate", "certified"),
     "origin": ("grown in",),
 }
+_WEAK_SYNONYMS = frozenset({"carton size", "box size", "bag size", "carton weight", "box weight", "bag weight", "pack", "class", "kind", "standards", "certified by", "condition", "package", "sizes", "variant"})
 _NUMERIC_GENERIC = ("brix", "moisture", "purity", "firmness", "diameter", "thickness", "protein")
 # Generic spec words: (pattern, label, kind). A suggestion with the same span wins over these.
 _GENERIC: list[tuple[str, str, str]] = [
@@ -147,7 +148,12 @@ def _same_unit(a: str, b: str) -> bool:
     a, b = _unit_norm(a), _unit_norm(b)
     if a == b:
         return True
-    return any(a in g and b in g for g in _UNIT_GROUPS)
+    if any(a in g and b in g for g in _UNIT_GROUPS):
+        return True
+    try:  # 20 g is a pack size in kg: any two units of one dimension are compatible
+        return a not in ("%", "bx") and b not in ("%", "bx") and unit_converter.convert(1, a, b) is not None
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +169,9 @@ class _Spec:
     placeholder: str = ""
     suggested: bool = False
     must_preset: bool = False  # the suggestion comes with must-match switched on
+    synonyms: list[str] = field(default_factory=list)
+    multi: bool = False  # takes several of its options
+    option_synonyms: dict[str, list[str]] = field(default_factory=dict)  # option -> other ways to say it
 
 
 @dataclass
@@ -178,10 +187,10 @@ class _Anchor:
 class Filing:
     """What an answer to the spec question filed."""
 
-    stored: dict[str, Any] = field(default_factory=dict)  # label -> value, new or changed
-    must: list[str] = field(default_factory=list)  # labels flagged must-match by this answer
+    stored: dict[str, Any] = field(default_factory=dict)  # canonical key -> value, new or changed
+    must: list[str] = field(default_factory=list)  # keys flagged must-match by this answer
     ask_value: Optional[dict[str, Any]] = None  # a numeric spec named without a usable number
-    matched: set[str] = field(default_factory=set)  # every label this answer spoke about
+    matched: set[str] = field(default_factory=set)  # every key this answer spoke about
 
     @property
     def touched(self) -> bool:
@@ -202,6 +211,8 @@ def _label_unit(label: str) -> str:
 def _kind_of(spec: dict[str, Any], unit: str) -> str:
     options = [str(o).strip() for o in (spec.get("options") or []) if str(o).strip()]
     numeric_options = bool(options) and all(re.fullmatch(r"\d+(?:\.\d+)?", o) for o in options)
+    if spec.get("multi"):
+        return "list"
     if str(spec.get("input_type") or "").lower() == "numeric" or unit or numeric_options:
         return "numeric"
     if options:
@@ -220,11 +231,13 @@ def _suggestion_specs(suggestions: Optional[list[dict[str, Any]]]) -> list[_Spec
         label = str(s.get("label") or s.get("key") or "").strip()
         if not label:
             continue
-        unit = _label_unit(label)
+        unit = str(s.get("unit") or "") or _label_unit(label)
         out.append(_Spec(
             label=label, kind=_kind_of(s, unit), key=str(s.get("key") or ""),
             options=[str(o).strip() for o in (s.get("options") or []) if str(o).strip()],
             unit=unit, placeholder=str(s.get("placeholder") or ""), suggested=True, must_preset=bool(s.get("must_match")),
+            synonyms=[str(x) for x in (s.get("synonyms") or [])], multi=bool(s.get("multi")),
+            option_synonyms={str(k): [str(x) for x in v] for k, v in (s.get("option_synonyms") or {}).items()},
         ))
     return out
 
@@ -252,6 +265,9 @@ def _anchors_for_suggestion(spec: _Spec, text: str, product_tokens: set[str]) ->
         add(_phrase_re(core), True)
     if key_phrase and _norm(key_phrase) != _norm(core):
         add(_phrase_re(key_phrase), True)
+    for syn in spec.synonyms:
+        if (len(syn) >= 4 or " " in syn) and syn.lower() not in _WEAK_SYNONYMS and not syn.lower().startswith("per "):
+            add(_phrase_re(syn), True)
     label_tokens = re.findall(r"[a-z]+", core.lower())
     for tok in label_tokens:
         if tok in _GENERIC_TOKENS or len(tok) < 3 or chat_specs._stem(tok) in product_tokens or tok == "type":
@@ -423,6 +439,9 @@ def match_options(spec: _Spec, text: str, *, loose: bool = True) -> list[str]:
         others = {t for o in spec.options if o != option for t in _option_tokens(o)}
         if any(len(t) >= 5 and t not in others and (t in words or chat_specs._stem(t) in stems) for t in toks):
             found.append(option)
+    for option, synonyms in spec.option_synonyms.items():  # "net bag" -> Bag, "peti" -> Box
+        if option not in found and any(len(syn) >= 3 and _phrase_re(syn).search(text) for syn in synonyms):
+            found.append(option)
     return found
 
 
@@ -434,6 +453,9 @@ def _product_tokens(draft: dict[str, Any]) -> set[str]:
 
 
 def _pack_label(specs: list[_Spec]) -> str:
+    for s in specs:
+        if s.key == "pack_size":
+            return s.label
     for s in specs:
         t = _tokens(s.label)
         if t & {"pack", "packing", "packaging"} and t & {"size", "weight"}:
@@ -459,14 +481,15 @@ def file_answer(
     text = message or ""
     if not text.strip():
         return filing
-    specs = _suggestion_specs(suggestions)
+    family = chat_draft_assist.family_for(draft, suggestions)
+    specs = _suggestion_specs(family.suggestions())
     product_tokens = _product_tokens(draft)
     details = draft.get("product_details")
     if not isinstance(details, dict):
         details = {}
 
     if pending_value:
-        _file_pending(details, text, pending_value, filing)
+        _file_pending(details, text, pending_value, filing, family)
 
     pack = pack_size(text)
     pack_span = pack[1] if pack else None
@@ -504,14 +527,18 @@ def file_answer(
             seg_end[i - 1] = min(seg_end[i - 1], window_start + m.start())
 
     def put(label: str, value: Any, must: bool) -> None:
+        """File ``value`` under the catalogue's key for ``label``, in the catalogue's canonical form."""
         if not label or chat_specs.is_core_key(label) or label.lower() in ("name", "hsn code", "hsn"):
             return
-        filing.matched.add(label)
-        existing = next((k for k in chat_draft_assist.spec_keys(details) if _norm(k) == _norm(label)), None)
-        if existing is None or _norm(details.get(existing)) != _norm(value):
-            filing.stored[label] = value
-        if must:
-            filing.must.append(label)
+        normalized = family.normalize(label, value)
+        if normalized is None:
+            return
+        key, canonical = normalized
+        filing.matched.add(key)
+        if details.get(key) != canonical:
+            filing.stored[key] = canonical
+        if must and key not in filing.must:
+            filing.must.append(key)
 
     for i, a in enumerate(anchors):
         raw = text[seg_start[i]: seg_end[i]]
@@ -540,9 +567,9 @@ def file_answer(
                 filing.matched.add(spec.label)
             continue
         if spec.kind == "choice":
-            chosen = match_options(spec, raw)
+            chosen = _one_or_list(match_options(spec, raw), raw)
             if chosen:
-                put(spec.label, ", ".join(chosen), must)
+                put(spec.label, chosen, must)
                 continue
         elif spec.kind == "list":
             value = _list_value(_MUST_RE.sub(" ", raw))
@@ -557,27 +584,49 @@ def file_answer(
 
     # Choice specs whose label was not mentioned: an option said on its own ("fuji") still answers them.
     for spec in specs:
-        if spec.kind != "choice" or _norm(spec.label) in {_norm(x) for x in filing.matched}:
+        if spec.kind not in ("choice", "list") or not spec.options or spec.key in filing.matched:
             continue
         probe = text
-        if pack_span:
-            probe = text[: pack_span[0]] + " " + text[pack_span[1]:]
+        for lo, hi in sorted([(a.start, a.end) for a in anchors] + ([pack_span] if pack_span else []), reverse=True):
+            probe = probe[:lo] + " " * (hi - lo) + probe[hi:]  # the labels themselves ("quality") are not option words
         chosen = match_options(spec, probe, loose=False)
         if chosen:
-            put(spec.label, ", ".join(chosen), False)
+            put(spec.label, ", ".join(chosen) if spec.kind == "list" else _one_or_list(chosen, probe), False)
 
     if pack:
         label = _pack_label(specs)
-        if not any(_norm(k) == _norm(label) for k in filing.stored) and not any(_norm(l) == _norm(label) for l in filing.matched):
+        pack_key = family.canonical_key(label)
+        if pack_key not in filing.stored and pack_key not in filing.matched:
             put(label, pack[0], False)
 
-    _apply(draft, details, specs, filing)
+    _apply(draft, details, family, specs, filing)
     return filing
 
 
-def _file_pending(details: dict[str, Any], text: str, pending: dict[str, Any], filing: Filing) -> None:
+_LIST_WORD_RE = re.compile(r",|;|/|&|\+|\band\b|\bor\b|\baur\b", re.IGNORECASE)
+
+
+def _one_or_list(options: list[str], text: str) -> str:
+    """Several options named in one segment: a list when the user listed them ("Fuji and Gala"), else the first said
+    ("carton size box of" names a carton, not a carton AND a box)."""
+    if len(options) <= 1:
+        return ", ".join(options)
+    lowered = text.lower()
+    at = {o: lowered.find(o.lower()) for o in options if o.lower() in lowered}
+    if len(at) < len(options):
+        return ", ".join(options)  # some were named by a synonym: no position to judge by
+    first, last = min(at.values()), max(at.values())
+    if _LIST_WORD_RE.search(lowered[first:last]):
+        return ", ".join(options)
+    return min(options, key=lambda o: at[o])
+
+
+def _file_pending(
+    details: dict[str, Any], text: str, pending: dict[str, Any], filing: Filing, family: spec_catalog.Family
+) -> None:
     """A bare value ("14", "min 14", "12-14 brix") answers the value question asked last turn."""
-    spec = _Spec(label=str(pending.get("label") or ""), kind="numeric", unit=str(pending.get("unit") or ""))
+    label = str(pending.get("label") or "")
+    spec = _Spec(label=label, kind="numeric", unit=str(pending.get("unit") or ""))
     if not spec.label or len(text.split()) > 6:
         return
     hit = _find_number(text, spec)
@@ -585,29 +634,29 @@ def _file_pending(details: dict[str, Any], text: str, pending: dict[str, Any], f
         return
     qual = _qualifier(text) or {"minimum": "min", "maximum": "max"}.get(str(pending.get("qualifier") or ""))
     value = _numeric_value(hit[0], hit[1], qual)
-    filing.matched.add(spec.label)
-    existing = next((k for k in chat_draft_assist.spec_keys(details) if _norm(k) == _norm(spec.label)), None)
-    if existing is None or _norm(details.get(existing)) != _norm(value):
-        filing.stored[spec.label] = value
+    normalized = family.normalize(str(pending.get("key") or label), value) or family.normalize(label, value)
+    if normalized is None:
+        return
+    key, canonical = normalized
+    filing.matched.add(key)
+    if details.get(key) != canonical:
+        filing.stored[key] = canonical
 
 
-def _apply(draft: dict[str, Any], details: dict[str, Any], specs: list[_Spec], filing: Filing) -> None:
+def _apply(
+    draft: dict[str, Any], details: dict[str, Any], family: spec_catalog.Family, specs: list[_Spec], filing: Filing
+) -> None:
     if not filing.stored and not filing.must:
         return
-    for label, value in filing.stored.items():
-        spec = next((s for s in specs if _norm(s.label) == _norm(label)), None)
+    for key, value in filing.stored.items():
         for k in list(chat_draft_assist.spec_keys(details)):
-            same = _norm(k) == _norm(label) or (spec is not None and spec.key and _norm(k) == _norm(spec.key))
-            if same and k != label:
+            if k != key and family.canonical_key(k) == key:  # the model's own spelling of the same spec
                 details.pop(k, None)
                 details.pop(f"{k}{MUST_SUFFIX}", None)
-        details[label] = value
-        if spec is not None and spec.must_preset and label not in filing.must:
-            # The form's preset would flag it; here the user answered in words and did not say "must": it stays optional.
-            details.setdefault(f"{label}{MUST_SUFFIX}", False)
-    for label in filing.must:
-        if label in details:
-            details[f"{label}{MUST_SUFFIX}"] = True
+        details[key] = value
+    for key in filing.must:
+        if key in details:
+            details[f"{key}{MUST_SUFFIX}"] = True
     draft["product_details"] = details
 
 
@@ -646,3 +695,35 @@ def prune_model_specs(draft: dict[str, Any], filing: Filing, keys_before: set[st
             details.pop(f"{key}{MUST_SUFFIX}", None)
             dropped.append(key)
     return dropped
+
+
+def file_focus(
+    draft: dict[str, Any], text: str, key: str, suggestions: Optional[list[dict[str, Any]]] = None
+) -> Filing:
+    """A message typed (or tapped) while one spec is being asked is that spec's value: a choice maps to its option or is
+    kept as typed, a multi-choice adds to the ones already chosen, a number is read with its unit. A spec that is a
+    must-match preset (or "must" in the text) is flagged."""
+    filing = Filing()
+    family = chat_draft_assist.family_for(draft, suggestions)
+    attr = family.attr(key)
+    value_text = _MUST_RE.sub(" ", text or "").strip(" ,.;")
+    if attr is None or not value_text:
+        return filing
+    res = family.normalize(key, value_text)
+    if res is None:
+        return filing
+    k, value = res
+    details = draft.get("product_details")
+    if not isinstance(details, dict):
+        details = {}
+    if isinstance(value, list) and isinstance(details.get(k), list):
+        value = list(dict.fromkeys([*details[k], *value]))
+    filing.matched.add(k)
+    if details.get(k) != value:
+        filing.stored[k] = value
+    details[k] = value
+    if attr.get("must_match_default") or _MUST_RE.search(text or ""):
+        details[f"{k}{MUST_SUFFIX}"] = True
+        filing.must.append(k)
+    draft["product_details"] = details
+    return filing

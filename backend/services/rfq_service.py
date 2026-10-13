@@ -22,7 +22,7 @@ from models.rfq import RFQ
 from models.user import User
 from schemas.common import DeadlineOut, Location, Money, Quantity
 from schemas.rfq import RFQCreate, RFQOut, RFQUpdate
-from services import hsn_service, locations, qdrant_index
+from services import hsn_service, locations, qdrant_index, spec_catalog
 from services.categories import normalize_category
 from services.embeddings import embed_one
 from services.moderation_service import AIContentModerator
@@ -270,7 +270,9 @@ async def create_rfq(db: AsyncSession, user: User, payload: RFQCreate) -> RFQ:
         category=normalize_category(payload.category),
         title=payload.title,
         description=payload.description,
-        product_details=payload.product_details or {},
+        product_details=await spec_catalog.normalize_for_rfq(
+            db, payload.product_details, payload.title, normalize_category(payload.category)
+        ),
     )
     _apply_common_fields(rfq, payload)
 
@@ -345,7 +347,7 @@ async def update_rfq(db: AsyncSession, rfq: RFQ, payload: RFQUpdate) -> RFQ:
         rfq.description = provided["description"]
 
     if "product_details" in provided and payload.product_details is not None:
-        rfq.product_details = payload.product_details
+        rfq.product_details = await spec_catalog.normalize_for_rfq(db, payload.product_details, rfq.title, rfq.category)
 
     _apply_common_fields(rfq, payload)
 

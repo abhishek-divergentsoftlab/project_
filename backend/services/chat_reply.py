@@ -166,11 +166,16 @@ def _sig(*parts: Any) -> Optional[tuple[Any, ...]]:
     return tuple(out)
 
 
-def _spec_map(draft: dict[str, Any], t: dict[str, Any]) -> dict[str, tuple[str, bool]]:
-    return {k: (v, must) for k, v, must in cc._specs((draft or {}).get("product_details"), t)}
+def _spec_map(
+    draft: dict[str, Any], t: dict[str, Any], labels: Optional[dict[str, str]] = None
+) -> dict[str, tuple[str, bool]]:
+    return {k: (v, must) for k, v, must in cc._specs((draft or {}).get("product_details"), t, labels)}
 
 
-def build_ack(before: Optional[dict[str, Any]], after: Optional[dict[str, Any]], lang: str = "en") -> str:
+def build_ack(
+    before: Optional[dict[str, Any]], after: Optional[dict[str, Any]], lang: str = "en",
+    labels: Optional[dict[str, str]] = None,
+) -> str:
     """"Added: Apple Variety Fuji, Pack Size 20 kg, Certifications Organic, FSSAI (must match)." from the draft diff.
 
     Empty when nothing the user can see changed: the assistant then makes no "updated" claim at all.
@@ -210,7 +215,7 @@ def build_ack(before: Optional[dict[str, Any]], after: Optional[dict[str, Any]],
     hsn_before, hsn_after = chat_draft_assist.user_hsn(before), chat_draft_assist.user_hsn(after)
     if hsn_after and hsn_after != hsn_before:
         (updated if hsn_before else added).append(f"HSN {hsn_after}")
-    old_specs, new_specs = _spec_map(before, t), _spec_map(after, t)
+    old_specs, new_specs = _spec_map(before, t, labels), _spec_map(after, t, labels)
     for label, (value, must) in new_specs.items():
         if label in old_specs and old_specs[label] == (value, must):
             continue
@@ -267,3 +272,13 @@ def already_published_reply(title: str, rfq_id: str, lang: str = "en") -> str:
 
 def join_blocks(*blocks: str) -> str:
     return "\n\n".join(b.strip() for b in blocks if b and b.strip())
+
+
+_HSN_APPLIED_ECHO_RE = re.compile(
+    r"\bHSN(?:\s+code)?\s+\d+\s+(?:has\s+been\s+|was\s+|is\s+)?(?:applied|set|added|saved|selected)\b[.!]?\s*", re.IGNORECASE
+)
+
+
+def drop_hsn_applied_echo(text: str) -> str:
+    """"HSN 0803 applied." repeats the "Added: HSN 0803" line: dropped."""
+    return _HSN_APPLIED_ECHO_RE.sub("", text or "").strip()

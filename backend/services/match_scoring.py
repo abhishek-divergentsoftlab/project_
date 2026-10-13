@@ -780,6 +780,17 @@ for _group in _RAW_KEY_SYNONYMS:
         _KEY_SYNONYMS[_k] = _KEY_SYNONYMS.get(_k, frozenset()) | _group
 
 
+def _typed_similarity(key: str, wanted: Any, offered: Any) -> Optional[tuple[float, str]]:
+    """Both sides use the same spec-catalogue key: compare by the spec's type (choice synonyms, multi-choice subsets,
+    numbers after unit conversion). None when the values are not typed, so the generic comparison runs."""
+    from services import spec_catalog
+
+    try:
+        return spec_catalog.compare_values(key, wanted, offered)
+    except Exception:
+        return None
+
+
 def _find_best_attribute_match_detailed(
     wanted_key: str, wanted_val: Any, offered: dict[str, Any]
 ) -> tuple[float, bool, Optional[str], Any, str]:
@@ -798,6 +809,9 @@ def _find_best_attribute_match_detailed(
     # 1. Direct key match
     if wanted_key in offered and offered[wanted_key] not in (None, ""):
         ov = offered[wanted_key]
+        typed = _typed_similarity(wanted_key, wanted_val, ov)
+        if typed is not None:
+            return typed[0], True, wanted_key, ov, typed[1]
         score = _value_similarity(wanted_val, ov)
         meas = unit_converter.compare_measurements(wanted_val, None, ov, None)
         if meas is not None and str(wanted_val).strip().lower() != str(ov).strip().lower():
@@ -809,6 +823,9 @@ def _find_best_attribute_match_detailed(
     for k in offered:
         if k.strip().lower() == wk_clean and offered[k] not in (None, ""):
             ov = offered[k]
+            typed = _typed_similarity(wanted_key, wanted_val, ov)
+            if typed is not None:
+                return typed[0], True, k, ov, typed[1]
             score = _value_similarity(wanted_val, ov)
             meas = unit_converter.compare_measurements(wanted_val, None, ov, None)
             if meas is not None and str(wanted_val).strip().lower() != str(ov).strip().lower():

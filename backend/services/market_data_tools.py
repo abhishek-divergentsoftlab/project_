@@ -664,6 +664,69 @@ async def company_profile(db: AsyncSession, *, user: User, user_id: Any = None, 
     return _result("company_profile", args, data=data, facts=facts)
 
 
+async def get_spec_options(db: AsyncSession, *, user: User, product: Any = None, spec: Any = None, **_: Any) -> dict[str, Any]:
+    """The spec catalogue's attributes for a product family (labels, types, options, units), or one attribute's options.
+
+    Reads the stored family (generated once by the attribute recommender, never regenerated here); a product with no stored
+    family returns the common attributes only.
+    """
+    from services import spec_catalog
+
+    name = _clean_str(product)
+    args = {"product": name, "spec": _clean_str(spec)}
+    if not name:
+        return _error("get_spec_options", args, "product is required")
+    fam = await spec_catalog.find_family(db, name) or spec_catalog.family_from_suggestions(name)
+    attrs = []
+    for a in fam.attributes:
+        attrs.append({
+            "key": a["key"], "label": spec_catalog.display_label(a["label"]), "type": a["type"],
+            "options": list(a["options"]), "unit": a.get("unit"),
+        })
+    wanted = _clean_str(spec)
+    notes: list[str] = []
+    if wanted:
+        hit, _unit = fam.resolve(wanted)
+        attrs = [x for x in attrs if hit and x["key"] == hit["key"]]
+        if not attrs:
+            notes.append(f"no spec called '{wanted}' for {fam.display_name}")
+    if not fam.persisted:
+        notes.append("no stored catalogue for this product yet: only the common specs are listed")
+    facts = _Facts()
+    for a in attrs:
+        facts.add(f"{a['label']} options" if a["options"] else f"{a['label']} ({a['type']})", ", ".join(a["options"]) or a["type"], a.get("unit") or "")
+    return _result(
+        "get_spec_options", args, ok=bool(attrs),
+        data={"family": fam.family_key, "attributes": attrs}, facts=facts, notes=notes,
+    )
+
+
+async def lookup_hsn(db: AsyncSession, *, user: User, product_or_code: Any = None, **_: Any) -> dict[str, Any]:
+    """Disambiguated HSN candidates for a product name or code (display title, fresh/dried context, recommended row)."""
+    import asyncio
+
+    from api.v1 import hsn as hsn_api
+
+    q = _clean_str(product_or_code)
+    args = {"product_or_code": q}
+    if not q:
+        return _error("lookup_hsn", args, "product_or_code is required")
+    rows = await asyncio.to_thread(hsn_api.search_hsn, q[:100], 6)
+    cands = [
+        {
+            "code": r.code, "title": r.display_title or r.formatted_title, "context": r.context,
+            "recommended": bool(r.recommended), "category": r.category,
+        }
+        for r in rows[:6]
+    ]
+    if not cands:
+        return _result("lookup_hsn", args, data={"candidates": []}, notes=[f"no HSN code found for '{q}'"])
+    facts = _Facts()
+    for c in cands:
+        facts.add(f"HSN {c['code']}" + (" (recommended)" if c["recommended"] else ""), c["title"])
+    return _result("lookup_hsn", args, data={"candidates": cands}, facts=facts)
+
+
 # --------------------------------------------------------------------------- registry
 
 _TOOLS: dict[str, Callable[..., Awaitable[dict[str, Any]]]] = {
@@ -674,6 +737,8 @@ _TOOLS: dict[str, Callable[..., Awaitable[dict[str, Any]]]] = {
     "get_my_rfqs": get_my_rfqs,
     "estimate_freight": estimate_freight,
     "company_profile": company_profile,
+    "get_spec_options": get_spec_options,
+    "lookup_hsn": lookup_hsn,
 }
 
 READ_TOOL_NAMES = frozenset(_TOOLS)
@@ -687,6 +752,8 @@ _ALLOWED_ARGS: dict[str, set[str]] = {
     "get_my_rfqs": {"status", "limit"},
     "estimate_freight": {"origin", "destination", "weight_kg", "mode"},
     "company_profile": {"user_id"},
+    "get_spec_options": {"product", "spec"},
+    "lookup_hsn": {"product_or_code"},
 }
 
 
@@ -755,6 +822,19 @@ READ_TOOL_SCHEMAS: list[dict[str, Any]] = [
         "company_profile",
         "Public verification facts of a marketplace user: KYC status, trust score, rating.",
         {"user_id": _S}, ["user_id"],
+    ),
+    _fn(
+        "get_spec_options",
+        "The spec catalogue for a product: the spec names, their types and the known options/units. Call it when the user "
+        "asks what varieties, grades, packaging or other specs they can choose; answer only from its result.",
+        {"product": {**_S, "description": "Product, e.g. 'apples'"}, "spec": {**_S, "description": "Optional spec name, e.g. 'variety'"}},
+        ["product"],
+    ),
+    _fn(
+        "lookup_hsn",
+        "HSN code candidates for a product name or code, with fresh/dried context and the recommended one. Call it when "
+        "the user asks which HSN code to use; answer only from its result.",
+        {"product_or_code": {**_S, "description": "Product name or HSN code"}}, ["product_or_code"],
     ),
 ]
 

@@ -438,6 +438,29 @@
   color: var(--text);
 }
 
+/* Quick replies sit under the latest assistant message and wrap on narrow screens. */
+.ai-quick-replies {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: var(--space-2) 0 var(--space-3);
+}
+
+.ai-quick-reply {
+  max-width: 100%;
+  min-height: 2rem;
+  height: auto;
+  padding-block: 0.25rem;
+  text-align: left;
+  white-space: normal;
+  cursor: pointer;
+}
+
+.ai-quick-reply:focus-visible {
+  outline: 2px solid var(--primary, currentColor);
+  outline-offset: 2px;
+}
+
 /* --- Composer ------------------------------------------------------------ */
 .ai-chat-footer {
   flex-shrink: 0;

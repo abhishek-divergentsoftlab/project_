@@ -37,6 +37,8 @@ interface MessageItem extends AIChatMessage {
   createdRfq?: AICreatedRFQ | null;
   counterpartyMessage?: AICounterpartyMessage | null;
   routedAgent?: AgentInfo | null;
+  /** In-memory only: suggested answers for the chat's latest assistant message. */
+  quickReplies?: string[];
   isStreaming?: boolean;
 }
 
@@ -719,6 +721,9 @@ export function AIChat() {
               const nextCreatedRfq = chunk.created_rfq || msg.createdRfq || null;
               const nextCounterpartyMsg = chunk.counterparty_message || msg.counterpartyMessage || null;
               const nextRoutedAgent = chunk.routed_agent || msg.routedAgent || null;
+              const nextQuickReplies = chunk.quick_replies?.length
+                ? chunk.quick_replies.filter((q) => typeof q === "string" && q.trim())
+                : msg.quickReplies;
               return {
                 ...msg,
                 content: nextContent,
@@ -728,6 +733,7 @@ export function AIChat() {
                 createdRfq: nextCreatedRfq,
                 counterpartyMessage: nextCounterpartyMsg,
                 routedAgent: nextRoutedAgent,
+                quickReplies: nextQuickReplies,
                 isStreaming: !chunk.done,
               };
             })
@@ -788,6 +794,11 @@ export function AIChat() {
   }
 
   const hasDraft = Object.keys(currentRfq).length > 0;
+  const lastMessage = messages[messages.length - 1];
+  const quickReplies =
+    lastMessage && lastMessage.role === "assistant" && !lastMessage.isStreaming
+      ? lastMessage.quickReplies ?? []
+      : [];
   const showEmptyHero = messages.length <= 1 && !loading;
   const showSuggestions = messages.length <= 2 && !loading && !showEmptyHero;
 
@@ -1125,6 +1136,20 @@ export function AIChat() {
                   </div>
                 );
               })}
+            {!loading && quickReplies.length > 0 && (
+              <div className="ai-quick-replies" role="group" aria-label="Quick replies">
+                {quickReplies.map((reply) => (
+                  <button
+                    key={reply}
+                    type="button"
+                    className="ai-prompt-chip ai-quick-reply"
+                    onClick={() => handleSend(reply)}
+                  >
+                    {reply}
+                  </button>
+                ))}
+              </div>
+            )}
             <div ref={messagesEndRef} />
           </div>
 

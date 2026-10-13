@@ -225,22 +225,29 @@ async def test_specs_stored_and_unfilled_labels_in_prompt(client, db, make_actor
     assert "target price" in data["reply"]
 
 
-async def test_spec_value_filed_under_label_with_preset_must_match(client, db, make_actor):
+async def test_spec_value_filed_under_catalogue_key_with_preset_must_match(client, db, make_actor):
     user = await make_actor("buyer")
     with _Helpers(), _tool_chat({"product_details": {"grade": "1121"}}):
         data = await _msg(user, "grade is 1121 and I need 600 kg", BASE)
     pd = data["rfq_draft"]["product_details"]
-    assert pd["Grade"] == "1121" and "grade" not in pd
-    assert pd["Grade__must_match"] is True
-    assert "Origin__must_match" not in pd
+    assert pd["grade"] == "1121" and "Grade" not in pd
+    assert pd["grade__must_match"] is True
+    assert "origin__must_match" not in pd
 
 
 def test_apply_spec_suggestions_without_preset():
     d = _draft()
     d["product_details"]["origin"] = "Punjab"
     cda.apply_spec_suggestions(d, SPECS)
-    assert d["product_details"]["Origin"] == "Punjab"
-    assert "Origin__must_match" not in d["product_details"]
+    assert d["product_details"]["origin"] == "Punjab"
+    assert "origin__must_match" not in d["product_details"]
+
+
+def test_apply_spec_suggestions_skips_the_preset_for_a_spec_the_user_answered():
+    d = _draft()
+    d["product_details"]["Grade"] = "1121"
+    cda.apply_spec_suggestions(d, SPECS, answered=["grade"])
+    assert d["product_details"] == {"name": "Basmati Rice", "grade": "1121"}  # no False flag, no preset
 
 
 @pytest.mark.parametrize("text", [

@@ -371,6 +371,14 @@ def base_unit(unit: Optional[str]) -> Optional[tuple[Decimal, str]]:
     return None
 
 
+def to_kg_from_text(value: Any) -> Optional[Decimal]:
+    """"20 kg" / "20000 g" -> kilograms; None when it is not a mass."""
+    parsed = parse_measurement(value)
+    if parsed is None:
+        return None
+    return to_kg(parsed[0], parsed[1])
+
+
 def resolve_to_base_unit(
     unit: Optional[str],
     attributes: Optional[dict[str, Any]] = None,
@@ -409,6 +417,9 @@ def resolve_to_base_unit(
         pw = None
         if attributes:
             pw = attributes.get("pack_weight_kg") or attributes.get("pack_weight")
+            if pw is None:  # the spec catalogue's flat "20 kg"
+                size = to_kg_from_text(attributes.get("pack_size"))
+                pw = size
         if pw is None and cleaned in (
             "bora", "boras", "bori", "boris", "katta", "kattas",
             "bag", "bags", "sack", "sacks", "gunny bag", "gunny bags",

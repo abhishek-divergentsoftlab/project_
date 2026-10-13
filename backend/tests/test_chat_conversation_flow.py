@@ -238,7 +238,7 @@ def test_recap_lists_hsn_specs_must_match_min_order_and_dispatch():
     out = cc.build_recap(draft, "en", role_note="seller")
     assert "(Agriculture, HSN 100630)" in out and "**Type:** Selling (your account can only post as a seller)" in out
     assert "**Minimum order:** 100 kg" in out and "**Offer price:** INR 70 per kg" in out
-    assert "**Dispatch within:** 10 days" in out and "Grain Length 7mm (must match)" in out
+    assert "**Dispatch within:** 10 days" in out and "Grain Length: 7mm (must match)" in out
     assert "**Description:** Export quality" in out and out.endswith(RECAP_Q)
     assert "Ise abhi publish karun" in cc.build_recap(draft, "hinglish")
 

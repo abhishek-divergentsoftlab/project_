@@ -184,8 +184,12 @@ async def test_product_details_accept_arbitrary_nested_json(make_actor):
     body = (
         await actor.post("/rfqs", json=rfq_body("seller", attributes=details))
     ).json()
-    assert body["product_details"]["capacity"] == {"value": 20000, "unit": "mAh"}
-    assert body["product_details"]["certification"] == ["CE", "UN38.3"]
+    # The JSONB column takes any spec without a migration; the spec catalogue stores each one flat and under its canonical
+    # key ("certification" is the common ``certifications`` spec, a {"value", "unit"} pair is "20000 mAh").
+    assert body["product_details"]["capacity"] == "20000 mAh"
+    assert body["product_details"]["certifications"] == ["CE", "UN38.3"]
+    assert body["product_details"]["ports"] == 3 and body["product_details"]["c_to_c"] is True
+    assert not any(isinstance(v, dict) for v in body["product_details"].values())
 
 
 async def test_every_rfq_route_requires_authentication(client, make_actor, make_rfq):

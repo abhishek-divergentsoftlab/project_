@@ -190,6 +190,11 @@ class SuggestedAttribute(BaseModel):
     options: list[str] = Field(default_factory=list)
     explanation: Optional[str] = None
     must_match: bool = False
+    # Catalogue fields: ``key`` is the canonical spec name; ``unit`` is the canonical unit of a numeric spec,
+    # ``multi`` marks a spec that takes several of its options (certifications), ``synonyms`` are other names for it.
+    unit: Optional[str] = None
+    multi: bool = False
+    synonyms: list[str] = Field(default_factory=list)
 
 
 class SuggestedAttributesResponse(BaseModel):

@@ -211,10 +211,10 @@ async def test_replayed_session_stays_buyer_asks_specs_and_creates_only_after_th
         assert not CORE & {k.lower() for k in details}
         assert not any(isinstance(v, dict) for v in details.values())
         # The answer is filed by the deterministic layer (the model's tool call is cleaned and its duplicates dropped).
-        assert details["Pack Size"] == "20 kg" and "pack_weight" not in details and "pack_weight_kg" not in details
-        assert details["Certifications"] == "Organic, FSSAI" and details["Certifications__must_match"] is True
+        assert details["pack_size"] == "20 kg" and "pack_weight" not in details and "pack_weight_kg" not in details
+        assert details["certifications"] == ["Organic", "FSSAI"] and details["certifications__must_match"] is True
         assert "certification" not in details and "organic" not in details
-        assert details["Variety"] == "Fuji" and not details.get("Variety__must_match")
+        assert details["variety"] == "Fuji" and not details.get("variety__must_match")
         assert "quality" not in details and not any("brix" in k.lower() for k in details)  # "minimum Brix lael": not stored
         assert d3["rfq_draft"]["price_target"]["per_unit"] == "kg"
         assert "Say 'create RFQ'" not in d3["reply"] and "create RFQ" not in d3["reply"]
@@ -232,7 +232,7 @@ async def test_replayed_session_stays_buyer_asks_specs_and_creates_only_after_th
         assert "**Target price:** USD 20 per kg" in d4["reply"] and "per per" not in d4["reply"]
         specs_line = next(l for l in d4["reply"].splitlines() if "**Specs:**" in l)
         assert "{" not in specs_line and "[" not in specs_line and "quantity_" not in specs_line and "price_" not in specs_line
-        assert "Certifications Organic, FSSAI (must match)" in specs_line and "Pack Size 20 kg" in specs_line
+        assert "Certifications: Organic, FSSAI (must match)" in specs_line and "Pack size: 20 kg" in specs_line
         assert d4["rfq_draft"]["role"] == "buyer"
         assert "grade" not in {k.lower() for k in d4["rfq_draft"]["product_details"]}
         st = await _state(db)
@@ -512,7 +512,7 @@ def test_the_recap_never_shows_core_keys_or_raw_reprs():
     recap = cc.build_recap(draft)
     line = next(l for l in recap.splitlines() if "**Specs:**" in l)
     assert "quantity_unit" not in line and "price_amount" not in line and "{" not in line and "[" not in line
-    assert "certification organic, fssai" in line and "organic yes (must match)" in line
+    assert "Certification: organic, fssai" in line and "Organic: yes (must match)" in line
 
 
 # ---- junk products ---------------------------------------------------------------------------------------------------------
@@ -638,8 +638,9 @@ async def test_after_the_spec_answer_or_skip_the_recap_follows(client, db, make_
     assert d["reply"].rstrip().endswith(RECAP_Q) and "tell me a few specs" not in d["reply"]
     details = d["rfq_draft"]["product_details"]
     # filed from the user's words: must-match only when the user says "must" (the suggestion's preset is not applied)
-    assert details["Variety"] == "Fuji" and details["Variety__must_match"] is False and details["Grade"] == "A"
-    assert "Size (mm)" not in details  # nothing is invented for a spec the user did not mention
+    assert details["variety"] == "Fuji" and "variety__must_match" not in details and details["grade"] == "A"
+    assert not any(k.endswith("__must_match") and v is not True for k, v in details.items())  # no False flags
+    assert "size" not in details  # nothing is invented for a spec the user did not mention
     with _Helpers():
         d2 = await _msg(user, U1)
         d2 = await _msg(user, "skip", cid=d2["conversation_id"])
@@ -790,16 +791,19 @@ async def test_replayed_banana_session(client, db, make_actor):
         assert d1["reply"].index("Suggested HSN") < d1["reply"].index("tell me a few specs")
 
         # U2: "fresh" answers the fresh-or-dried distinction: HSN applied, condition is a spec, no description,
-        # no model-invented closing choice; the closing question is the recap's.
+        # no model-invented closing choice; answering only the HSN offer does not answer the spec question, so it is asked again.
         d2 = await _msg(user, B2, cid=cid, log=log)
         details = d2["rfq_draft"]["product_details"]
         assert details["hsn_code"] == "0803" and details["hsn_source"] == "manual"
         assert details["condition"] == "Fresh" and details["name"].lower() == "bananas"
         assert "description" not in d2["rfq_draft"]
         assert "continue refining" not in d2["reply"] and "Ready to publish" not in d2["reply"]
-        assert d2["reply"].rstrip().endswith(RECAP_Q)
-        assert "Category set to Agriculture from HSN 0803." in d2["reply"] or d2["rfq_draft"]["category"] == "Agriculture"
-        assert "(Agriculture, HSN 0803)" in d2["reply"]
+        assert "tell me a few specs" in d2["reply"] and RECAP_Q not in d2["reply"]
+        assert d2["rfq_draft"]["category"] == "Agriculture"
+        if "Category set to Agriculture from HSN 0803." in d2["reply"]:  # a note comes before the question, never after it
+            assert d2["reply"].index("Category set to Agriculture from HSN 0803.") < d2["reply"].index("tell me a few specs")
+        assert d2["reply"].count("HSN 0803") <= 2 and "applied.Here" not in d2["reply"] and "HSN 0803 applied" not in d2["reply"]
+        assert d2["reply"].rstrip().endswith("Skip") is False and d2["quick_replies"][-1] == "Skip"
         assert d2["rfq_draft"]["role"] == "buyer"
 
         # U3: "continue refinig it" asks the spec question (no model call), never renames, never recaps.

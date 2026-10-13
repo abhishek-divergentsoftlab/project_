@@ -373,6 +373,41 @@
   align-items: center;
 }
 
+/* Suggested rows: the name is a fixed label, not an input to edit. */
+.attribute-label-input {
+  background: var(--bg-subtle);
+  color: var(--text-secondary);
+  font-weight: var(--weight-medium);
+  cursor: default;
+}
+
+.attr-select-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  min-width: 0;
+}
+
+.attr-value-with-unit {
+  position: relative;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.attr-value-with-unit input {
+  width: 100%;
+  padding-right: 3.25rem;
+}
+
+.attr-unit-suffix {
+  position: absolute;
+  right: 0.75rem;
+  color: var(--muted);
+  font-size: var(--text-sm);
+  pointer-events: none;
+}
+
 .attr-option-pills {
   display: flex;
   align-items: center;

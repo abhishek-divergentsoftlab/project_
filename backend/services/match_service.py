@@ -231,7 +231,7 @@ _SPEC_WORDS = frozenset(
 _NON_SPEC_KEYS = frozenset(
     {
         "name", "product", "product_name", "title", "packaging", "pack_count",
-        "pack_weight", "pack_weight_kg", "total_weight_kg", "total_weight_tons",
+        "packaging_type", "pack_size", "pack_weight", "pack_weight_kg", "total_weight_kg", "total_weight_tons",
         "quantity", "moq", "min_order", "notes",
     }
 )

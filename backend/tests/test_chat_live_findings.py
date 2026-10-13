@@ -200,7 +200,7 @@ async def test_the_spec_answer_gets_the_update_tool_and_a_drafting_turn_even_tho
             d2 = await _msg(user, U3, cid=d1["conversation_id"])
     assert seen == {"drafting": True, "round_only": True}
     assert "update_rfq_draft" in model.calls[-1]["tools"] and "Do NOT ask any question" in model.calls[-1]["system"]
-    assert d2["rfq_draft"]["product_details"]["Apple Variety"] == "Fuji"
+    assert d2["rfq_draft"]["product_details"]["variety"] == "Fuji"
 
 
 async def test_a_question_about_the_specs_is_not_a_drafting_turn(client, db, make_actor):
@@ -229,37 +229,39 @@ def _file(message, specs=APPLE8, details=None, pending=None):
     return draft["product_details"], filing
 
 
-def test_the_apples_answer_is_filed_under_the_suggestion_labels():
+def test_the_apples_answer_is_filed_under_the_catalogue_keys():
     details, filing = _file(U3)
-    assert details["Apple Variety"] == "Fuji" and not details.get("Apple Variety__must_match")  # "must" is about certification
-    assert details["Packaging Type"] == "Carton Box"  # from the full list of 8, not only the 3 that were asked
-    assert details["Pack Size"] == "20 kg"
-    assert details["Certifications"] == "Organic, FSSAI" and details["Certifications__must_match"] is True
-    assert not any("brix" in k.lower() or k.lower() == "quality" for k in details)  # "minimum Brix lael" is garbled
-    assert "Size Diameter (mm)" not in details  # "carton size box of 20kg" is not a size in mm
+    assert details["variety"] == "Fuji" and not details.get("variety__must_match")  # "must" is about certification
+    assert details["packaging_type"] == "Carton"  # from the full list of 8, not only the 3 that were asked
+    assert details["pack_size"] == "20 kg"
+    assert details["certifications"] == ["Organic", "FSSAI"] and details["certifications__must_match"] is True
+    assert not any("brix" in k.lower() or k.lower() in ("quality", "grade") for k in details)  # "minimum Brix lael" is garbled
+    assert "size_diameter" not in details  # "carton size box of 20kg" is not a size in mm
+    assert not any(k.endswith("__must_match") and v is not True for k, v in details.items())  # never a False flag
     assert filing.ask_value == {
-        "label": "Brix Sugar Content (°Bx)", "key": "brix_sugar_content_bx", "qualifier": "minimum",
+        "label": "Brix Sugar Content (°Bx)", "key": "brix_sugar_content", "qualifier": "minimum",
         "examples": ["12", "14"], "unit": "°Bx",
     }
-    assert filing.must == ["Certifications"]
+    assert filing.must == ["certifications"]
 
 
 @pytest.mark.parametrize("message,key,value", [
-    ("fuji", "Apple Variety", "Fuji"),
-    ("variety is gala or fuji", "Apple Variety", "Fuji, Gala"),
-    ("type is honeycrisp", "Apple Variety", "Honeycrisp"),
-    ("carton", "Packaging Type", "Carton Box"),
-    ("net bag packing", "Packaging Type", "Net Bag"),
-    ("minimum brix 14", "Brix Sugar Content (°Bx)", "min 14"),
-    ("min 14 brix", "Brix Sugar Content (°Bx)", "min 14"),
-    ("brix: 12-14", "Brix Sugar Content (°Bx)", "12-14"),
-    ("size 70 mm", "Size Diameter (mm)", "70 mm"),
-    ("firmness at least 100 kpa", "Firmness (kPa)", "min 100 kpa"),
-    ("pack size of 25 kg per bag", "Pack Size", "25 kg"),
-    ("20 kg per box", "Pack Size", "20 kg"),
-    ("colour is red, texture: crisp", "Color", "Red"),
-    ("texture: crisp", "Texture", "Crisp"),
-    ("certified organic, haccp", "Certifications", "Organic, HACCP"),
+    ("fuji", "variety", "Fuji"),
+    ("variety is gala or fuji", "variety", "Fuji, Gala"),
+    ("type is honeycrisp", "variety", "Honeycrisp"),
+    ("carton", "packaging_type", "Carton"),
+    ("net bag packing", "packaging_type", "Bag"),
+    ("minimum brix 14", "brix_sugar_content", "≥14 °Bx"),
+    ("min 14 brix", "brix_sugar_content", "≥14 °Bx"),
+    ("brix: 12-14", "brix_sugar_content", "12-14 °Bx"),
+    ("size 70 mm", "size_diameter", "70 mm"),
+    ("firmness at least 100 kpa", "firmness", "≥100 kPa"),
+    ("pack size of 25 kg per bag", "pack_size", "25 kg"),
+    ("20 kg per box", "pack_size", "20 kg"),
+    ("pack size 20000 g", "pack_size", "20 kg"),
+    ("colour is red, texture: crisp", "color", "Red"),
+    ("texture: crisp", "texture", "Crisp"),
+    ("certified organic, haccp", "certifications", ["Organic", "HACCP"]),
 ])
 def test_filing_examples(message, key, value):
     details, _ = _file(message)
@@ -268,33 +270,33 @@ def test_filing_examples(message, key, value):
 
 def test_must_attaches_to_the_spec_it_is_written_next_to():
     details, filing = _file("variety must be fuji, packaging carton, certification organic aur fssai zaroori hai")
-    assert details["Apple Variety__must_match"] is True and details["Certifications__must_match"] is True
-    assert not details.get("Packaging Type__must_match")
-    assert set(filing.must) == {"Apple Variety", "Certifications"}
+    assert details["variety__must_match"] is True and details["certifications__must_match"] is True
+    assert not details.get("packaging_type__must_match")
+    assert set(filing.must) == {"variety", "certifications"}
 
 
 @pytest.mark.parametrize("message", ["size 20kg", "size is carton", "firmness is soft", "brix lael", "brix"])
 def test_a_numeric_spec_needs_a_grounded_number_with_a_compatible_unit(message):
     details, filing = _file(message)
-    assert not any(k in details for k in ("Size Diameter (mm)", "Firmness (kPa)", "Brix Sugar Content (°Bx)")), details
+    assert not any(k in details for k in ("size_diameter", "firmness", "brix_sugar_content")), details
     if "brix" in message or "firmness" in message:
         assert filing.ask_value is not None
 
 
 def test_a_bare_number_answers_the_value_question_asked_last_turn():
-    pending = {"label": "Brix Sugar Content (°Bx)", "unit": "°Bx", "qualifier": "minimum"}
-    for message, expected in (("14", "min 14"), ("12-14", "min 12-14"), ("max 16", "max 16"), ("14 brix", "min 14")):
+    pending = {"label": "Brix Sugar Content (°Bx)", "key": "brix_sugar_content", "unit": "°Bx", "qualifier": "minimum"}
+    for message, expected in (("14", "≥14 °Bx"), ("12-14", "12-14 °Bx"), ("max 16", "≤16 °Bx"), ("14 brix", "≥14 °Bx")):
         details, _ = _file(message, pending=pending)
-        assert details["Brix Sugar Content (°Bx)"] == expected, (message, details)
+        assert details["brix_sugar_content"] == expected, (message, details)
     details, _ = _file("lets see", pending=pending)
-    assert "Brix Sugar Content (°Bx)" not in details
+    assert "brix_sugar_content" not in details
 
 
 def test_filing_never_touches_the_form_fields_or_a_question():
     details, filing = _file("price is 25 and quantity is 600 kg, location: Pune")
     assert set(details) == {"name"} and not filing.touched
     details, _ = _file("fuji", details={"Apple Variety": "Gala"})
-    assert details["Apple Variety"] == "Fuji"  # the newest answer wins
+    assert details["variety"] == "Fuji" and "Apple Variety" not in details  # the newest answer wins, under the catalogue key
 
 
 async def test_the_spec_answer_is_filed_before_the_model_runs_and_the_model_cannot_undo_or_duplicate_it(client, db, make_actor):
@@ -317,15 +319,15 @@ async def test_the_spec_answer_is_filed_before_the_model_runs_and_the_model_cann
     details = d2["rfq_draft"]["product_details"]
     # the draft the model started from already held the filed answer
     start = seen["draft_at_start"]["product_details"]
-    assert start["Pack Size"] == "20 kg" and start["Packaging Type"] == "Carton Box" and start["Apple Variety"] == "Fuji"
+    assert start["pack_size"] == "20 kg" and start["packaging_type"] == "Carton" and start["variety"] == "Fuji"
     assert {k for k in details if not k.endswith("__must_match")} == {
-        "name", "Apple Variety", "Packaging Type", "Pack Size", "Certifications"}, details
-    assert details["Certifications"] == "Organic, FSSAI" and details["Certifications__must_match"] is True
+        "name", "variety", "packaging_type", "pack_size", "certifications"}, details
+    assert details["certifications"] == ["Organic", "FSSAI"] and details["certifications__must_match"] is True
     assert d2["reply"].rstrip().endswith(BRIX_Q)
     # the follow-up answer completes it; then the recap
     d3 = await _msg(user, "14", cid=d1["conversation_id"])
-    assert d3["rfq_draft"]["product_details"]["Brix Sugar Content (°Bx)"] == "min 14"
-    assert d3["reply"].startswith("Added: Brix Sugar Content (°Bx) min 14") and d3["reply"].rstrip().endswith(RECAP_Q)
+    assert d3["rfq_draft"]["product_details"]["brix_sugar_content"] == "≥14 °Bx"
+    assert d3["reply"].startswith("Added: Brix Sugar Content ≥14 °Bx") and d3["reply"].rstrip().endswith(RECAP_Q)
 
 
 # =====================================================================================================================
@@ -353,13 +355,15 @@ def test_the_acknowledgement_comes_from_the_draft_diff():
     before = {"role": "buyer", "product_details": {"name": "apples"}}
     after = {
         "role": "buyer", "quantity": {"value": 500.0, "unit": "kg"},
-        "product_details": {"name": "apples", "Apple Variety": "Fuji", "Packaging Type": "Carton Box", "Pack Size": "20 kg",
-                            "Certifications": "Organic, FSSAI", "Certifications__must_match": True},
+        "product_details": {"name": "apples", "variety": "Fuji", "packaging_type": "Carton", "pack_size": "20 kg",
+                            "certifications": ["Organic", "FSSAI"], "certifications__must_match": True},
     }
     assert chat_reply.build_ack(before, after) == (
-        "Added: Quantity 500 kg, Apple Variety Fuji, Packaging Type Carton Box, Pack Size 20 kg, Certifications Organic, FSSAI (must match)."
+        "Added: Quantity 500 kg, Variety Fuji, Packaging Carton, Pack size 20 kg, Certifications Organic, FSSAI (must match)."
     )
-    assert chat_reply.build_ack(before, after, "hinglish").startswith("Add kiya: Quantity 500 kg, Apple Variety Fuji")
+    assert chat_reply.build_ack(before, after, "hinglish").startswith("Add kiya: Quantity 500 kg, Variety Fuji")
+    labelled = chat_reply.build_ack(before, after, labels={"variety": "Apple Variety"})
+    assert "Apple Variety Fuji" in labelled
     assert chat_reply.build_ack(after, after) == ""  # nothing changed: no claim at all
     changed = {**after, "quantity": {"value": 600, "unit": "kg"}}
     assert chat_reply.build_ack(after, changed) == "Updated: Quantity 600 kg."
@@ -383,7 +387,7 @@ async def test_the_reply_lists_what_was_really_added_and_never_says_the_draft_wa
         d2 = await _msg(user, U3, cid=d1["conversation_id"])
     reply = d2["reply"]
     assert reply.startswith(
-        "Added: Apple Variety Fuji, Packaging Type Carton Box, Certifications Organic, FSSAI (must match), Pack Size 20 kg."
+        "Added: Apple Variety Fuji, Packaging Type Carton, Certifications Organic, FSSAI (must match), Pack size 20 kg."
     )
     assert "RFQ draft updated" not in reply and "Let me know" not in reply and "Brix level" not in reply
     assert d1["reply"].startswith("Added: Product Apples, Quantity 500 kg, Target price USD 20 per kg, Location Indore")
@@ -482,8 +486,9 @@ async def test_the_hsn_is_offered_after_the_spec_question_and_fresh_accepts_it(c
         d2 = await _msg(user, "fresh", cid=cid)
     details = d2["rfq_draft"]["product_details"]
     assert details["hsn_code"] == "0803" and details["hsn_source"] == "manual" and details["condition"] == "Fresh"
-    assert d2["reply"].startswith("Added: HSN 0803, condition Fresh.")
-    assert "(Agriculture, HSN 0803)" in d2["reply"] and d2["reply"].rstrip().endswith(RECAP_Q)
+    assert d2["reply"].startswith("Added: HSN 0803, Condition Fresh.")
+    # the HSN answer is not an answer to the spec question: it is asked again (with label chips), not the recap
+    assert "tell me a few specs" in d2["reply"] and RECAP_Q not in d2["reply"] and d2["quick_replies"] == ["Variety", "Ripeness Level", "Skip"]
 
 
 async def test_yes_accepts_the_offered_hsn_and_the_offer_is_in_hinglish_for_hinglish_users(client, db, make_actor):

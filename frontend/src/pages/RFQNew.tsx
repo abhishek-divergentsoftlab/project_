@@ -16,14 +16,98 @@ import {
   calculateOrderEstimate,
 } from "@/utils/siUnits";
 
+/** What a suggested spec needs from the row after it is added (kept so async reloads cannot change it). */
+interface AttributeSpecMeta {
+  inputType: string;
+  unit: string | null;
+  multi: boolean;
+  options: string[];
+  placeholder?: string;
+  explanation?: string;
+}
+
 interface Attribute {
+  /** Canonical key for suggested rows (written to product_details); free text for free rows. */
   key: string;
   value: string;
   mustMatch: boolean;
+  /** Display name of a suggested row; its presence makes the name read-only. */
+  label?: string;
+  spec?: AttributeSpecMeta;
+  /** Selected values of a multi-select row. */
+  values?: string[];
+  /** Select row is in "Other..." free-text mode. */
+  otherMode?: boolean;
+  /** Prefilled from a saved RFQ; maps to a suggestion once suggestions load. */
+  pending?: boolean;
 }
+
+const emptyAttribute = (): Attribute => ({ key: "", value: "", mustMatch: false });
 
 /** Suffix used in product_details to flag an attribute for heavier matching. */
 const MUST_MATCH_SUFFIX = "__must_match";
+const OTHER_OPTION = "__other__";
+
+function specMeta(spec: SuggestedAttribute): AttributeSpecMeta {
+  return {
+    inputType: spec.input_type ?? "text",
+    unit: spec.unit ?? null,
+    multi: Boolean(spec.multi),
+    options: spec.options ?? [],
+    placeholder: spec.placeholder,
+    explanation: spec.explanation,
+  };
+}
+
+/** "20 kg" -> "20" when the suffix is the spec's unit. */
+function stripUnit(value: string, unit: string): string {
+  const escaped = unit.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return value.trim().replace(new RegExp(`\\s*${escaped}$`, "i"), "").trim();
+}
+
+/** A new row for a suggested spec: canonical key, display label, and its input rules. */
+function suggestedRow(spec: SuggestedAttribute, value = ""): Attribute {
+  const meta = specMeta(spec);
+  return {
+    key: spec.key,
+    label: spec.label,
+    value: meta.multi ? "" : value,
+    values: meta.multi ? (value ? [value] : []) : undefined,
+    mustMatch: Boolean(spec.must_match),
+    spec: meta,
+  };
+}
+
+/** Map a prefilled row (saved canonical key) onto the matching suggestion. */
+function applySpecToRow(row: Attribute, spec: SuggestedAttribute): Attribute {
+  const meta = specMeta(spec);
+  let value = row.value;
+  let values: string[] | undefined;
+  let otherMode = false;
+  if (meta.multi) {
+    values = row.values ?? (value ? value.split(",").map((v) => v.trim()).filter(Boolean) : []);
+    value = "";
+  } else {
+    if (row.values) value = row.values.join(", ");
+    if (meta.unit) value = stripUnit(value, meta.unit);
+    if (meta.inputType === "select" && value) {
+      const match = meta.options.find((o) => o.toLowerCase() === value.trim().toLowerCase());
+      if (match) value = match;
+      else otherMode = true;
+    }
+  }
+  return {
+    ...row,
+    key: spec.key,
+    label: spec.label,
+    value,
+    values,
+    otherMode,
+    mustMatch: row.mustMatch || false,
+    spec: meta,
+    pending: false,
+  };
+}
 
 /** Product attributes back into editable rows. `name` has its own field. */
 function toAttributeRows(details: ProductDetails): Attribute[] {
@@ -35,7 +119,7 @@ function toAttributeRows(details: ProductDetails): Attribute[] {
     }
   }
 
-  const rows = Object.entries(details)
+  const rows: Attribute[] = Object.entries(details)
     .filter(([key]) => key !== "name" && !key.endsWith(MUST_MATCH_SUFFIX))
     .map(([key, value]) => ({
       key,
@@ -45,9 +129,15 @@ function toAttributeRows(details: ProductDetails): Attribute[] {
         value !== null && typeof value === "object"
           ? JSON.stringify(value)
           : String(value),
+      // Multi-select values arrive as a string array.
+      values:
+        Array.isArray(value) && value.every((v) => typeof v === "string")
+          ? (value as string[])
+          : undefined,
       mustMatch: mustMatchKeys.has(key),
+      pending: true,
     }));
-  return rows.length > 0 ? rows : [{ key: "", value: "", mustMatch: false }];
+  return rows.length > 0 ? rows : [emptyAttribute()];
 }
 
 /** Turn the typed attribute rows into the JSONB payload. */
@@ -59,26 +149,46 @@ function buildProductDetails(name: string, attributes: Attribute[], hsnCode?: st
     details.hsn_source = "manual";
   }
 
-  for (const { key, value, mustMatch } of attributes) {
+  for (const { key, value, mustMatch, spec, values } of attributes) {
     const trimmedKey = key.trim();
-    const trimmedValue = value.trim();
-    if (!trimmedKey || !trimmedValue) continue;
+    if (!trimmedKey) continue;
 
-    // Let obvious booleans and numbers through as real JSON types so that
-    // numeric matching has something to work with later.
-    const lowered = trimmedValue.toLowerCase();
-    if (lowered === "true" || lowered === "yes") details[trimmedKey] = true;
-    else if (lowered === "false" || lowered === "no") details[trimmedKey] = false;
-    else if (trimmedValue !== "" && !Number.isNaN(Number(trimmedValue))) {
-      details[trimmedKey] = Number(trimmedValue);
-    } else if (trimmedValue.startsWith("{") || trimmedValue.startsWith("[")) {
-      // A structured spec round-tripping through the edit form.
-      try {
-        details[trimmedKey] = JSON.parse(trimmedValue);
-      } catch {
-        details[trimmedKey] = trimmedValue;
-      }
-    } else details[trimmedKey] = trimmedValue;
+    if (spec?.multi) {
+      const picked = (values ?? []).map((v) => v.trim()).filter(Boolean);
+      if (picked.length === 0) continue;
+      details[trimmedKey] = picked;
+      if (mustMatch) details[`${trimmedKey}${MUST_MATCH_SUFFIX}`] = true;
+      continue;
+    }
+
+    const trimmedValue = value.trim();
+    if (!trimmedValue) continue;
+
+    if (spec && (spec.inputType === "select" || spec.inputType === "text")) {
+      // Catalogue values stay exactly as chosen ("007" must not become 7).
+      details[trimmedKey] = trimmedValue;
+    } else if (spec?.unit) {
+      // "20" + kg -> "20 kg"; anything that is not a plain number is kept as typed.
+      const amount = stripUnit(trimmedValue, spec.unit);
+      details[trimmedKey] =
+        amount !== "" && !Number.isNaN(Number(amount)) ? `${amount} ${spec.unit}` : trimmedValue;
+    } else {
+      // Let obvious booleans and numbers through as real JSON types so that
+      // numeric matching has something to work with later.
+      const lowered = trimmedValue.toLowerCase();
+      if (lowered === "true" || lowered === "yes") details[trimmedKey] = true;
+      else if (lowered === "false" || lowered === "no") details[trimmedKey] = false;
+      else if (!Number.isNaN(Number(trimmedValue))) {
+        details[trimmedKey] = Number(trimmedValue);
+      } else if (trimmedValue.startsWith("{") || trimmedValue.startsWith("[")) {
+        // A structured spec round-tripping through the edit form.
+        try {
+          details[trimmedKey] = JSON.parse(trimmedValue);
+        } catch {
+          details[trimmedKey] = trimmedValue;
+        }
+      } else details[trimmedKey] = trimmedValue;
+    }
 
     // Write the must-match flag as a sibling key if the checkbox is checked.
     if (mustMatch) {
@@ -124,7 +234,7 @@ export function RFQNew() {
     publishNow: true,
   });
   const [showMapPicker, setShowMapPicker] = useState(false);
-  const [attributes, setAttributes] = useState<Attribute[]>([{ key: "", value: "", mustMatch: false }]);
+  const [attributes, setAttributes] = useState<Attribute[]>([emptyAttribute()]);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [loading, setLoading] = useState(editing);
@@ -308,6 +418,19 @@ export function RFQNew() {
   // Active specs directly and purely from real-time AI generation
   const activeSpecs: SuggestedAttribute[] = aiSuggestedSpecs;
 
+  // Prefilled rows (editing) pick up the suggestion's label and input rules once suggestions load.
+  useEffect(() => {
+    if (isAiSpecsLoading || activeSpecs.length === 0) return;
+    setAttributes((current) => {
+      if (!current.some((attr) => attr.pending)) return current;
+      return current.map((attr) => {
+        if (!attr.pending) return attr;
+        const spec = activeSpecs.find((s) => s.key.toLowerCase() === attr.key.trim().toLowerCase());
+        return spec ? applySpecToRow(attr, spec) : { ...attr, pending: false };
+      });
+    });
+  }, [activeSpecs, isAiSpecsLoading]);
+
   const handleAddOrFocusSpec = useCallback((spec: SuggestedAttribute, presetValue?: string) => {
     setAttributes((current) => {
       const existingIndex = current.findIndex(
@@ -323,12 +446,11 @@ export function RFQNew() {
         }
         return current;
       }
-      const initialVal = presetValue || "";
-      const mustMatch = Boolean(spec.must_match);
+      const row = suggestedRow(spec, presetValue || "");
       if (current.length === 1 && !current[0].key.trim() && !current[0].value.trim()) {
-        return [{ key: spec.label, value: initialVal, mustMatch }];
+        return [row];
       }
-      return [...current, { key: spec.label, value: initialVal, mustMatch }];
+      return [...current, row];
     });
   }, []);
 
@@ -338,7 +460,9 @@ export function RFQNew() {
 
   function updateAttribute(index: number, patch: Partial<Attribute>) {
     setAttributes((current) =>
-      current.map((attribute, i) => (i === index ? { ...attribute, ...patch } : attribute)),
+      current.map((attribute, i) =>
+        i === index ? { ...attribute, ...patch, ...("key" in patch ? { pending: false } : {}) } : attribute,
+      ),
     );
   }
 
@@ -1012,74 +1136,151 @@ export function RFQNew() {
 
             <div className="attribute-list">
               {attributes.map((attribute, index) => {
-                const matchingSpec = activeSpecs.find(
-                  (s) =>
-                    s.key.toLowerCase() === attribute.key.trim().toLowerCase() ||
-                    s.label.toLowerCase() === attribute.key.trim().toLowerCase()
-                );
-                const isNumeric = matchingSpec?.input_type === "numeric";
-                const placeholder = matchingSpec?.placeholder || (isNumeric ? "e.g. 6.0" : "Value, e.g. red");
-                const hasOptions = matchingSpec?.options && matchingSpec.options.length > 0;
+                const snap = attribute.spec;
+                // Free rows still get the old label/key-based hints.
+                const matchingSpec = snap
+                  ? undefined
+                  : activeSpecs.find(
+                      (s) =>
+                        s.key.toLowerCase() === attribute.key.trim().toLowerCase() ||
+                        s.label.toLowerCase() === attribute.key.trim().toLowerCase()
+                    );
+                const isNumeric = snap ? snap.inputType === "numeric" : matchingSpec?.input_type === "numeric";
+                const options = snap?.options ?? matchingSpec?.options ?? [];
+                const explanation = snap?.explanation ?? matchingSpec?.explanation;
+                const unit = snap?.unit ?? null;
+                const isMulti = Boolean(snap?.multi);
+                const isSelect = Boolean(snap && !snap.multi && snap.inputType === "select" && options.length > 0);
+                const placeholder =
+                  snap?.placeholder || matchingSpec?.placeholder || (isNumeric ? "e.g. 6.0" : "Value, e.g. red");
+                const hasOptions = options.length > 0 && !isSelect;
+                const picked = attribute.values ?? [];
+                const rowName = attribute.label ?? `Attribute ${index + 1}`;
+                const selectValue = attribute.otherMode ? OTHER_OPTION : attribute.value;
+                const addPicked = (raw: string) => {
+                  const v = raw.trim();
+                  if (v && !picked.some((p) => p.toLowerCase() === v.toLowerCase())) {
+                    updateAttribute(index, { values: [...picked, v] });
+                  }
+                };
 
                 return (
                   <div className="attribute-row-container" key={index}>
                     <div className="attribute-row">
-                      <input
-                        aria-label={`Attribute ${index + 1} name`}
-                        placeholder="Name, e.g. colour"
-                        value={attribute.key}
-                        onChange={(e) => updateAttribute(index, { key: e.target.value })}
-                      />
-                      <input
-                        aria-label={`Attribute ${index + 1} value`}
-                        placeholder={placeholder}
-                        value={attribute.value}
-                        inputMode={isNumeric ? "decimal" : undefined}
-                        onKeyDown={(e) => {
-                          if (!isNumeric) return;
-                          // Allow standard navigation and edit controls
-                          if (
-                            e.key === "Backspace" ||
-                            e.key === "Tab" ||
-                            e.key === "Enter" ||
-                            e.key === "Escape" ||
-                            e.key === "Delete" ||
-                            e.key === "ArrowLeft" ||
-                            e.key === "ArrowRight" ||
-                            e.key === "ArrowUp" ||
-                            e.key === "ArrowDown" ||
-                            e.key === "Home" ||
-                            e.key === "End"
-                          ) {
-                            return;
-                          }
-                          // Allow Ctrl/Cmd shortcuts
-                          if (e.ctrlKey || e.metaKey) {
-                            return;
-                          }
-                          // Allow digits 0-9
-                          if (/^[0-9]$/.test(e.key)) {
-                            return;
-                          }
-                          // Allow single decimal dot if not already present
-                          if (e.key === "." && !attribute.value.includes(".")) {
-                            return;
-                          }
-                          // Block all other keys (letters, %, symbols, spaces)
-                          e.preventDefault();
-                        }}
-                        onChange={(e) => {
-                          let val = e.target.value;
-                          if (isNumeric) {
-                            val = val.replace(/[^0-9.]/g, "");
-                            const parts = val.split(".");
-                            if (parts.length > 2) {
-                              val = parts[0] + "." + parts.slice(1).join("");
+                      {attribute.label ? (
+                        <input
+                          aria-label={`Attribute ${index + 1} name`}
+                          className="attribute-label-input"
+                          value={attribute.label}
+                          title={attribute.key}
+                          readOnly
+                        />
+                      ) : (
+                        <input
+                          aria-label={`Attribute ${index + 1} name`}
+                          placeholder="Name, e.g. colour"
+                          value={attribute.key}
+                          onChange={(e) => updateAttribute(index, { key: e.target.value })}
+                        />
+                      )}
+                      {isMulti ? (
+                        <input
+                          aria-label={`${rowName} other value`}
+                          placeholder="Add other value, press Enter"
+                          onKeyDown={(e) => {
+                            if (e.key !== "Enter" && e.key !== ",") return;
+                            e.preventDefault();
+                            addPicked(e.currentTarget.value);
+                            e.currentTarget.value = "";
+                          }}
+                          onBlur={(e) => {
+                            addPicked(e.currentTarget.value);
+                            e.currentTarget.value = "";
+                          }}
+                        />
+                      ) : isSelect ? (
+                        <div className="attr-select-cell">
+                          <select
+                            aria-label={`${rowName} value`}
+                            value={selectValue}
+                            onChange={(e) =>
+                              e.target.value === OTHER_OPTION
+                                ? updateAttribute(index, { otherMode: true, value: "" })
+                                : updateAttribute(index, { otherMode: false, value: e.target.value })
                             }
-                          }
-                          updateAttribute(index, { value: val });
-                        }}
-                      />
+                          >
+                            <option value="">Select…</option>
+                            {options.map((opt) => (
+                              <option key={opt} value={opt}>
+                                {opt}
+                              </option>
+                            ))}
+                            <option value={OTHER_OPTION}>Other…</option>
+                          </select>
+                          {attribute.otherMode && (
+                            <input
+                              aria-label={`${rowName} other value`}
+                              placeholder="Type your value"
+                              value={attribute.value}
+                              onChange={(e) => updateAttribute(index, { value: e.target.value })}
+                            />
+                          )}
+                        </div>
+                      ) : (
+                        <div className={unit ? "attr-value-with-unit" : "attr-value-plain"}>
+                          <input
+                            aria-label={`Attribute ${index + 1} value`}
+                            placeholder={placeholder}
+                            value={attribute.value}
+                            inputMode={isNumeric ? "decimal" : undefined}
+                            onKeyDown={(e) => {
+                              if (!isNumeric) return;
+                              // Allow standard navigation and edit controls
+                              if (
+                                e.key === "Backspace" ||
+                                e.key === "Tab" ||
+                                e.key === "Enter" ||
+                                e.key === "Escape" ||
+                                e.key === "Delete" ||
+                                e.key === "ArrowLeft" ||
+                                e.key === "ArrowRight" ||
+                                e.key === "ArrowUp" ||
+                                e.key === "ArrowDown" ||
+                                e.key === "Home" ||
+                                e.key === "End"
+                              ) {
+                                return;
+                              }
+                              // Allow Ctrl/Cmd shortcuts
+                              if (e.ctrlKey || e.metaKey) {
+                                return;
+                              }
+                              // Allow digits 0-9
+                              if (/^[0-9]$/.test(e.key)) {
+                                return;
+                              }
+                              // Allow single decimal dot if not already present
+                              if (e.key === "." && !attribute.value.includes(".")) {
+                                return;
+                              }
+                              // Block all other keys (letters, %, symbols, spaces)
+                              e.preventDefault();
+                            }}
+                            onChange={(e) => {
+                              let val = e.target.value;
+                              if (isNumeric) {
+                                val = val.replace(/[^0-9.]/g, "");
+                                const parts = val.split(".");
+                                if (parts.length > 2) {
+                                  val = parts[0] + "." + parts.slice(1).join("");
+                                }
+                              }
+                              updateAttribute(index, { value: val });
+                            }}
+                          />
+                          {unit && <span className="attr-unit-suffix">{unit}</span>}
+                        </div>
+                      )}
                       <label
                         className={`must-match-label${attribute.mustMatch ? " checked" : ""}`}
                         title="Matching strongly favours exact or nearest values for this attribute"
@@ -1102,11 +1303,36 @@ export function RFQNew() {
                       </button>
                     </div>
 
+                    {/* Multi-select: toggle the catalogue options; custom values appear as extra chips. */}
+                    {isMulti && (
+                      <div className="attr-option-pills" role="group" aria-label={`${rowName} values`}>
+                        {[...options, ...picked.filter((v) => !options.some((o) => o.toLowerCase() === v.toLowerCase()))].map((opt) => {
+                          const on = picked.some((p) => p.toLowerCase() === opt.toLowerCase());
+                          return (
+                            <button
+                              key={opt}
+                              type="button"
+                              aria-pressed={on}
+                              className={`attr-option-pill${on ? " is-selected" : ""}`}
+                              onClick={() =>
+                                updateAttribute(index, {
+                                  values: on
+                                    ? picked.filter((p) => p.toLowerCase() !== opt.toLowerCase())
+                                    : [...picked, opt],
+                                })
+                              }
+                            >
+                              {opt}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
                     {/* Quick Preset Value Options from LLM / Expert Spec */}
-                    {hasOptions && (
+                    {hasOptions && !isMulti && (
                       <div className="attr-option-pills" role="group" aria-label="Suggested values">
                         <span className="attr-option-pill-label">Suggested:</span>
-                        {matchingSpec.options!.map((opt) => {
+                        {options.map((opt) => {
                           const cleanVal = isNumeric
                             ? (opt.match(/[-+]?\d+(?:\.\d+)?/)?.[0] || opt.replace(/[^0-9.]/g, ""))
                             : opt;
@@ -1124,9 +1350,9 @@ export function RFQNew() {
                         })}
                       </div>
                     )}
-                    {matchingSpec?.explanation && (
+                    {explanation && (
                       <div className="attr-explanation-hint">
-                        💡 {matchingSpec.explanation}
+                        💡 {explanation}
                       </div>
                     )}
                   </div>
@@ -1136,7 +1362,7 @@ export function RFQNew() {
             <button
               type="button"
               className="ghost small-btn add-attribute-btn"
-              onClick={() => setAttributes((current) => [...current, { key: "", value: "", mustMatch: false }])}
+              onClick={() => setAttributes((current) => [...current, emptyAttribute()])}
             >
               <IconPlus size={14} />
               Add custom attribute

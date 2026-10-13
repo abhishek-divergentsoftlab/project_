@@ -31,6 +31,7 @@ from models.notification import Notification
 from models.escrow import DealDispute, EscrowAccount, EscrowMilestone
 from models.shipment import Shipment
 from models.saved_rfq import SavedRFQ
+from models.spec_catalog import SpecCatalog
 from models.enums import ShipmentStatus, ShippingMode
 
 __all__ = [
@@ -68,6 +69,7 @@ __all__ = [
     "ShippingMode",
     "ShipmentStatus",
     "SavedRFQ",
+    "SpecCatalog",
 ]
 
 

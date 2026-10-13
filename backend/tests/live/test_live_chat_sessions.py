@@ -47,7 +47,18 @@ def real_helpers(monkeypatch):
     monkeypatch.setattr(settings, "HSN_AI_ENABLED", True)
 
 
+async def _warm_catalogue(product):
+    """Generate the product's spec family up front (the real recommender), so the replay is not at the mercy of the model
+    swapping between the attribute model and the chat model: the catalogue is stored once, as in production."""
+    from services import spec_catalog
+
+    fam = await spec_catalog.ensure_family(product, "Agriculture")
+    assert fam.persisted, "the attribute recommender produced no family"
+    print(f"\n[catalogue warmed: {fam.family_key}: {[a['key'] for a in fam.attributes]}]")
+
+
 async def _replay(name, client, db, make_actor):
+    await _warm_catalogue({"apples": "apples", "bananas": "bananas"}[name])
     user = await make_actor("both")
     cid, history, turns = None, [], []
     print(f"\n\n========== {name} ==========")
@@ -82,10 +93,6 @@ def _assert_clean_replies(turns):
         assert not re.search(r"RFQ draft (saved|created|updated)", reply, re.IGNORECASE), reply
 
 
-def _find(details, *words):
-    return next((v for k, v in details.items() if all(w in k.lower() for w in words) and not k.endswith("__must_match")), None)
-
-
 async def test_live_apples_session(client, db, make_actor):
     turns, rows = await _replay("apples", client, db, make_actor)
     _assert_clean_replies(turns)
@@ -93,11 +100,14 @@ async def test_live_apples_session(client, db, make_actor):
     rfq = rows[0]
     assert rfq.role == "buyer" and rfq.status == "active"
     details = rfq.product_details
-    assert "fuji" in str(_find(details, "variety")).lower()
-    assert "carton" in str(_find(details, "packag")).lower()
-    certs = str(_find(details, "certif")).lower()
-    assert "organic" in certs and "fssai" in certs
-    assert details.get("Certifications__must_match") is True
+    # canonical catalogue keys and values: the same names the RFQ form and matching use
+    assert details.get("variety") == "Fuji", details
+    assert details.get("packaging_type") == "Carton", details
+    assert details.get("pack_size") == "20 kg", details
+    assert details.get("certifications") == ["Organic", "FSSAI"], details
+    assert details.get("certifications__must_match") is True
+    assert not any(k.endswith("__must_match") and v is not True for k, v in details.items()), "no False must-match keys"
+    assert not any(isinstance(v, dict) for v in details.values()), "specs are flat"
     assert not any("brix" in k.lower() for k in details), "the garbled 'minimum Brix lael' must not be stored"
     # turn 1 asks the spec question once; turn 3 files the answer and asks for the Brix value
     assert "tell me a few specs" in turns[0][1]
@@ -114,4 +124,43 @@ async def test_live_bananas_session(client, db, make_actor):
     rfq = rows[0]
     assert rfq.role == "buyer" and rfq.status == "active"
     assert str(rfq.product_details.get("hsn_code", "")).startswith("0803"), rfq.product_details
-    assert "Suggested HSN 0803" in turns[0][1], "the HSN is offered with the first spec question"
+    # The HSN is offered in the first reply (after the spec question, or on its own when the first spec generation is still
+    # running); answering it does not count as answering the spec question, which is asked again.
+    assert "HSN 0803" in turns[0][1]
+    assert "tell me a few specs" in turns[1][1] and "Shall I publish it now" not in turns[1][1]
+
+
+async def test_live_bananas_attribute_chips_session(client, db, make_actor):
+    """U1 -> spec question + HSN line + label chips; "fresh" -> asked again (not the recap); tap a label -> its options;
+    tap an option -> remaining labels + Done; Done -> the recap with its chips. Chips are read from the replies."""
+    await _warm_catalogue("bananas")
+    user = await make_actor("both")
+    history, cid = [], None
+
+    async def say(msg):
+        nonlocal cid
+        history.append({"role": "user", "content": msg})
+        res = await user.post("/ai-chat/message", json={"messages": history, **({"conversation_id": cid} if cid else {})})
+        assert res.status_code == 200, res.text
+        data = res.json()
+        cid = data.get("conversation_id") or cid
+        history.append({"role": "assistant", "content": data["reply"]})
+        print(f"\nUSER: {msg}\nBOT: {data['reply']}\nCHIPS: {data.get('quick_replies')}")
+        return data
+
+    d1 = await say(SESSIONS["bananas"][0])
+    labels = d1["quick_replies"]
+    assert labels and labels[-1] == "Skip" and len(labels) >= 2 and "tell me a few specs" in d1["reply"]
+    d2 = await say("fresh")
+    assert "tell me a few specs" in d2["reply"] and "Shall I publish it now" not in d2["reply"]
+    assert d2["quick_replies"][-1] == "Skip" and "Condition" not in d2["quick_replies"]
+    d3 = await say(d2["quick_replies"][0])
+    assert d3["quick_replies"][-2:] in (["Other", "Skip"], ["Other", "Done"]) or d3["quick_replies"][-1] == "Other"
+    first = d3["quick_replies"][0]
+    d4 = await say(first)
+    assert d4["quick_replies"][-1] in ("Done", "Other")
+    if d4["quick_replies"][-1] != "Done":  # a multi-choice stays open: Done closes it first
+        d4 = await say("Done")
+    d5 = await say("Done")
+    assert d5["quick_replies"] == ["Publish now", "Save as draft", "Change something"], d5["reply"]
+    assert "Shall I publish it now" in d5["reply"]

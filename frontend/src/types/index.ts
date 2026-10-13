@@ -793,13 +793,20 @@ export interface ShipmentStatusUpdatePayload {
 }
 
 export interface SuggestedAttribute {
+  /** Canonical snake_case key written to product_details. */
   key: string;
+  /** Display name. */
   label: string;
   placeholder: string;
   input_type?: "numeric" | "text" | "select" | string;
   options?: string[];
   explanation?: string;
   must_match?: boolean;
+  /** Unit for numeric attributes; the value is stored as "<number> <unit>". */
+  unit?: string | null;
+  /** Multi-select attribute: stored as an array of strings. */
+  multi?: boolean;
+  synonyms?: string[];
 }
 
 export interface SuggestedAttributesResponse {

@@ -129,7 +129,7 @@ async def clean_tables(database: None) -> AsyncIterator[None]:
                 "TRUNCATE users, rfqs, connections, connection_messages, quotations, "
                 "reviews, certificates, moderation_logs, notifications, "
                 "conversations, messages, message_events, match_searches, "
-                "match_results, escrow_accounts, escrow_milestones, deal_disputes, shipments RESTART IDENTITY CASCADE"
+                "match_results, escrow_accounts, escrow_milestones, deal_disputes, shipments, spec_catalog RESTART IDENTITY CASCADE"
             )
         )
         await session.commit()

@@ -62,6 +62,10 @@ class AIChatResponse(BaseModel):
     editing_rfq_id: Optional[str] = Field(
         default=None, description="Id of the saved RFQ being edited in this conversation, if any."
     )
+    quick_replies: Optional[list[str]] = Field(
+        default=None,
+        description="Chips for the question the reply ends with; clicking one sends exactly that text as the user's next message.",
+    )
 
 
 class AIConversationSummary(BaseModel):

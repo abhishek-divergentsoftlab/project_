@@ -15,7 +15,7 @@ import json
 import re
 from typing import Any, Iterable, Optional
 
-from services import chat_draft_assist, chat_specs, drafting_reply
+from services import chat_draft_assist, chat_specs, drafting_reply, spec_catalog
 
 _HASH_KEYS = (
     "role", "category", "title", "product_details", "quantity", "minimum_order", "price_target", "location",
@@ -68,9 +68,10 @@ def unfilled_specs(draft: dict[str, Any], suggestions: Optional[dict[str, Any]])
     """The suggested specs the draft has no value for yet, must-match presets first (suggestion order otherwise)."""
     details = draft.get("product_details") or {}
     have = {chat_draft_assist._norm_key(k) for k in details}
+    skipped = {chat_draft_assist._norm_key(k) for k in (suggestions or {}).get("skipped") or []}
     out: list[dict[str, Any]] = []
     for spec in (suggestions or {}).get("specs") or []:
-        if not isinstance(spec, dict):
+        if not isinstance(spec, dict) or chat_draft_assist._norm_key(spec.get("key") or "") in skipped:
             continue
         label = str(spec.get("label") or spec.get("key") or "").strip()
         if label and chat_draft_assist._norm_key(label) not in have and chat_draft_assist._norm_key(spec.get("key") or "") not in have:
@@ -241,7 +242,7 @@ _DECLINE_RE = re.compile(
 )
 _DECLINE_ALL_RE = re.compile(
     r"\b(skip\s+(?:all|the\s+rest|everything|rest)|that'?s\s+all|nothing\s+else|no\s+more|bas\s+itna|bas\s+yahi|"
-    r"baaki\s+skip|sab\s+skip|baaki\s+sab\s+skip|rest\s+skip|bas\s+itna\s+hi)\b",
+    r"baaki\s+skip|sab\s+skip|baaki\s+sab\s+skip|rest\s+skip|bas\s+itna\s+hi|done|ho\s*gaya|hogaya)\b",
     re.IGNORECASE,
 )
 _BARE_NO_RE = re.compile(r"^\s*(no|nope|nah|nahi|nahin|na)\s*[.!]*\s*$", re.IGNORECASE)
@@ -281,7 +282,8 @@ _DRAFT_RE = re.compile(
 )
 _NO_RE = re.compile(
     r"^\s*(?:no|nope|nah|wait|hold\s+on|hold\s+it|not\s+yet|stop|cancel|ruko|ruk\s+jao|ruk|nahi|nahin|abhi\s+nahi|"
-    r"ek\s+minute|one\s+sec(?:ond)?|mat\s+karo|don'?t|dont)(?:\s+(?:yet|abhi|please|publish|post|karo|kijiye))*\s*[.!]*\s*$",
+    r"ek\s+minute|one\s+sec(?:ond)?|mat\s+karo|don'?t|dont|change\s+(?:something|a\s+few\s+things|some\s+things)|"
+    r"make\s+(?:some\s+)?changes|kuch\s+badalna\s+hai|kuch\s+change\s+karna\s+hai)(?:\s+(?:yet|abhi|please|publish|post|karo|kijiye))*\s*[.!]*\s*$",
     re.IGNORECASE,
 )
 
@@ -390,8 +392,28 @@ def _spec_value(v: Any, t: dict[str, Any]) -> str:
     return _num(v) if isinstance(v, (int, float)) else str(v)
 
 
-def _specs(details: Any, t: dict[str, Any]) -> list[tuple[str, str, bool]]:
-    """The recap's specs: never the form's own fields, never a raw dict or list repr."""
+def spec_label(key: str, labels: Optional[dict[str, str]] = None) -> str:
+    """What to call a spec key to the user: the suggestion's label ("Apple Variety"), else the catalogue's, else the key in words."""
+    k = str(key)
+    if labels and labels.get(k):
+        return labels[k]
+    common = spec_catalog._COMMON_BY_KEY.get(k)
+    if common:
+        return spec_catalog.display_label(common["label"])
+    return k.replace("_", " ").strip().title() if "_" in k or k.islower() else k
+
+
+def spec_labels(specs: Optional[Iterable[dict[str, Any]]]) -> dict[str, str]:
+    """key -> display label (no unit) for a suggestion list."""
+    out: dict[str, str] = {}
+    for sp in specs or []:
+        if isinstance(sp, dict) and sp.get("key"):
+            out[str(sp["key"])] = spec_catalog.display_label(str(sp.get("label") or sp["key"]))
+    return out
+
+
+def _specs(details: Any, t: dict[str, Any], labels: Optional[dict[str, str]] = None) -> list[tuple[str, str, bool]]:
+    """The recap's specs as (label, value, must): never the form's own fields, never a raw dict or list repr."""
     out: list[tuple[str, str, bool]] = []
     details = details if isinstance(details, dict) else {}
     for k, v in details.items():
@@ -400,15 +422,20 @@ def _specs(details: Any, t: dict[str, Any]) -> list[tuple[str, str, bool]]:
             or chat_specs.is_core_key(k) or v in (None, "", [], {})
         ):
             continue
-        out.append((str(k), _spec_value(v, t), bool(details.get(f"{k}{chat_draft_assist.MUST_MATCH_SUFFIX}"))))
+        out.append((spec_label(str(k), labels), _spec_value(v, t), bool(details.get(f"{k}{chat_draft_assist.MUST_MATCH_SUFFIX}"))))
     return out
 
 
-def _specs_text(details: Any, t: dict[str, Any]) -> str:
-    return ", ".join(f"{k} {v}" + (f" ({t['must']})" if must else "") for k, v, must in _specs(details, t))
+def _specs_text(details: Any, t: dict[str, Any], labels: Optional[dict[str, str]] = None) -> str:
+    """"Packaging: Carton · Pack size: 20 kg · Certifications: Organic, FSSAI (must match)"."""
+    return " · ".join(
+        f"{k}: {v}" + (f" ({t['must']})" if must else "") for k, v, must in _specs(details, t, labels)
+    )
 
 
-def build_recap(draft: dict[str, Any], lang: str = "en", role_note: Optional[str] = None) -> str:
+def build_recap(
+    draft: dict[str, Any], lang: str = "en", role_note: Optional[str] = None, labels: Optional[dict[str, str]] = None
+) -> str:
     """The draft as a short bullet list plus the publish-or-draft question. ``role_note`` names the one role the account can post as."""
     t = _L[lang if lang in _L else "en"]
     role = str(draft.get("role") or "").lower()
@@ -433,7 +460,7 @@ def build_recap(draft: dict[str, Any], lang: str = "en", role_note: Optional[str
     if _deadline(draft.get("deadline"), t, seller):
         lines.append(f"- **{t['deadline_seller' if seller else 'deadline_buyer']}:** {_deadline(draft['deadline'], t, seller)}")
     if _specs(draft.get("product_details"), t):
-        lines.append(f"- **{t['specs']}:** {_specs_text(draft.get('product_details'), t)}")
+        lines.append(f"- **{t['specs']}:** {_specs_text(draft.get('product_details'), t, labels)}")
     if draft.get("description"):
         desc = str(draft["description"]).strip()
         lines.append(f"- **{t['description']}:** {desc[:140]}{'...' if len(desc) > 140 else ''}")
@@ -449,7 +476,7 @@ def build_recap(draft: dict[str, Any], lang: str = "en", role_note: Optional[str
     return "\n".join(lines)
 
 
-def _field_value(key: str, draft: dict[str, Any], t: dict[str, Any], seller: bool) -> str:
+def _field_value(key: str, draft: dict[str, Any], t: dict[str, Any], seller: bool, labels: Optional[dict[str, str]] = None) -> str:
     if key == "quantity":
         return _qty(draft.get("quantity"))
     if key == "minimum_order":
@@ -461,12 +488,13 @@ def _field_value(key: str, draft: dict[str, Any], t: dict[str, Any], seller: boo
     if key == "deadline":
         return _deadline(draft.get("deadline"), t, seller)
     if key == "product_details":
-        return _specs_text(draft.get("product_details"), t)
+        return _specs_text(draft.get("product_details"), t, labels)
     return str(draft.get(key) or "")
 
 
 def build_edit_recap(
-    draft: dict[str, Any], snapshot: dict[str, Any], changed: Iterable[str], lang: str = "en", publish: bool = False
+    draft: dict[str, Any], snapshot: dict[str, Any], changed: Iterable[str], lang: str = "en", publish: bool = False,
+    labels: Optional[dict[str, str]] = None,
 ) -> str:
     """Only the changed fields as ``old -> new`` and the "save these changes?" question."""
     t = _L[lang if lang in _L else "en"]
@@ -484,12 +512,13 @@ def build_edit_recap(
                      and not str(k).endswith(chat_draft_assist.MUST_MATCH_SUFFIX)]
             for k in names:
                 if old_d.get(k) != new_d.get(k) or old_d.get(f"{k}{chat_draft_assist.MUST_MATCH_SUFFIX}") != new_d.get(f"{k}{chat_draft_assist.MUST_MATCH_SUFFIX}"):
-                    name = "HSN" if k == "hsn_code" else k
-                    new_v = str(new_d.get(k)) + (f" ({t['must']})" if new_d.get(f"{k}{chat_draft_assist.MUST_MATCH_SUFFIX}") else "") if k in new_d else "-"
-                    lines.append(f"- **{name}:** {old_d.get(k, '-')} -> {new_v}")
+                    name = "HSN" if k == "hsn_code" else spec_label(str(k), labels)
+                    new_v = _spec_value(new_d.get(k), t) + (f" ({t['must']})" if new_d.get(f"{k}{chat_draft_assist.MUST_MATCH_SUFFIX}") else "") if k in new_d else "-"
+                    old_v = _spec_value(old_d.get(k), t) if k in old_d else "-"
+                    lines.append(f"- **{name}:** {old_v} -> {new_v}")
             continue
-        old = _field_value(key, snapshot, t, seller) or "-"
-        new = _field_value(key, draft, t, seller) or "-"
+        old = _field_value(key, snapshot, t, seller, labels) or "-"
+        new = _field_value(key, draft, t, seller, labels) or "-"
         lines.append(f"- **{label.get(key, key)}:** {old} -> {new}")
     if len(lines) == 1:
         return t["nothing"]
@@ -504,3 +533,117 @@ def recap_question(lang: str = "en") -> str:
 
 def ready_to_confirm(draft: dict[str, Any]) -> bool:
     return _filled(draft, "role") and _filled(draft, "product")
+
+
+# ---------------------------------------------------------------------------
+# Quick replies: the chips shown under a question. Each one, sent back as a message, is handled by the flow above
+# ("Publish now" confirms, "Change something" is a no, "Buying" answers the role, an option answers its spec).
+# ---------------------------------------------------------------------------
+SKIP_REPLY = "Skip"
+DONE_REPLY = "Done"
+OTHER_REPLY = "Other"
+MAX_FOCUS_CHIPS = 8
+RECAP_REPLIES = ["Publish now", "Save as draft", "Change something"]
+ROLE_REPLIES = ["Buying", "Selling"]
+MAX_CHIPS = 6
+
+
+def quick_replies(
+    field: Optional[str], draft: dict[str, Any], suggestions: Optional[dict[str, Any]] = None,
+    value_ask: Optional[dict[str, Any]] = None,
+) -> list[str]:
+    """Chips for the question ``field`` just asked (a ``next_question`` field, or ``"spec_value"``); [] when none fit."""
+    suggestions = suggestions or {}
+    if field == "recap":
+        return list(RECAP_REPLIES)
+    if field == "role":
+        return list(ROLE_REPLIES)
+    if field == "spec_value":
+        examples = [str(e).strip() for e in ((value_ask or {}).get("examples") or []) if str(e).strip()]
+        return [*examples[:MAX_CHIPS], SKIP_REPLY]
+    if field == "hsn":
+        quals = [q.capitalize() for q in chat_draft_assist.hsn_qualifiers(suggestions.get("hsn"))][:MAX_CHIPS]
+        return [*quals, "No"] if quals else ["Yes", "No"]
+    if field == "specs":
+        return [*spec_label_chips(draft, suggestions), SKIP_REPLY]
+    if field == "spec_pick":
+        return [*spec_label_chips(draft, suggestions), DONE_REPLY]
+    return []
+
+
+def spec_label_chips(draft: dict[str, Any], suggestions: Optional[dict[str, Any]]) -> list[str]:
+    """Labels of the specs still to fill, must-match presets first (the catalogue's order otherwise), at most 6."""
+    out = [spec_catalog.display_label(str(sp.get("label") or sp.get("key"))) for sp in unfilled_specs(draft, suggestions)]
+    return list(dict.fromkeys(out))[:MAX_CHIPS]
+
+
+# ---------------------------------------------------------------------------
+# Tapping specs: a label chip asks only that spec; its options are the next chips
+# ---------------------------------------------------------------------------
+_DONE_RE = re.compile(r"^\s*(?:done|ho\s*gaya|hogaya|that'?s\s+it|finished)\s*[.!]*\s*$", re.IGNORECASE)
+_OTHER_RE = re.compile(r"^\s*other\s*[.!]*\s*$", re.IGNORECASE)
+
+
+def is_done(message: str) -> bool:
+    return bool(_DONE_RE.match(message or ""))
+
+
+def is_other(message: str) -> bool:
+    return bool(_OTHER_RE.match(message or ""))
+
+
+def match_spec_label(message: str, specs: Optional[Iterable[dict[str, Any]]]) -> Optional[dict[str, Any]]:
+    """The suggested spec a short message names by its label ("Variety", "pack size"); None for anything longer or unlike one."""
+    text = spec_catalog._norm(message or "")
+    if not text or len(text.split()) > 4 or re.search(r"\d", text):
+        return None
+    best, score = None, 0.0
+    for sp in specs or []:
+        if not isinstance(sp, dict):
+            continue
+        names = [spec_catalog.display_label(str(sp.get("label") or sp.get("key") or "")), str(sp.get("key") or "").replace("_", " ")]
+        for n in names:
+            n = spec_catalog._norm(n)
+            if not n:
+                continue
+            r = 1.0 if n == text or n == f"the {text}" else (spec_catalog._ratio(n, text) if len(text) >= 4 else 0.0)
+            if r > score:
+                best, score = sp, r
+    return best if score >= 0.85 else None
+
+
+def spec_ask_text(spec: dict[str, Any], lang: str = "en") -> str:
+    label = spec_catalog.display_label(str(spec.get("label") or spec.get("key"))).lower()
+    if lang == "hinglish":
+        return f"Kaun sa {label}?" if spec.get("options") else f"{label.capitalize()} kitna?"
+    if str(spec.get("input_type")) == "numeric":
+        return f"What {label}?"
+    return f"Which {label}?"
+
+
+def spec_type_text(spec: dict[str, Any], lang: str = "en") -> str:
+    label = spec_catalog.display_label(str(spec.get("label") or spec.get("key"))).lower()
+    return f"{label.capitalize()} type kijiye." if lang == "hinglish" else f"Please type the {label}."
+
+
+def spec_pick_text(lang: str = "en") -> str:
+    return "Aur kuch add karna hai? Neeche se chuniye ya 'Ho gaya' likhiye." if lang == "hinglish" else "Anything else? Pick a spec below, or say Done."
+
+
+def spec_more_text(spec: dict[str, Any], lang: str = "en") -> str:
+    label = spec_catalog.display_label(str(spec.get("label") or spec.get("key"))).lower()
+    return f"Aur {label} chuniye, ya 'Ho gaya' likhiye." if lang == "hinglish" else f"Choose more {label}, or tap Done."
+
+
+def focus_chips(spec: dict[str, Any], details: Optional[dict[str, Any]] = None) -> list[str]:
+    """Chips for the spec being asked: its options (choice), the options still unchosen + Done (multi), or example values
+    with the unit (number); always an Other."""
+    options = [str(o).strip() for o in (spec.get("options") or []) if str(o).strip()]
+    unit = str(spec.get("unit") or "").strip()
+    if spec.get("multi"):
+        have = {spec_catalog._norm(x) for x in ((details or {}).get(str(spec.get("key"))) or [])}
+        left = [o for o in options if spec_catalog._norm(o) not in have]
+        return [*left[:MAX_FOCUS_CHIPS], OTHER_REPLY, DONE_REPLY]
+    if str(spec.get("input_type")) == "numeric":
+        return [*[f"{o} {unit}".strip() for o in options[:MAX_FOCUS_CHIPS]], OTHER_REPLY]
+    return [*options[:MAX_FOCUS_CHIPS], OTHER_REPLY, SKIP_REPLY]

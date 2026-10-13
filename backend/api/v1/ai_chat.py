@@ -149,6 +149,7 @@ async def chat_message(
         draft_suggestions=result.get("draft_suggestions"),
         draft_moderation=result.get("draft_moderation"),
         editing_rfq_id=result.get("editing_rfq_id"),
+        quick_replies=result.get("quick_replies"),
     )
 
 
