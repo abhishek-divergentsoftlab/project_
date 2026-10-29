@@ -6,18 +6,82 @@ product type would make the marketplace unusable.
 """
 
 import json
+import unicodedata
 import uuid
 from datetime import datetime
 from typing import Annotated, Any, Optional, Self
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_serializer, field_validator, model_validator
 
 from models.enums import EmbeddingStatus, RFQRole, RFQStatus
-from schemas.common import Deadline, DeadlineOut, Location, Money, NoNulModel, Quantity
+from schemas.common import Deadline, DeadlineOut, Location, Money, NoNulModel, Quantity, clean_user_text, strip_markup
 from schemas.rfq_structure import RFQStructure
 
 # Surrounding whitespace is stripped *before* the length check, so a title of
 # "     " is rejected instead of stored as a blank listing.
+def _strip_format_chars(text: str) -> str:
+    """Drop Cf characters, except ZWNJ/ZWJ (U+200C/U+200D) when the text has Indic letters (U+0900-U+0DFF):
+    those scripts need them for correct conjuncts and half-forms."""
+    keep_joiners = any("\u0900" <= ch <= "\u0dff" and ch.isalpha() for ch in text)
+    return "".join(
+        ch
+        for ch in text
+        if unicodedata.category(ch) != "Cf" or (keep_joiners and ch in ("\u200c", "\u200d"))
+    )
+
+
+MIN_TITLE_CHARS = 2
+
+
+def _is_junk_title(text: str) -> bool:
+    """One character repeated ("aa", "0000", "xxxx"). A two-letter UPPERCASE code ("PP", "CC") is a real product code."""
+    chars = [ch for ch in text if ch.isalnum()]
+    if len(set(chars)) != 1:
+        return False
+    return not (len(chars) == 2 and chars[0].isalpha() and chars[0].isupper())
+
+
+def clean_title(value: str) -> str:
+    """Canonical form of a listing title.
+
+    NFKC-normalised, every Unicode "format" character (category Cf: zero-width
+    spaces, joiners (kept only next to Indic letters), bidi marks and overrides U+202A-202E / U+2066-2069, BOM,
+    soft hyphen...) removed, whitespace collapsed, and at least one letter or
+    digit required -- so an invisible-only or RTL-spoofed title is refused.
+    """
+    text = unicodedata.normalize("NFKC", value)
+    text = _strip_format_chars(text)
+    text = " ".join(strip_markup(text).split())
+    if not any(ch.isalnum() for ch in text):
+        raise ValueError("title must contain at least one letter or digit")
+    if sum(1 for ch in text if ch.isalnum()) < MIN_TITLE_CHARS:
+        raise ValueError(f"title must have at least {MIN_TITLE_CHARS} meaningful characters (describe the product)")
+    if _is_junk_title(text):
+        raise ValueError("title must describe the product, not repeat one character")
+    return text
+
+
+def public_product_details(details: Any) -> Any:
+    """Output view of product_details: internal "_"-prefixed bookkeeping keys (_canon, _canon_pending, _hsn_pending...)
+    are dropped. Storage is never changed."""
+    if not isinstance(details, dict):
+        return details
+    return {k: v for k, v in details.items() if not (isinstance(k, str) and k.startswith("_"))}
+
+
+def title_key(value: Optional[str]) -> str:
+    """Comparison key for duplicate detection: cleaned and case-folded."""
+    if not value:
+        return ""
+    text = unicodedata.normalize("NFKC", value)
+    text = _strip_format_chars(text)
+    return " ".join(text.split()).casefold()
+
+
+def _clean_title_field(value: Optional[str]) -> Optional[str]:
+    return None if value is None else clean_title(value)
+
+
 TitleStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=300)]
 CategoryStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120)]
 
@@ -62,7 +126,14 @@ def validate_product_details(details: Optional[dict[str, Any]]) -> Optional[dict
         raise ValueError("product_details must be JSON-serialisable") from exc
     if size > PRODUCT_DETAILS_MAX_BYTES:
         raise ValueError(f"product_details may be at most {PRODUCT_DETAILS_MAX_BYTES} bytes of JSON")
-    return details
+    return clean_user_text(details)
+
+
+def _clean_description(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = strip_markup(value)
+    return cleaned or None
 
 
 class RFQCreate(NoNulModel):
@@ -86,6 +157,16 @@ class RFQCreate(NoNulModel):
         default=RFQStatus.DRAFT,
         description="Only 'draft' or 'active' may be set at creation.",
     )
+
+    @field_validator("title")
+    @classmethod
+    def _normalise_title(cls, value: str) -> str:
+        return clean_title(value)
+
+    @field_validator("description")
+    @classmethod
+    def _plain_description(cls, value: Optional[str]) -> Optional[str]:
+        return _clean_description(value)
 
     @field_validator("product_details")
     @classmethod
@@ -124,6 +205,16 @@ class RFQPatch(NoNulModel):
     location: Optional[Location] = None
     deadline: Optional[Deadline] = None
     product_details: Optional[dict[str, Any]] = None
+
+    @field_validator("title")
+    @classmethod
+    def _normalise_title(cls, value: Optional[str]) -> Optional[str]:
+        return _clean_title_field(value)
+
+    @field_validator("description")
+    @classmethod
+    def _plain_description(cls, value: Optional[str]) -> Optional[str]:
+        return _clean_description(value)
 
     @field_validator("product_details")
     @classmethod
@@ -173,6 +264,11 @@ class RFQOut(BaseModel):
     is_saved: bool = False
     created_at: datetime
     updated_at: datetime
+
+    @field_serializer("product_details")
+    def _hide_internal_details(self, value: dict[str, Any]) -> dict[str, Any]:
+        return public_product_details(value)
+
 
 
 class RFQListOut(BaseModel):

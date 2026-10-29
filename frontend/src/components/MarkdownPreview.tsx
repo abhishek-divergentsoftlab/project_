@@ -44,10 +44,12 @@ function renderInline(text: string): ReactNode {
     if (linkMatch) {
       const linkText = linkMatch[1];
       const linkUrl = linkMatch[2];
-      // Only permit safe http, https or relative links
-      const isSafeUrl = /^https?:\/\//i.test(linkUrl) || linkUrl.startsWith("/") || linkUrl.startsWith("#");
+      // Only http(s) or a same-origin path. "//host" and "/\host" are protocol-relative (another domain that looks
+      // internal), so they render as plain text.
+      const isInternal = /^\/(?![/\\])/.test(linkUrl);
+      const isSafeUrl = /^https?:\/\//i.test(linkUrl) || isInternal;
       if (isSafeUrl) {
-        if (linkUrl.startsWith("/") || linkUrl.startsWith("#")) {
+        if (isInternal) {
           return (
             <Link key={index} to={linkUrl} className="md-link">
               {linkText}

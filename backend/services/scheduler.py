@@ -1,4 +1,4 @@
-"""In-process background jobs: RFQ expiry, embedding retry, match-history pruning.
+"""In-process background jobs: RFQ expiry, quote expiry, embedding retry, match-history pruning.
 
 Started from the FastAPI lifespan and cancelled on shutdown. Each job:
 
@@ -75,7 +75,7 @@ async def retry_embeddings_job(db: AsyncSession, *, limit: Optional[int] = None)
     Because a retry bumps ``updated_at``, rows that keep failing rotate to the
     back of the queue instead of starving the rest. Returns rows now INDEXED.
     """
-    from models.enums import EmbeddingStatus
+    from models.enums import EmbeddingStatus, RFQStatus
     from models.rfq import RFQ
     from services import rfq_service
 
@@ -92,6 +92,8 @@ async def retry_embeddings_job(db: AsyncSession, *, limit: Optional[int] = None)
                         EmbeddingStatus.STALE,
                     ]
                 ),
+                # Closed, expired and draft listings are not searchable; skip them.
+                RFQ.status == RFQStatus.ACTIVE,
                 RFQ.updated_at <= cutoff,
             )
             .order_by(RFQ.updated_at)
@@ -113,6 +115,20 @@ async def retry_embeddings_job(db: AsyncSession, *, limit: Optional[int] = None)
     if ids:
         logger.info("embedding retry: %d/%d RFQ(s) indexed", indexed, len(ids))
     return indexed
+
+
+async def expire_quotes_job(db: AsyncSession) -> int:
+    """Mark PENDING quotations past ``valid_until`` EXPIRED."""
+    from services import quotation_service
+
+    return await quotation_service.expire_due_quotes(db)
+
+
+async def prune_revoked_tokens_job(db: AsyncSession) -> int:
+    """Delete revoked-token rows whose tokens have expired anyway (daily)."""
+    from core.security import prune_revoked_tokens
+
+    return await prune_revoked_tokens(db)
 
 
 async def prune_match_history_job(
@@ -161,12 +177,30 @@ class Job:
     interval: float
 
 
+async def complete_canon_job(db: AsyncSession) -> int:
+    """Finish AI canonical values for listings saved while the model was busy (small batch: each row may wait on it)."""
+    from services import value_canon
+
+    return await value_canon.complete_pending(db, limit=_env_int("CANON_JOB_LIMIT", 5))
+
+
+async def complete_hsn_job(db: AsyncSession) -> int:
+    """Classify the HSN of listings saved without one (AI call kept off the request path)."""
+    from services import rfq_service
+
+    return await rfq_service.complete_hsn_pending(db, limit=_env_int("HSN_JOB_LIMIT", 5))
+
+
 def default_jobs() -> list[Job]:
     interval = float(_env_int("SCHEDULER_INTERVAL_SECONDS", 600))
     return [
         Job("expire_rfqs", expire_rfqs_job, interval),
         Job("retry_embeddings", retry_embeddings_job, interval),
+        Job("complete_canon", complete_canon_job, interval),
+        Job("complete_hsn", complete_hsn_job, interval),
+        Job("expire_quotes", expire_quotes_job, float(_env_int("QUOTE_EXPIRY_INTERVAL_SECONDS", 3600))),
         Job("prune_match_history", prune_match_history_job, interval),
+        Job("prune_revoked_tokens", prune_revoked_tokens_job, 86400.0),
         Job("refresh_currency_rates", refresh_currency_rates_job, interval),
     ]
 

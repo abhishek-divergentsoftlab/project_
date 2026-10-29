@@ -12,10 +12,16 @@ Authentication (in order of preference)
 
 A socket is only registered for broadcasts after the token is valid, the user
 is active and a party of the connection, and the connection is not REJECTED.
+
+The socket is closed with code 4401 when the access token expires, is revoked
+(logout), or the account is suspended / its token_version changes. Expiry is
+enforced with a receive timeout; revocation and suspension are re-checked on
+every message and at least every ``RECHECK_INTERVAL`` seconds while idle.
 """
 
 import asyncio
 import logging
+import time
 import uuid
 from typing import Annotated, Any, Optional
 
@@ -26,6 +32,7 @@ from db.session import SessionLocal
 from models.connection import Connection
 from models.enums import ConnectionStatus
 from models.user import User
+from services import auth_service
 from services.websocket_manager import ws_manager
 
 logger = logging.getLogger(__name__)
@@ -33,6 +40,8 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["websockets"])
 
 AUTH_MESSAGE_TIMEOUT = 10.0
+RECHECK_INTERVAL = 30.0
+WS_AUTH_EXPIRED = 4401
 BEARER_SUBPROTOCOL = "bearer"
 
 
@@ -79,14 +88,24 @@ def _token_from_subprotocol(websocket: Any) -> Optional[str]:
     return None
 
 
-def _user_id_from(token: Optional[str]) -> Optional[uuid.UUID]:
+async def _validate(token: Optional[str]) -> Optional[tuple[User, dict]]:
+    """The active user and claims for an access token, or None (invalid, revoked, suspended)."""
     if not token:
         return None
     try:
-        payload = decode_token(token, expected_type="access")
-        return uuid.UUID(payload["sub"])
-    except (TokenError, ValueError, KeyError):
+        async with SessionLocal() as db:
+            return await auth_service.user_from_access_token(db, token)
+    except TokenError:
         return None
+
+
+async def _close_unauthorized(connection_id: uuid.UUID, socket: Any) -> None:
+    logger.info("WebSocket closed (4401): token expired, revoked or account suspended")
+    await ws_manager.disconnect(connection_id, socket)
+    try:
+        await socket.close(code=WS_AUTH_EXPIRED)
+    except Exception:  # noqa: BLE001 - peer may already be gone
+        pass
 
 
 @router.websocket("/ws/connections/{connection_id}")
@@ -112,19 +131,16 @@ async def connection_websocket(
         if not isinstance(supplied, str):
             supplied = None
 
-    user_id = _user_id_from(supplied)
-    if user_id is None:
-        logger.warning("WebSocket rejected: missing, invalid or expired access token")
+    validated = await _validate(supplied)
+    if validated is None:
+        logger.warning("WebSocket rejected: missing, invalid, revoked or expired access token")
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
+    user, claims = validated
+    user_id = user.id
+    token_exp = float(claims["exp"])
 
     async with SessionLocal() as db:
-        user = await db.get(User, user_id)
-
-        if user is None or not user.is_active:
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-            return
-
         conn = await db.get(Connection, connection_id)
         if conn is None or user_id not in (conn.sender_id, conn.receiver_id):
             logger.warning("WebSocket rejected: user %s not in connection %s", user_id, connection_id)
@@ -138,9 +154,28 @@ async def connection_websocket(
 
     await ws_manager.connect(connection_id, socket)
 
+    last_check = time.monotonic()
     try:
         while True:
-            data = await websocket.receive_json()
+            # Wake at the token's expiry (and periodically) even when the client is silent.
+            wait = min(token_exp - time.time(), RECHECK_INTERVAL)
+            if wait <= 0:
+                await _close_unauthorized(connection_id, socket)
+                return
+            try:
+                data = await asyncio.wait_for(websocket.receive_json(), timeout=wait)
+            except asyncio.TimeoutError:
+                data = None
+            now = time.monotonic()
+            expired = token_exp <= time.time()
+            # An idle wake-up always re-checks; messages re-check at most once a second.
+            if expired or data is None or now - last_check >= 1.0:
+                last_check = now
+                if expired or await _validate(supplied) is None:
+                    await _close_unauthorized(connection_id, socket)
+                    return
+            if data is None:
+                continue
             event_type = data.get("type") if isinstance(data, dict) else None
 
             if event_type == "ping":

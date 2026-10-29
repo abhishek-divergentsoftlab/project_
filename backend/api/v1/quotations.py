@@ -24,7 +24,7 @@ async def create_quote(
     quote = await quotation_service.create_quotation(
         db, connection_id, current_user.id, payload
     )
-    return quotation_service.to_out(quote, current_user.id)
+    return await quotation_service.out_for(db, quote, current_user.id)
 
 
 @router.get("", response_model=list[QuotationOut])
@@ -35,7 +35,7 @@ async def list_quotes(
 ) -> list[QuotationOut]:
     """Retrieve full chronological quote and counter-offer negotiation history."""
     quotes = await quotation_service.list_quotations(db, connection_id, current_user.id)
-    return [quotation_service.to_out(q, current_user.id) for q in quotes]
+    return [await quotation_service.out_for(db, q, current_user.id) for q in quotes]
 
 
 @router.post("/{quote_id}/accept", response_model=QuotationOut)
@@ -46,10 +46,10 @@ async def accept_quote(
     db: DbSession,
 ) -> QuotationOut:
     """Accept the received quotation. Generates a confirmed Purchase Order (PO)."""
-    quote = await quotation_service.accept_quotation(
+    quote, award = await quotation_service.accept_quotation(
         db, connection_id, quote_id, current_user.id
     )
-    return quotation_service.to_out(quote, current_user.id)
+    return await quotation_service.out_for(db, quote, current_user.id, **award)
 
 
 @router.post("/{quote_id}/reject", response_model=QuotationOut)
@@ -65,7 +65,7 @@ async def reject_quote(
     quote = await quotation_service.reject_quotation(
         db, connection_id, quote_id, current_user.id, reason=reason
     )
-    return quotation_service.to_out(quote, current_user.id)
+    return await quotation_service.out_for(db, quote, current_user.id)
 
 
 @router.get("/{quote_id}/po-pdf")
@@ -113,9 +113,7 @@ async def download_commercial_invoice_pdf(
     )
     # The invoice states the escrow position; it must never claim a deposit
     # that was not made.
-    escrow = await escrow_service.find_escrow_for_connection(db, connection_id)
-    if escrow is not None and escrow.quotation_id != quote.id:
-        escrow = None
+    escrow = await escrow_service.find_escrow_for_quote(db, quote.id)
     pdf_bytes = await asyncio.to_thread(
         document_generator.generate_commercial_invoice_pdf,
         quotation=quote, buyer=buyer, seller=seller, rfq=rfq, escrow=escrow,

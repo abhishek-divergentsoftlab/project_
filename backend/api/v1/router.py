@@ -17,6 +17,9 @@ from api.v1 import (
     media,
     moderation,
     notifications,
+    ops_accounts,
+    ops_payments,
+    ops_trust,
     quotations,
     reviews,
     rfqs,
@@ -47,6 +50,6 @@ api_router.include_router(translation.router)
 api_router.include_router(escrow.router)
 api_router.include_router(logistics.router)
 api_router.include_router(hsn.router)
-
-
-
+api_router.include_router(ops_accounts.router)
+api_router.include_router(ops_trust.router)
+api_router.include_router(ops_payments.router)

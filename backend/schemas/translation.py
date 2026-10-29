@@ -8,7 +8,9 @@ from pydantic import BaseModel, Field, field_validator
 # separate LLM call, so an unbounded batch item is a cheap way to tie up the
 # translator.
 MAX_TRANSLATION_CHARS = 5000
-MAX_BATCH_ITEMS = 50
+# A batch is tighter than the single endpoint: 20 items of up to 2000 characters.
+MAX_BATCH_ITEMS = 20
+MAX_BATCH_ITEM_CHARS = 2000
 
 
 def _validate_language(value: Optional[str], *, allow_auto: bool) -> Optional[str]:
@@ -54,10 +56,12 @@ class TranslationResponse(BaseModel):
     source_language: str
     target_language: str
     cached: bool = False
+    # True when no translation could be produced: ``translated_text`` is then the original, unchanged.
+    fallback: bool = False
 
 
 class BatchTranslationRequest(BaseModel):
-    texts: list[Annotated[str, Field(max_length=MAX_TRANSLATION_CHARS)]] = Field(
+    texts: list[Annotated[str, Field(max_length=MAX_BATCH_ITEM_CHARS)]] = Field(
         ..., min_length=1, max_length=MAX_BATCH_ITEMS, description="Batch of texts to translate"
     )
     target_language: str = Field(..., min_length=2, max_length=10)

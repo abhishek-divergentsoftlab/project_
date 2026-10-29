@@ -3,7 +3,7 @@
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Path, status
+from fastapi import APIRouter, HTTPException, Path, status
 
 from api.deps import CurrentUser, DbSession
 from schemas.escrow import (
@@ -26,11 +26,26 @@ async def get_connection_escrow(
     current_user: CurrentUser,
     db: DbSession,
 ) -> EscrowAccountOut:
-    """Retrieve the active escrow vault, milestone breakdown, and balances for a deal room."""
-    escrow = await escrow_service.get_or_create_escrow_for_connection(
+    """Read-only: the escrow vault of the deal room's live order (404 if none has been opened)."""
+    escrow = await escrow_service.get_escrow_for_connection(
         db=db,
         connection_id=connection_id,
         user_id=current_user.id,
+    )
+    if escrow is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No escrow vault has been opened for this order yet")
+    return EscrowAccountOut.model_validate(escrow)
+
+
+@router.post("/{connection_id}/escrow", response_model=EscrowAccountOut)
+async def open_connection_escrow(
+    connection_id: Annotated[uuid.UUID, Path(description="Connection UUID")],
+    current_user: CurrentUser,
+    db: DbSession,
+) -> EscrowAccountOut:
+    """Explicitly open the escrow vault for the live order (idempotent). Holds no money until funded."""
+    escrow = await escrow_service.open_escrow_for_connection(
+        db=db, connection_id=connection_id, user_id=current_user.id
     )
     return EscrowAccountOut.model_validate(escrow)
 
@@ -42,7 +57,8 @@ async def fund_connection_escrow(
     current_user: CurrentUser,
     db: DbSession,
 ) -> EscrowAccountOut:
-    """Buyer deposits funds into the platform Escrow Vault, securing the quotation order."""
+    """Buyer REPORTS a deposit (method + reference). The vault becomes ``deposit_reported``;
+    only an operator confirmation makes it ``funded``."""
     escrow = await escrow_service.fund_escrow(
         db=db,
         connection_id=connection_id,
@@ -128,12 +144,29 @@ async def resolve_connection_dispute(
     current_user: CurrentUser,
     db: DbSession,
 ) -> DealDisputeOut:
-    """Resolve an open dispute with mutual agreement, escrow release, or buyer refund."""
+    """Resolve an open dispute: escrow release (buyer), refund (seller), or a two-step mutual settlement."""
     dispute = await escrow_service.resolve_dispute(
         db=db,
         connection_id=connection_id,
         dispute_id=dispute_id,
         user_id=current_user.id,
         payload=payload,
+    )
+    return DealDisputeOut.model_validate(dispute)
+
+
+@router.post(
+    "/{connection_id}/disputes/{dispute_id}/withdraw",
+    response_model=DealDisputeOut,
+)
+async def withdraw_connection_dispute(
+    connection_id: Annotated[uuid.UUID, Path(description="Connection UUID")],
+    dispute_id: Annotated[uuid.UUID, Path(description="Dispute UUID")],
+    current_user: CurrentUser,
+    db: DbSession,
+) -> DealDisputeOut:
+    """Withdraw an open dispute. Only the party who raised it may."""
+    dispute = await escrow_service.withdraw_dispute(
+        db=db, connection_id=connection_id, dispute_id=dispute_id, user_id=current_user.id
     )
     return DealDisputeOut.model_validate(dispute)

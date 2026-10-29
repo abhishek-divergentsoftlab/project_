@@ -1,14 +1,18 @@
 """User and profile responses."""
 
+import json
 import uuid
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Optional
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_serializer
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_serializer, field_validator
 
 from models.enums import KYCStatus, UserRole, UserStatus
 from schemas.common import normalise_decimal
+
+
+MAX_MATCHING_PREFERENCES_BYTES = 8 * 1024
 
 
 class ProfileUpdate(BaseModel):
@@ -34,6 +38,15 @@ class ProfileUpdate(BaseModel):
     pan_number: Optional[str] = Field(default=None, max_length=20)
     signatory_name: Optional[str] = Field(default=None, max_length=120)
     matching_preferences: Optional[dict[str, Any]] = Field(default=None)
+
+    @field_validator("matching_preferences")
+    @classmethod
+    def _bounded_preferences(cls, value: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        if value is not None and len(json.dumps(value, default=str)) > MAX_MATCHING_PREFERENCES_BYTES:
+            raise ValueError(
+                f"matching_preferences is too large (max {MAX_MATCHING_PREFERENCES_BYTES // 1024} KB)"
+            )
+        return value
 
 
 class AccountUpdate(BaseModel):

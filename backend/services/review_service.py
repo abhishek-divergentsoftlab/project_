@@ -18,8 +18,30 @@ from schemas.review import ReviewCreate, ReviewOut, UserReviewStatsOut
 from services.websocket_manager import ws_manager
 
 
+# Reviews are only allowed on orders worth at least this much (in the order's own
+# currency), so zero-value "loop" orders cannot be used to farm ratings.
+MIN_REVIEWABLE_ORDER_TOTAL = Decimal("1")
+
+
 class ReviewError(Exception):
     """Domain-level rejection translated to 4xx."""
+
+
+async def effective_reviews(db: AsyncSession, reviewee_id: uuid.UUID) -> list[Review]:
+    """Reviews that count towards ``reviewee_id``: the most recent one per reviewer.
+
+    One partner reviewing the same seller on many orders still counts once.
+    """
+    return list(
+        (
+            await db.scalars(
+                select(Review)
+                .where(Review.reviewee_id == reviewee_id)
+                .distinct(Review.reviewer_id)
+                .order_by(Review.reviewer_id, Review.created_at.desc())
+            )
+        ).all()
+    )
 
 
 async def _get_quote_participants(db: AsyncSession, quote: Quotation) -> tuple[uuid.UUID, uuid.UUID]:
@@ -183,6 +205,22 @@ async def create_review(
             "Ratings are only unlocked after the buyer has accepted the order delivery (Step 3)"
         )
 
+    if quote.total_amount < MIN_REVIEWABLE_ORDER_TOTAL:
+        raise ReviewError(
+            f"Ratings are only available for orders of at least {MIN_REVIEWABLE_ORDER_TOTAL} {quote.currency}"
+        )
+
+    # Ensure no active/open escrow dispute exists on this connection
+    from models.escrow import EscrowAccount
+    open_dispute = await db.scalar(
+        select(EscrowAccount.id).where(
+            EscrowAccount.connection_id == connection_id,
+            EscrowAccount.status.in_(("disputed", "in_arbitration")),
+        )
+    )
+    if open_dispute:
+        raise ReviewError("Reviews cannot be submitted while an escrow dispute is actively under investigation.")
+
     # Determine buyer and seller roles for this transaction
     buyer_id, seller_id = await _get_quote_participants(db, quote)
 
@@ -250,10 +288,13 @@ async def create_review(
             bonus = 5 if payload.rating >= 4 else (1 if payload.rating == 3 else -5)
             profile.trust_score = max(0, min(100, profile.trust_score + bonus))
 
-        existing_ratings = (await db.scalars(
-            select(Review.rating).where(Review.reviewee_id == reviewee_id)
-        )).all()
-        all_ratings = list(existing_ratings) + [payload.rating]
+        # One review per reviewer counts (the most recent); this new one replaces
+        # that reviewer's earlier one in the aggregate.
+        all_ratings = [
+            r.rating
+            for r in await effective_reviews(db, reviewee_id)
+            if r.reviewer_id != reviewer_id
+        ] + [payload.rating]
         profile.total_reviews = len(all_ratings)
         profile.average_rating = Decimal(str(round(sum(all_ratings) / len(all_ratings), 2)))
 
@@ -338,12 +379,20 @@ async def get_user_review_stats(db: AsyncSession, user_id: uuid.UUID) -> UserRev
     """Public rating summary for a user. ``ReviewNotFoundError`` for unknown ids."""
     if await db.get(User, user_id) is None:
         raise ReviewNotFoundError("User not found")
+    # One review per reviewer (the most recent) counts, in aggregates and in the list.
+    latest = (
+        select(Review.id)
+        .where(Review.reviewee_id == user_id)
+        .distinct(Review.reviewer_id)
+        .order_by(Review.reviewer_id, Review.created_at.desc())
+        .scalar_subquery()
+    )
     query = (
         select(Review)
         .options(
             selectinload(Review.reviewer).selectinload(User.profile)
         )
-        .where(Review.reviewee_id == user_id)
+        .where(Review.id.in_(latest))
         .order_by(Review.created_at.desc())
     )
     result = await db.execute(query)

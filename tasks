@@ -1,0 +1,32 @@
+I've stopped work and unloaded `gpt-oss:120b`, so the GPU is free for your friend. **About 70% is done: 9 of 13 tasks.** The new LLM chat works end to end, but the old rule code is still in place and nothing is committed yet.
+
+**One warning before your friend starts:** your backend on port 8011 is still running, and it sends background jobs to `gpt-oss:120b`. One of those jobs could load the 65 GB model back onto the GPU. To prevent that, stop it with `./stop.sh`, or tell me and I'll stop it.
+
+## ✅ Done (9 tasks)
+| # | Task | Result |
+|---|---|---|
+| 1 | Design the new engine: one LLM plus tools, code only checks what the model does | Done |
+| 2 | Stage A: the agent engine, with tools for drafting, specs, HSN, create/publish/edit/close and matches | Done |
+| 3 | Stage B: negotiation tools (connect, message, quote, counter-offer, accept, reject; each needs the user's yes) | Done |
+| 4 | GPU fix: model fully on the GPU | 10 → 35.6 tok/s; turns now about 5–15 s instead of about 36 s |
+| 5 | Fix round C (live run 1 bugs: Hindi input, publish needing 4 "haan", RFQ lookup, chips) | Done |
+| 6 | Fix round D (live run 2 bugs: wrong reply language, values stored in Devanagari, browsing listings, market price) | Done |
+| 7 | Fix round E (live run 3 bugs: unicode spaces in text, "draft discarded", "this request") | Done, but only unit-tested; not yet checked live |
+| 8 | Unit tests | **111 passing** |
+| 9 | Live scenario tests on the real model | **142/155 → 130/143 → 140/147**; 7 of 10 scenarios pass fully |
+
+The old regexes like `_CREATE_NEGATION_RE` and `_CHANGE_PRODUCT_RE` aren't used any more: the model handles "abhi mat banao", "rice nahi wheat", and Hindi or Hinglish itself.
+
+## ⏳ Remaining (4 tasks)
+| # | Task | Rough time |
+|---|---|---|
+| 10 | Live run 4, to confirm the round E fixes on the real model | ~30 min (needs the GPU) |
+| 11 | **Delete the old rule code**: move about 35 helpers the new engine still uses, delete the old modules (roughly 300 regexes), remove the `CHAT_ENGINE` setting, then run the full test suite | ~1–2 h |
+| 12 | Live scenarios for negotiation (none exist yet) and Hinglish recaps for negotiation | ~1 h (needs the GPU) |
+| 13 | Commit the work (only when you say so) | 5 min |
+
+**Two smaller items, separate from the chat rebuild:**
+- The test database has no active onion or turmeric seller listings, so one "find matches" check fails because of data, not code.
+- A database connection error at the end of each chat stream has been logged since Oct 25. The old engine caused it too, so it's a separate fix.
+
+I've saved this list to memory. Next time, just say "continue the chat agent" and I'll start with live run 4 once the GPU is free.

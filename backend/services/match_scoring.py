@@ -16,7 +16,7 @@ from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 from typing import Any, Optional
 
-from services import currency, embeddings, hsn_service, product_synonyms, unit_converter
+from services import currency, hsn_service, product_synonyms, spec_codes, unit_converter, value_canon
 from services.locations import normalise_country
 
 # How much each dimension contributes. Dimensions that cannot be evaluated
@@ -394,6 +394,12 @@ def _semantic_text_similarity(wanted: str, offered: str) -> float:
     if w == o:
         return 1.0
 
+    # Both name a grade code and the codes differ (SS 316L vs SS 304, EN8 vs EN24): different grades, however much of
+    # the rest (stainless steel, or the same HSN heading) they share.
+    w_codes, o_codes = spec_codes.code_tokens(w), spec_codes.code_tokens(o)
+    if w_codes and o_codes and not (w_codes & o_codes):
+        return 0.1
+
     # 2. Multi-concept synonym resolution: do they share ANY canonical concept?
     w_matches = _resolve_all_synonyms(w)
     o_matches = _resolve_all_synonyms(o)
@@ -455,7 +461,7 @@ def _semantic_text_similarity(wanted: str, offered: str) -> float:
         if raw_overlap > 0:
             return raw_overlap * 0.4
 
-    # 5. Dynamic Open-World Semantic Fallback (HSN Codes + Dense Vector Embeddings)
+    # 5. Dynamic Open-World Semantic Fallback (HSN codes, offline)
     dynamic = _dynamic_semantic_similarity(w, o)
     if dynamic is not None and dynamic > 0.0:
         return dynamic
@@ -465,11 +471,19 @@ def _semantic_text_similarity(wanted: str, offered: str) -> float:
 
 @lru_cache(maxsize=20000)
 def _dynamic_semantic_similarity(w: str, o: str) -> Optional[float]:
-    """Zero-shot open-world semantic similarity via HSN codes & dense vector embeddings."""
+    """Open-world similarity of two product names from HSN classification only.
+
+    This used to add a dense-embedding call, but scoring is synchronous and runs
+    per candidate (and per attribute value) on the event loop; with embeddings on
+    CPU that call timed out on every uncached pair and stalled the server.
+    Embedding similarity also rates same-family commodities (tomato/potato) at
+    0.85-0.95, so it could not tell them apart anyway. Cross-product judgement
+    now comes from ``ai_lexicon.relate`` (awaited once, up front, in the match
+    service); this function stays offline: HSN lookups are cache/static only.
+    """
     if not w or not o or len(w) < 2 or len(o) < 2:
         return None
 
-    # 1. HSN Customs Classification
     try:
         ha = hsn_service.predict_hsn_from_text(w)
         hb = hsn_service.predict_hsn_from_text(o)
@@ -478,30 +492,7 @@ def _dynamic_semantic_similarity(w: str, o: str) -> Optional[float]:
             return h_sim
     except Exception:
         pass
-
-    # 2. Vector Embedding Cosine Similarity (with short 2s timeout so scoring never blocks)
-    try:
-        data = embeddings._post(
-            "/api/embed",
-            {"model": settings.EMBEDDING_MODEL, "input": [w, o]},
-            timeout=2,
-        )
-        if data:
-            vecs = data.get("embeddings")
-            if vecs and len(vecs) == 2:
-                dot = sum(a * b for a, b in zip(vecs[0], vecs[1]))
-                m1 = math.sqrt(sum(a * a for a in vecs[0]))
-                m2 = math.sqrt(sum(b * b for b in vecs[1]))
-                if m1 > 0 and m2 > 0:
-                    cos = dot / (m1 * m2)
-                    if cos >= 0.85:
-                        return round(cos, 4)
-                    return 0.0
-    except Exception:
-        pass
-
     return None
-
 
 def hsn_score(buyer_hsn: Optional[str], seller_hsn: Optional[str]) -> Optional[float]:
     """Customs-grade HSN hierarchical compatibility score.
@@ -608,7 +599,8 @@ def tokenize(text: Optional[str]) -> set[str]:
     if not text:
         return set()
     tokens = set()
-    for raw in _TOKEN_RE.findall(text.lower()):
+    # "SS 304", "ss-304" and "SS304" are one token on both sides of every comparison.
+    for raw in _TOKEN_RE.findall(spec_codes.canonical_codes(text)):
         # Single letters are kept -- the "C" in Type-C is the whole distinction
         # between two otherwise identical cables. Single digits are dropped as
         # noise from quantities and titles.
@@ -689,67 +681,121 @@ def category_score(requester_category: str, candidate_category: str) -> float:
     return _overlap(tokenize(requester_category), tokenize(candidate_category))
 
 
-def _value_similarity(wanted: Any, offered: Any) -> float:
+_IDENT_JOIN_RE = re.compile(r"\b([a-z]{1,2})[\s\-_./]+(?=\d)")
+_IDENT_TOKEN_RE = re.compile(r"([a-z]*)(\d+(?:\.\d+)?)[a-z]*")
+
+
+def identifiers(text: str) -> list[str]:
+    """The identifiers in a text, WHOLE and in order: letters plus digits, ignoring case, spaces and separators
+    ("S-30" = "s 30" = "S30" -> "s30"; "pusa 1509" -> "1509"; "30s" / "30 Ne" / "30/1" -> "30", "30", "30", "1").
+    A suffix letter ("30s", "500D") is a variant mark of the same identifier; a PREFIX is part of it (S30 is not M30)."""
+    t = _IDENT_JOIN_RE.sub(lambda m: m.group(1), str(text).lower())
+    return [prefix + number for prefix, number in _IDENT_TOKEN_RE.findall(re.sub(r"[\s\-_/]+", " ", t))]
+
+
+def _identifier_verdict(w: str, o: str) -> Optional[float]:
+    """Both texts carry identifiers (variety 1121 / 1509, grade S30 / M30, model A52 / A54, count 30s / 30 Ne / 30/1).
+    Compared whole: the same leading identifier (or one found in the other's list) is the same item (0.9); different
+    identifiers conflict (0.0), including different letters on the same digits (S30 vs M30, M20 vs C20)."""
+    wn, on = identifiers(w), identifiers(o)
+    if not wn or not on:
+        return None
+    if re.sub(r"[\s\-_./]+", "", w.lower()) == re.sub(r"[\s\-_./]+", "", o.lower()):
+        return 1.0  # the same characters once separators are ignored: "S-30" = "s 30" = "S30"
+    if wn[0] == on[0] or wn[0] in on or on[0] in wn:
+        return 0.9
+    return 0.0
+
+
+_NEGATORS = frozenset({"non", "not", "no", "without"})
+_STEM_SUFFIXES = ("ing", "ed", "es", "s", "d")
+
+
+def _stem(word: str) -> str:
+    """Crude inflection stem ("steamed" / "steaming" / "steams" -> "steam"; "boiled" -> "boil"). Only used to decide
+    whether two values are the same words in other forms, never alone."""
+    w = singularise(word.lower())
+    if len(w) <= 3 or any(c.isdigit() for c in w):
+        return w
+    for suffix in _STEM_SUFFIXES:
+        if w.endswith(suffix) and len(w) - len(suffix) >= 3:
+            w = w[: -len(suffix)]
+            break
+    if len(w) > 3 and w[-1] == w[-2] and w[-1] not in "aeiouls":
+        w = w[:-1]
+    return w
+
+
+def _stem_similarity(w: str, o: str) -> float:
+    """Same words once inflections are folded: equal sets 0.97, one contained in the other 0.88 (containment:
+    "pusa 1509" ~ "1509", "golden sella" ~ "sella"); 0.0 otherwise."""
+    ws = {_stem(t) for t in tokenize(w)}
+    os_ = {_stem(t) for t in tokenize(o)}
+    if not ws or not os_:
+        return 0.0
+    if ws == os_:
+        return 0.97
+    if ws <= os_ or os_ <= ws:
+        return 0.88
+    return 0.0
+
+
+def _value_similarity(wanted: Any, offered: Any, key: str = "") -> float:
     """How well one attribute value satisfies another, from 0 to 1.
 
-    Graded rather than binary: asking for 20,000 mAh and being offered 27,000
-    is a near miss, not a total one, while 5,000 clearly is not.
-
-    Normalised measurements are compared numerically. They used to fall through
-    to token overlap on the stringified dict, where {"value": 65, "unit": "W"}
-    and {"value": 18, "unit": "W"} "matched" on the shared words value/unit/W --
-    so every numeric spec scored full marks regardless of the number.
+    * Numbers and measurements: converted to a common unit and compared within 5 %, then a steep decay, so a real
+      conflict (gsm 120 where 180 was asked) scores far below "not stated".
+    * Bare numbers are magnitudes only for numeric keys (thickness, count, year ...). Otherwise they are identifiers
+      (grade 304 vs 316, variety 1121 vs 1509): equal or in conflict, never "close".
+    * Words: grade codes, synonym groups, token overlap.
     """
     if isinstance(wanted, bool) or isinstance(offered, bool):
         return 1.0 if bool(wanted) == bool(offered) else 0.0
 
-    # Physical dimensional measurement comparison (e.g. 2cm vs 20mm -> 1.0, 1 tonne vs 1000kg -> 1.0)
-    meas_sim = unit_converter.compare_measurements(wanted, None, offered, None)
-    if meas_sim is not None:
-        return meas_sim
+    # Same grade written differently: "SS 304" / "ss-304" / "304" / "AISI 304"; "MS" / "mild steel".
+    if spec_codes.codes_equal(wanted, offered):
+        return 1.0
 
     if (
         isinstance(wanted, dict) and isinstance(offered, dict)
         and "value" in wanted and "value" in offered
     ):
         if str(wanted.get("unit", "")).lower() != str(offered.get("unit", "")).lower():
-            return 0.0
-        return _value_similarity(wanted["value"], offered["value"])
+            wu, ou = unit_converter.parse_measurement(wanted), unit_converter.parse_measurement(offered)
+            if wu is None or ou is None:
+                return 0.0
+        return _value_similarity(_dict_as_text(wanted), _dict_as_text(offered), key)
 
-    def _parse_num(val: Any) -> Optional[float]:
-        if isinstance(val, bool):
-            return None
-        if isinstance(val, (int, float)):
-            return float(val)
-        if isinstance(val, str):
-            clean = val.strip().rstrip("%").strip()
-            try:
-                return float(clean)
-            except (ValueError, TypeError):
-                return None
-        return None
+    from services import spec_catalog
 
-    w_num = _parse_num(wanted)
-    o_num = _parse_num(offered)
-    if w_num is not None and o_num is not None:
-        left, right = w_num, o_num
-        if left == right:
-            return 1.0
-        largest = max(abs(left), abs(right))
-        if largest == 0:
-            return 1.0
-        return max(0.0, 1.0 - abs(left - right) / largest)
+    numeric = spec_catalog.numeric_similarity(key, _dict_as_text(wanted), _dict_as_text(offered))
+    if numeric is not None:
+        return numeric[0]
 
     # Dimensions and other nested shapes: equal or not.
     if isinstance(wanted, dict) or isinstance(offered, dict):
         return 1.0 if wanted == offered else 0.0
 
     # --- Text / categorical values: synonym-aware comparison ---
-    # Convert lists/tuples to space-separated strings for comparison.
     w_str = " ".join(map(str, wanted)) if isinstance(wanted, (list, tuple)) else str(wanted)
     o_str = " ".join(map(str, offered)) if isinstance(offered, (list, tuple)) else str(offered)
 
-    return _semantic_text_similarity(w_str, o_str)
+    wt, ot = {t for t in tokenize(w_str)}, {t for t in tokenize(o_str)}
+    if bool(wt & _NEGATORS) != bool(ot & _NEGATORS):
+        return 0.0  # "non organic" / "organic", "seedless" is another matter: only explicit negators count
+    base = max(_semantic_text_similarity(w_str, o_str), _stem_similarity(w_str, o_str))
+    ident = _identifier_verdict(w_str, o_str)
+    if ident is None:
+        return base
+    return max(base, ident) if ident > 0 else 0.0
+
+
+def _dict_as_text(value: Any) -> Any:
+    if isinstance(value, dict) and "value" in value and value.get("unit"):
+        return f"{value['value']} {value['unit']}"
+    if isinstance(value, dict) and "value" in value:
+        return str(value["value"])
+    return value
 
 
 # Synonymous attribute keys across different industry conventions (fully bidirectional).
@@ -791,8 +837,91 @@ def _typed_similarity(key: str, wanted: Any, offered: Any) -> Optional[tuple[flo
         return None
 
 
+# Dimensions several different specs share (length: thickness, width, height ...; mass: net weight, pack weight ...):
+# a value in the same dimension under another key is only taken for the spec when it MATCHES.
+_AMBIGUOUS_DIMENSIONS = frozenset({"length", "mass", "count", "volume", "time", "area"})
+
+
+def _entry_dimension(key: str, value: Any) -> Optional[str]:
+    """Physical dimension of one spec entry: from its own unit ("180 g/m2"), else from the unit its key names ("gsm")."""
+    from services import spec_catalog
+
+    text = _dict_as_text(value)
+    if isinstance(text, bool) or text in (None, ""):
+        return None
+    parsed = spec_catalog.parse_number(text)
+    if parsed is None:
+        return None
+    unit = parsed["unit"] or spec_catalog.key_unit_hint(key)
+    if not unit:
+        return None
+    return "%" if unit == "%" else unit_converter.dimension_of_unit(unit)
+
+
+def _dimension_match(
+    wanted_key: str, wanted_val: Any, offered: dict[str, Any], claimed: frozenset[str]
+) -> Optional[tuple[float, str, Any, str]]:
+    """Align by unit dimension when the keys differ: wanted {"gsm": "180"} against offered {"weight": "180 g/m2"}.
+
+    Returns (score, offered key, offered value, reason) of the best offered entry of the same dimension that no other
+    requested spec claims, or None.
+    """
+    from services import spec_catalog
+
+    dimension = _entry_dimension(wanted_key, wanted_val)
+    if dimension is None or dimension == "%":
+        return None
+    best: Optional[tuple[float, str, Any, str]] = None
+    for ok, ov in offered.items():
+        if ok in claimed or ov in (None, "") or _entry_dimension(ok, ov) != dimension:
+            continue
+        hint_key = wanted_key if spec_catalog.key_unit_hint(wanted_key) else ok
+        res = spec_catalog.numeric_similarity(hint_key, _dict_as_text(wanted_val), _dict_as_text(ov))
+        if res is None:
+            continue
+        if dimension in _AMBIGUOUS_DIMENSIONS and res[0] < 0.70:
+            continue
+        if best is None or res[0] > best[0]:
+            reason = f"Base SI equivalent ({wanted_val} = {ov})" if res[0] >= 0.99 else f"Same quantity as {ok}"
+            best = (res[0], ok, ov, reason)
+    return best
+
+
+def _canon_of(source: Any, key: str) -> Optional[str]:
+    values = source.get("values") if isinstance(source, dict) else None
+    if isinstance(values, dict) and values.get(key):
+        return str(values[key])
+    return None
+
+
+def _compare_pair(
+    wanted_key: str, wanted_val: Any, offered_key: str, offered_val: Any, wcanon: Any, ocanon: Any
+) -> tuple[float, str]:
+    """Score one wanted value against one offered value: typed by the spec, else generic, and (when both listings carry
+    canonical English terms) the canonical terms as well; the better reading wins."""
+    typed = _typed_similarity(wanted_key, wanted_val, offered_val)
+    if typed is not None:
+        score, reason = typed
+    else:
+        score = _value_similarity(wanted_val, offered_val, wanted_key)
+        meas = unit_converter.compare_measurements(wanted_val, None, offered_val, None)
+        if meas is not None and str(wanted_val).strip().lower() != str(offered_val).strip().lower():
+            reason = f"Base SI equivalent ({wanted_val} = {offered_val})" if score >= 0.99 else "Close dimension"
+        else:
+            reason = "Exact match" if score >= 0.99 else ("Semantic match" if score >= 0.70 else "Different value")
+    cw, co = _canon_of(wcanon, wanted_key), _canon_of(ocanon, offered_key)
+    if cw and co and score < 0.99:
+        if value_canon.same_term(cw, co):
+            return 1.0, f"Same term ({offered_val} = {wanted_val})"
+        alt = _value_similarity(cw, co, wanted_key)
+        if alt > score:
+            return alt, "Semantic match" if alt >= 0.70 else "Different value"
+    return score, reason
+
+
 def _find_best_attribute_match_detailed(
-    wanted_key: str, wanted_val: Any, offered: dict[str, Any]
+    wanted_key: str, wanted_val: Any, offered: dict[str, Any],
+    wcanon: Any = None, ocanon: Any = None, claimed: frozenset[str] = frozenset(),
 ) -> tuple[float, bool, Optional[str], Any, str]:
     """Finds best matching attribute in offered dict with human explanation.
 
@@ -800,39 +929,20 @@ def _find_best_attribute_match_detailed(
     1. Direct key match (e.g., {"color": "black"} vs {"color": "black"})
     2. Key-to-Value Inversion (e.g., {"type": "organic"} vs {"organic": True})
     3. Key Synonyms (e.g., {"material": "cotton"} vs {"fabric": "cotton"})
-    4. Cross-Measurement Match (e.g. {"dia": "20mm"} vs {"thickness": "2cm"})
+    4. Same unit dimension under another key (e.g. {"gsm": "180"} vs {"weight": "180 g/m2"})
 
     Returns (score: float, found: bool, matched_key: Optional[str], matched_val: Any, reason: str).
     """
     wk_clean = wanted_key.strip().lower()
 
-    # 1. Direct key match
-    if wanted_key in offered and offered[wanted_key] not in (None, ""):
-        ov = offered[wanted_key]
-        typed = _typed_similarity(wanted_key, wanted_val, ov)
-        if typed is not None:
-            return typed[0], True, wanted_key, ov, typed[1]
-        score = _value_similarity(wanted_val, ov)
-        meas = unit_converter.compare_measurements(wanted_val, None, ov, None)
-        if meas is not None and str(wanted_val).strip().lower() != str(ov).strip().lower():
-            reason = f"Base SI equivalent ({wanted_val} = {ov})" if score >= 0.99 else "Close dimension"
-        else:
-            reason = "Exact match" if score >= 0.99 else ("Semantic match" if score >= 0.70 else "Different value")
-        return score, True, wanted_key, ov, reason
-
-    for k in offered:
-        if k.strip().lower() == wk_clean and offered[k] not in (None, ""):
-            ov = offered[k]
-            typed = _typed_similarity(wanted_key, wanted_val, ov)
-            if typed is not None:
-                return typed[0], True, k, ov, typed[1]
-            score = _value_similarity(wanted_val, ov)
-            meas = unit_converter.compare_measurements(wanted_val, None, ov, None)
-            if meas is not None and str(wanted_val).strip().lower() != str(ov).strip().lower():
-                reason = f"Base SI equivalent ({wanted_val} = {ov})" if score >= 0.99 else "Close dimension"
-            else:
-                reason = "Exact match" if score >= 0.99 else ("Semantic match" if score >= 0.70 else "Different value")
-            return score, True, k, ov, reason
+    # 1. Direct key match (exact spelling first, then case-insensitive)
+    direct = wanted_key if wanted_key in offered and offered[wanted_key] not in (None, "") else next(
+        (k for k in offered if k.strip().lower() == wk_clean and offered[k] not in (None, "")), None
+    )
+    if direct is not None:
+        ov = offered[direct]
+        score, reason = _compare_pair(wanted_key, wanted_val, direct, ov, wcanon, ocanon)
+        return score, True, direct, ov, reason
 
     # 2. Key-to-Value Inversion:
     # Case A: Requester wanted string value (e.g. type: "organic") and counterparty has boolean key (e.g. organic: True)
@@ -861,23 +971,17 @@ def _find_best_attribute_match_detailed(
     for ok, ov in offered.items():
         ok_clean = ok.strip().lower()
         if ok_clean in synonyms and ov not in (None, ""):
-            sim = _value_similarity(wanted_val, ov)
+            sim, why = _compare_pair(wanted_key, wanted_val, ok, ov, wcanon, ocanon)
             if sim >= 0.70:
-                meas = unit_converter.compare_measurements(wanted_val, None, ov, None)
-                if meas is not None and str(wanted_val).strip().lower() != str(ov).strip().lower():
-                    reason = f"Base SI equivalent ({wanted_val} = {ov})"
-                else:
-                    reason = f"Synonym spec ({ok} ≈ {wanted_key})"
-                return sim, True, ok, ov, reason
+                if why.startswith("Base SI"):
+                    return sim, True, ok, ov, why
+                return sim, True, ok, ov, f"Synonym spec ({ok} ≈ {wanted_key})"
 
-    # 4. Cross-Measurement Match (e.g. dia: 20mm vs thickness: 2cm)
-    if unit_converter.parse_measurement(wanted_val) is not None:
-        for ok, ov in offered.items():
-            if ov not in (None, ""):
-                meas_sim = unit_converter.compare_measurements(wanted_val, None, ov, None)
-                if meas_sim is not None and meas_sim >= 0.70:
-                    reason = f"Base SI equivalent ({wanted_val} = {ov})" if meas_sim >= 0.99 else "Close dimension"
-                    return meas_sim, True, ok, ov, reason
+    # 4. Same unit dimension under another key. A conflicting value is reported as a conflict (it must not score
+    # above "not stated"), except for dimensions several specs share (see _AMBIGUOUS_DIMENSIONS).
+    aligned = _dimension_match(wanted_key, wanted_val, offered, claimed)
+    if aligned is not None:
+        return aligned[0], True, aligned[1], aligned[2], aligned[3]
 
     return 0.5, False, None, None, "Unstated by counterparty"
 
@@ -894,11 +998,19 @@ _MUST_MATCH_MISSING = 0.15
 
 
 def attribute_score_with_breakdown(
-    wanted: dict[str, Any], offered: dict[str, Any]
+    wanted: dict[str, Any],
+    offered: dict[str, Any],
+    negated_attributes: Optional[set[str]] = None,
 ) -> tuple[Optional[float], list[dict[str, Any]]]:
     """How well the candidate satisfies the attributes the requester named,
-    along with an itemized breakdown of each attribute comparison.
+    along with an itemized breakdown of each attribute comparison and negation checks.
     """
+    neg_factor, violations = (
+        negation_penalty(negated_attributes, offered)
+        if negated_attributes
+        else (1.0, [])
+    )
+
     must_match_keys: set[str] = set()
     for key, value in wanted.items():
         if key.endswith(_MUST_MATCH_SUFFIX) and value:
@@ -908,30 +1020,52 @@ def attribute_score_with_breakdown(
         key: value
         for key, value in wanted.items()
         if key not in _PRODUCT_NAME_KEYS
+        and not key.startswith(value_canon.CANON_KEY)
         and key not in _DERIVED_QUANTITY_KEYS
         and not key.endswith(_MUST_MATCH_SUFFIX)
         and value not in (None, "")
     }
-    if not requested:
-        return None, []
 
     offered_clean = {
         key: value
         for key, value in offered.items()
         if not key.endswith(_MUST_MATCH_SUFFIX)
+        and not key.startswith(value_canon.CANON_KEY)
         and key not in _DERIVED_QUANTITY_KEYS
     }
 
+    wcanon = wanted.get(value_canon.CANON_KEY) if isinstance(wanted, dict) else None
+    ocanon = offered.get(value_canon.CANON_KEY) if isinstance(offered, dict) else None
+    claimed = frozenset(requested)
+    breakdown: list[dict[str, Any]] = []
+
+    # Negation violations added directly to breakdown
+    for viol in violations:
+        breakdown.append({
+            "key": "exclusion",
+            "requested_value": f"NOT {', '.join(sorted(negated_attributes or set()))}",
+            "offered_key": "material/spec",
+            "offered_value": viol,
+            "score": 0.0,
+            "status": "mismatch",
+            "reason": f"Violates exclusion constraint: {viol}",
+            "must_match": True,
+        })
+
+    if not requested:
+        if violations:
+            return 0.0, breakdown
+        return None, breakdown
+
     total = 0.0
     weight_sum = 0.0
-    breakdown: list[dict[str, Any]] = []
 
     for key, value in requested.items():
         is_must = key in must_match_keys
         weight = _MUST_MATCH_WEIGHT if is_must else 1.0
 
         score, found, matched_key, matched_val, reason = _find_best_attribute_match_detailed(
-            key, value, offered_clean
+            key, value, offered_clean, wcanon, ocanon, claimed
         )
         if not found:
             effective_score = _MUST_MATCH_MISSING if is_must else 0.5
@@ -959,19 +1093,23 @@ def attribute_score_with_breakdown(
             "must_match": is_must,
         })
 
-    overall = total / weight_sum if weight_sum else None
+    overall = (total / weight_sum) * neg_factor if weight_sum else None
+    if violations and overall is not None:
+        overall = min(overall, 0.05)
     return overall, breakdown
 
 
 def attribute_score(
-    wanted: dict[str, Any], offered: dict[str, Any]
+    wanted: dict[str, Any],
+    offered: dict[str, Any],
+    negated_attributes: Optional[set[str]] = None,
 ) -> Optional[float]:
     """How well the candidate satisfies the attributes the requester named.
 
-    Supports Key-to-Value Inversion, Key Synonym Graphs, and Multi-Dimensional
-    Unit Normalization (e.g. 2cm vs 20mm -> 1.0).
+    Supports Key-to-Value Inversion, Key Synonym Graphs, Multi-Dimensional
+    Unit Normalization (e.g. 2cm vs 20mm -> 1.0), and Negation Penalties.
     """
-    score, _ = attribute_score_with_breakdown(wanted, offered)
+    score, _ = attribute_score_with_breakdown(wanted, offered, negated_attributes=negated_attributes)
     return score
 
 
@@ -1016,6 +1154,33 @@ def _per_unit_prices(
     return None
 
 
+OVER_BUDGET_SLOPE = 2.5
+
+
+def saturate_relevance(relevance: float) -> float:
+    """Product-fit saturation: once two listings are clearly the same product (relevance >= 0.90) the exact embedding
+    similarity is noise ("Wheat lot A" vs "Wheat lot B" differ by 0.04 for no reason a buyer would care about) and must
+    not outvote price, specs, quantity and location. Linear below 0.80, full marks from 0.90."""
+    if relevance >= 0.90:
+        return 1.0
+    if relevance > 0.80:
+        return 0.80 + (relevance - 0.80) * 2.0
+    return relevance
+
+
+def breadth_factor(distinct_products: int) -> float:
+    """A listing that names many unrelated products at once ("onion potato tomato garlic rice wheat ... all available")
+    is a keyword stuffer, not a specific offer of the requested product. 1 product: 1.0; 2: 0.85; 3-5: 0.55; 6+: 0.4."""
+    n = int(distinct_products or 1)
+    if n <= 1:
+        return 1.0
+    if n == 2:
+        return 0.85
+    if n <= 5:
+        return 0.55
+    return 0.40
+
+
 def price_score(
     buyer_target: Optional[Decimal],
     seller_ask: Optional[Decimal],
@@ -1025,6 +1190,7 @@ def price_score(
     seller_unit: Optional[str] = None,
     buyer_attributes: Optional[dict[str, Any]] = None,
     seller_attributes: Optional[dict[str, Any]] = None,
+    buyer_quantity: Optional[Decimal] = None,
 ) -> Optional[float]:
     """1.0 when the seller is at or under the buyer's target, decaying above it.
 
@@ -1068,12 +1234,24 @@ def price_score(
     if b_target <= 0:
         return None
 
+    # Guard against buyer entering total order budget instead of per-unit price:
+    if buyer_quantity is not None and s_ask > 0:
+        try:
+            b_qty = Decimal(str(buyer_quantity))
+            if b_qty > 1 and (b_target / s_ask) > 15:
+                # Check if total budget divided by quantity is a realistic per-unit target
+                per_unit_candidate = b_target / b_qty
+                if per_unit_candidate > 0 and (0.05 <= (per_unit_candidate / s_ask) <= 20):
+                    b_target = per_unit_candidate
+        except (InvalidOperation, ZeroDivisionError, TypeError, ValueError):
+            pass
+
     if s_ask <= b_target:
         return 1.0
 
-    # Linear decay: at twice the target the score reaches zero.
+    # Steep decay: a seller 12 % over budget must clearly lose to one at or under it; 40 % over scores zero.
     overshoot = float((s_ask - b_target) / b_target)
-    return max(0.0, 1.0 - overshoot)
+    return max(0.0, 1.0 - OVER_BUDGET_SLOPE * overshoot)
 
 
 def quantity_score(
@@ -1083,8 +1261,17 @@ def quantity_score(
     available_unit: Optional[str],
     needed_attributes: Optional[dict[str, Any]] = None,
     available_attributes: Optional[dict[str, Any]] = None,
+    *,
+    min_needed: Optional[Decimal] = None,
+    max_needed: Optional[Decimal] = None,
 ) -> Optional[float]:
     """Full marks when the seller can cover the buyer's requirement.
+
+    Enhancement #3: Range + MOQ awareness.
+    - If the buyer specified a range (min_needed, max_needed), the seller's
+      capacity anywhere inside or above the range scores 1.0.
+    - If the seller has an MOQ (in product_details) and the buyer's quantity
+      is strictly below it, a steep penalty is applied.
 
     Converts all units to canonical base SI / trade units (kg, liters, pcs, meters)
     before evaluating volume coverage.
@@ -1096,6 +1283,35 @@ def quantity_score(
     - Length conversions (km, meters, cm, mm)
     - Packaging conversions (boras, kattas, bags, cartons with pack weights).
     """
+    # --- MOQ Check ---
+    shortfall = moq_shortfall(needed, needed_unit, needed_attributes, available_attributes, available_unit)
+    if shortfall is not None:
+        # The seller cannot serve an order below its minimum: cap low, falling
+        # toward 0 the further the order is below the MOQ.
+        return max(0.0, min(0.2, shortfall * 0.2))
+
+    # --- Range scoring ---
+    if min_needed is not None and max_needed is not None and available is not None:
+        try:
+            avail_d = Decimal(str(available))
+            min_d = Decimal(str(min_needed))
+            max_d = Decimal(str(max_needed))
+            if avail_d > 0 and min_d > 0:
+                # Normalise
+                a_base = unit_converter.normalize_quantity_to_base(avail_d, available_unit, available_attributes)
+                n_min_base = unit_converter.normalize_quantity_to_base(min_d, needed_unit, needed_attributes)
+                n_max_base = unit_converter.normalize_quantity_to_base(max_d, needed_unit, needed_attributes)
+                if a_base and n_min_base and n_max_base:
+                    a_val, a_u, a_dim = a_base
+                    mn_val, mn_u, mn_dim = n_min_base
+                    mx_val, mx_u, mx_dim = n_max_base
+                    if a_dim == mn_dim and a_u == mn_u:
+                        if a_val >= mn_val:  # at or above minimum
+                            return 1.0
+                        return max(0.0, min(1.0, float(a_val / mn_val)))
+        except (InvalidOperation, TypeError, ValueError):
+            pass
+
     if needed is None or available is None:
         return None
     try:
@@ -1140,6 +1356,121 @@ def quantity_score(
     return None
 
 
+def _parse_moq(attributes: Optional[dict[str, Any]]) -> Optional[tuple[Decimal, Optional[str]]]:
+    """Seller MOQ as (number, unit). Accepts 500, "500", "10 tonne", "1,000 kg"."""
+    if not attributes or not isinstance(attributes, dict):
+        return None
+    for key in ("moq", "min_order", "minimum_order", "min_order_quantity", "minimum_order_quantity"):
+        val = attributes.get(key)
+        if val is None or isinstance(val, bool):
+            continue
+        m = re.match(r"^\s*([0-9][0-9,]*(?:\.[0-9]+)?)\s*([^\d\s].*?)?\s*$", str(val))
+        if not m:
+            continue
+        try:
+            d = Decimal(m.group(1).replace(",", ""))
+        except (InvalidOperation, ValueError):
+            continue
+        if d > 0:
+            return d, (m.group(2) or "").strip() or None
+    return None
+
+
+def _extract_moq(attributes: Optional[dict[str, Any]]) -> Optional[Decimal]:
+    """Extract Minimum Order Quantity (number only) from seller's product_details."""
+    parsed = _parse_moq(attributes)
+    return parsed[0] if parsed else None
+
+
+def moq_shortfall(
+    buyer_qty: Any,
+    buyer_unit: Optional[str],
+    buyer_attributes: Optional[dict[str, Any]],
+    seller_attributes: Optional[dict[str, Any]],
+    seller_unit: Optional[str] = None,
+) -> Optional[float]:
+    """buyer quantity / seller MOQ when the order is below the MOQ, else None.
+
+    The MOQ's own unit ("10 tonne") is honoured and converted to the same base
+    as the buyer's quantity; a bare number is read in the buyer's unit (else the
+    seller's). Previously the string failed to parse, so a 10-tonne MOQ was
+    ignored for a 100 kg order and the seller scored full marks.
+    """
+    parsed = _parse_moq(seller_attributes)
+    if parsed is None or buyer_qty is None:
+        return None
+    try:
+        moq, moq_unit = parsed
+        qty = Decimal(str(buyer_qty))
+        if qty <= 0:
+            return None
+        unit = normalise_unit(moq_unit) if moq_unit else (normalise_unit(buyer_unit) or normalise_unit(seller_unit))
+        b = unit_converter.normalize_quantity_to_base(qty, buyer_unit, buyer_attributes)
+        m = unit_converter.normalize_quantity_to_base(moq, unit, seller_attributes)
+        if b is not None and m is not None:
+            if b[2] == m[2] and b[1] == m[1] and b[0] < m[0]:
+                return float(b[0] / m[0])
+            return None
+        if qty < moq and not moq_unit:
+            return float(qty / moq)
+    except (InvalidOperation, TypeError, ValueError, ZeroDivisionError):
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Enhancement #4: Negation Penalty
+#
+# When a buyer explicitly negates an attribute ("not plastic", "no Chinese
+# origin"), a candidate who matches the negated value is penalised to 0.0 on
+# that attribute, and the overall feasibility is gated down.
+# ---------------------------------------------------------------------------
+
+def negation_penalty(
+    negated_attributes: Optional[set[str]],
+    candidate_details: Optional[dict[str, Any]],
+) -> tuple[float, list[str]]:
+    """Check candidate's specs against buyer's negated attributes.
+
+    Returns (penalty_factor, list_of_violated_negations).
+    penalty_factor is 1.0 (no violation) or a fraction (violations found).
+    """
+    if not negated_attributes or not candidate_details:
+        return 1.0, []
+
+    violations: list[str] = []
+    for negated in negated_attributes:
+        neg_lower = negated.lower().strip()
+        if not neg_lower:
+            continue
+        # Check if candidate explicitly offers the negated attribute
+        for key, value in candidate_details.items():
+            if key.startswith(value_canon.CANON_KEY):
+                continue
+            val_str = str(value).lower().strip() if value is not None else ""
+            key_str = key.lower().strip()
+            # Direct value match: buyer says "not plastic", seller has material: "plastic"
+            if neg_lower in val_str or neg_lower == val_str:
+                violations.append(f"{key}={value} matches negated '{negated}'")
+                break
+            # Key match: buyer says "not organic", seller has organic: true
+            if neg_lower == key_str and value in (True, "true", "yes", "1"):
+                violations.append(f"{key}=True matches negated '{negated}'")
+                break
+            # Synonym check: "not plastic" should catch "polypropylene" if in same synonym group
+            neg_canon, neg_sim = _resolve_synonym(neg_lower)
+            val_canon, val_sim = _resolve_synonym(val_str)
+            if neg_canon and val_canon and neg_canon == val_canon and neg_sim >= 0.80 and val_sim >= 0.80:
+                violations.append(f"{key}={value} synonym-matches negated '{negated}' (via {neg_canon})")
+                break
+
+    if not violations:
+        return 1.0, []
+    # Each violation applies a multiplicative penalty
+    penalty = max(0.05, 0.15 ** len(violations))
+    return penalty, violations
+
+
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     radius = 6371.0
     d_lat = math.radians(lat2 - lat1)
@@ -1164,11 +1495,43 @@ _DECAY_KM = 450.0
 
 
 def distance_km(
-    requester: dict[str, Optional[object]], candidate: dict[str, Optional[object]]
+    requester: dict[str, Optional[object]],
+    candidate: dict[str, Optional[object]],
+    *,
+    fallback: bool = False,
 ) -> Optional[float]:
     """Great-circle distance between two locations, when both are geocoded."""
     r_lat, r_lng = requester.get("latitude"), requester.get("longitude")
     c_lat, c_lng = candidate.get("latitude"), candidate.get("longitude")
+
+    # Dynamic coordinate fallback when requested for trade cities
+    if fallback:
+        if r_lat is None or r_lng is None:
+            try:
+                from services import locations
+                fb_lat, fb_lng = locations.resolve_coordinates(
+                    city=str(requester.get("city") or "") or None,
+                    state=str(requester.get("state") or "") or None,
+                    country=str(requester.get("country") or "") or None,
+                )
+                if fb_lat is not None and fb_lng is not None:
+                    r_lat, r_lng = fb_lat, fb_lng
+            except Exception:
+                pass
+
+        if c_lat is None or c_lng is None:
+            try:
+                from services import locations
+                fb_lat, fb_lng = locations.resolve_coordinates(
+                    city=str(candidate.get("city") or "") or None,
+                    state=str(candidate.get("state") or "") or None,
+                    country=str(candidate.get("country") or "") or None,
+                )
+                if fb_lat is not None and fb_lng is not None:
+                    c_lat, c_lng = fb_lat, fb_lng
+            except Exception:
+                pass
+
     if None in (r_lat, r_lng, c_lat, c_lng):
         return None
     try:
@@ -1390,4 +1753,79 @@ def estimate_logistics(
         "label": f"Domestic Transit ({round(distance_km)} km · 2–5 days)",
         "customs_required": False,
     }
+
+
+def explain_match(
+    scores: dict[str, Optional[float]],
+    attribute_breakdown: Optional[list[dict[str, Any]]] = None,
+    buyer_qty: Optional[Decimal] = None,
+    buyer_unit: Optional[str] = None,
+    seller_qty: Optional[Decimal] = None,
+    seller_unit: Optional[str] = None,
+    seller_moq: Optional[Decimal] = None,
+    moq_text: Optional[str] = None,
+    distance_km: Optional[float] = None,
+) -> tuple[str, dict[str, str]]:
+    """Generate concise human-readable explanations overall and per dimension."""
+    dim_explanations: dict[str, str] = {}
+    summary_parts: list[str] = []
+
+    # 1. Attributes breakdown
+    attr_matched = []
+    attr_penalized = []
+    if attribute_breakdown:
+        for item in attribute_breakdown:
+            key = item.get("key")
+            status = item.get("status")
+            reason = item.get("reason", "")
+            off_v = item.get("offered_value")
+
+            if status == "matched":
+                msg = f"{key}: {off_v}" if off_v is not None else str(key)
+                if reason and "->" in reason:
+                    msg += f" ({reason})"
+                attr_matched.append(msg)
+            elif status == "mismatch" or item.get("score", 1.0) < 0.2:
+                attr_penalized.append(reason or f"mismatch on {key}")
+
+    if attr_matched:
+        dim_explanations["attributes"] = f"Matched on {', '.join(attr_matched)}"
+        summary_parts.append(f"Matched on {', '.join(attr_matched)}")
+    if attr_penalized:
+        dim_explanations["attributes_penalty"] = f"Penalized: {'; '.join(attr_penalized)}"
+        summary_parts.append(f"Penalized: {'; '.join(attr_penalized)}")
+
+    # 2. Quantity & MOQ
+    if moq_text:
+        moq_str = f"penalized on MOQ ({moq_text})"
+        dim_explanations["quantity"] = moq_str
+        summary_parts.append(moq_str)
+    elif seller_moq is not None and buyer_qty is not None and buyer_qty < seller_moq:
+        moq_str = f"penalized on MOQ (wants {buyer_qty} {buyer_unit or ''}, seller MOQ {seller_moq} {seller_unit or ''})".strip()
+        dim_explanations["quantity"] = moq_str
+        summary_parts.append(moq_str)
+    elif scores.get("quantity") is not None:
+        q_sc = scores["quantity"]
+        if q_sc >= 0.85:
+            dim_explanations["quantity"] = "Quantity fully satisfied by capacity"
+        elif q_sc < 0.5:
+            dim_explanations["quantity"] = "Quantity mismatch with supplier capacity"
+
+    # 3. Price
+    if scores.get("price") is not None:
+        p_sc = scores["price"]
+        if p_sc >= 0.85:
+            dim_explanations["price"] = "Price within target budget"
+        elif p_sc < 0.5:
+            dim_explanations["price"] = "Price exceeds target budget"
+
+    # 4. Location / Distance
+    if distance_km is not None:
+        if distance_km <= 50:
+            dim_explanations["location"] = f"Local supplier ({distance_km:.0f} km)"
+        else:
+            dim_explanations["location"] = f"Distance {distance_km:.0f} km"
+
+    explanation = "; ".join(summary_parts) if summary_parts else "Match based on product relevance and category"
+    return explanation, dim_explanations
 

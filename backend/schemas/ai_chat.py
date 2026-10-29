@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any, Literal, Optional
 import uuid
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class AgentInfo(BaseModel):
@@ -18,9 +18,21 @@ class AIChatMessage(BaseModel):
     role: Literal["user", "assistant"]
     content: str = Field(..., min_length=1, max_length=5000)
 
+    @field_validator("content")
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        # A whitespace-only message must be a 422, not an empty "New Business Chat" conversation.
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("message must not be empty")
+        return stripped
+
 
 class AIChatRequest(BaseModel):
-    messages: list[AIChatMessage] = Field(..., min_length=1, max_length=50)
+    messages: list[AIChatMessage] = Field(
+        ..., min_length=1, max_length=50,
+        description="Only the newest user message is used; the server loads the conversation history from its database.",
+    )
     current_rfq: Optional[dict[str, Any]] = Field(
         default=None,
         description="Accumulated RFQ draft state maintained across the conversation.",
@@ -31,7 +43,7 @@ class AIChatRequest(BaseModel):
     )
     matched_candidates: Optional[list[dict[str, Any]]] = Field(
         default=None,
-        description="Currently loaded matching candidates (counterparties) for the active RFQ.",
+        description="Accepted for backward compatibility only; the server ignores it (candidates are rebuilt from its own state).",
     )
     active_connection_id: Optional[uuid.UUID] = Field(
         default=None,

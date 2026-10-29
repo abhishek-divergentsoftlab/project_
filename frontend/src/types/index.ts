@@ -217,6 +217,8 @@ export interface MatchResponse {
   total: number;
   limit: number;
   offset: number;
+  /** "sql" when smart (vector) matching was unavailable and keyword matching answered. */
+  retrieval?: "vector" | "sql";
 }
 
 export type ConnectionStatus = "pending" | "accepted" | "rejected";
@@ -280,12 +282,22 @@ export interface Quotation {
   lead_time_days?: number | null;
   incoterms?: Incoterm | null;
   payment_terms?: string | null;
+  /** GST percent (slab); absent/null = as applicable. */
+  gst_rate?: number | string | null;
   valid_until?: string | null;
   notes?: string | null;
   purchase_order_reference?: string | null;
   created_at: string;
   updated_at: string;
   is_sender: boolean;
+  rfq_currency?: string | null;
+  rfq_unit?: string | null;
+  /** The amount in the RFQ's currency when it differs; null if no rate is available. */
+  converted?: { currency: string; unit_price: number | string; total_amount: number | string; rate: number | string } | null;
+  /** Set on accept: the RFQ's quantity is now awarded beyond 100%. */
+  over_award?: boolean | null;
+  awarded_quantity?: number | string | null;
+  rfq_quantity?: number | string | null;
 }
 
 export interface QuotationCreatePayload {
@@ -296,6 +308,7 @@ export interface QuotationCreatePayload {
   lead_time_days?: number;
   incoterms?: Incoterm;
   payment_terms?: string;
+  gst_rate?: number;
   valid_days?: number;
   notes?: string;
 }
@@ -559,6 +572,8 @@ export interface TranslationResponse {
   source_language: string;
   target_language: string;
   cached: boolean;
+  /** True when no translation could be produced: translated_text is the original, unchanged. */
+  fallback?: boolean;
 }
 
 export interface BatchTranslationResponse {
@@ -591,6 +606,10 @@ export interface DealDispute {
   suggested_resolution?: string | null;
   resolution_notes?: string | null;
   resolved_at?: string | null;
+  /** Two-step mutual settlement: who proposed it and the proposed split (share of the remaining balance paid to the seller). */
+  settlement_proposed_by_id?: string | null;
+  settlement_release_percent?: number | string | null;
+  settlement_proposed_at?: string | null;
   created_at: string;
 }
 
@@ -605,7 +624,20 @@ export interface EscrowAccount {
   funded_amount: number | string;
   released_amount: number | string;
   refunded_amount: number | string;
-  status: "pending_deposit" | "funded" | "partially_released" | "completed" | "disputed" | "refunded";
+  // deposit_reported = the buyer says they paid; only an operator confirmation makes it "funded".
+  status:
+    | "pending_deposit"
+    | "deposit_reported"
+    | "funded"
+    | "partially_released"
+    | "completed"
+    | "disputed"
+    | "refunded";
+  deposit_method?: string | null;
+  deposit_reference?: string | null;
+  deposit_reported_at?: string | null;
+  deposit_confirmed_at?: string | null;
+  deposit_rejection_reason?: string | null;
   milestones: EscrowMilestone[];
   disputes: DealDispute[];
   created_at: string;
@@ -614,6 +646,7 @@ export interface EscrowAccount {
 
 export interface EscrowDepositPayload {
   payment_method?: string;
+  payment_reference?: string;
   notes?: string;
 }
 
@@ -636,6 +669,8 @@ export interface DealDisputeCreatePayload {
 export interface DealDisputeResolvePayload {
   resolution: "release_funds" | "refund_buyer" | "mutual_settlement";
   resolution_notes: string;
+  /** mutual_settlement only: share (0-100) of the remaining balance paid to the seller. */
+  release_percent?: number;
 }
 
 // ==========================================

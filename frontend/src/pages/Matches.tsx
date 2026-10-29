@@ -30,6 +30,9 @@ export function applyConnection(
   );
 }
 
+/** Below this overall score a result is shown as "Weak" and left out of the headline count (see MatchCard). */
+const WEAK_BELOW = 0.4;
+
 export function Matches() {
   const { rfqId } = useParams<{ rfqId: string }>();
   const { toast, confirm } = useFeedback();
@@ -38,6 +41,7 @@ export function Matches() {
   const [results, setResults] = useState<MatchCandidate[]>([]);
   const [total, setTotal] = useState(0);
   const [targetRole, setTargetRole] = useState<string>("");
+  const [retrieval, setRetrieval] = useState<"vector" | "sql">("vector");
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [closing, setClosing] = useState(false);
@@ -57,6 +61,7 @@ export function Matches() {
       setResults(response.results);
       setTotal(response.total);
       setTargetRole(response.target_role);
+      setRetrieval(response.retrieval ?? "vector");
     } catch (err) {
       setError(errorMessage(err, "Could not load matches"));
     } finally {
@@ -75,8 +80,13 @@ export function Matches() {
     try {
       // Continue from what is already shown rather than re-requesting page one.
       const response = await matching.forRfq(rfqId, PAGE_SIZE, results.length);
-      setResults((current) => [...current, ...response.results]);
+      // One card per listing: a page can repeat a row the previous page already showed.
+      setResults((current) => {
+        const seen = new Set(current.map((c) => c.rfq_id));
+        return [...current, ...response.results.filter((c) => !seen.has(c.rfq_id))];
+      });
       setTotal(response.total);
+      if (response.retrieval) setRetrieval(response.retrieval);
     } catch (err) {
       setError(errorMessage(err, "Could not load more matches"));
     } finally {
@@ -96,6 +106,19 @@ export function Matches() {
       setError(errorMessage(err, "Could not send the connection request"));
     }
   }
+
+  // The headline counts real matches only. Results arrive best first, so once a weak one has been loaded
+  // every unloaded result is weak too; until then the strong count is a lower bound.
+  const strongCount = results.filter((c) => c.score.total >= WEAK_BELOW).length;
+  const weakLoaded = results.length - strongCount;
+  const allLoaded = results.length >= total;
+  const weakCount = weakLoaded > 0 || allLoaded ? total - strongCount : 0;
+  const strongLabel = weakLoaded > 0 || allLoaded ? `${strongCount}` : `${strongCount}+`;
+  const headline =
+    strongCount === 0 && (weakLoaded > 0 || allLoaded)
+      ? `No strong matches, ${weakCount} weak ${weakCount === 1 ? "match" : "matches"}`
+      : `${strongLabel} ${strongCount === 1 ? "match" : "matches"}, best first` +
+        (weakCount > 0 ? ` and ${weakCount} weak ${weakCount === 1 ? "match" : "matches"}` : "");
 
   async function handleCloseRfq() {
     if (!rfq) return;
@@ -157,7 +180,7 @@ export function Matches() {
             )}
             {!loading && results.length > 0 && (
               <span className="result-meta">
-                {total} {total === 1 ? "match" : "matches"}, best first
+                {headline}
               </span>
             )}
           </div>
@@ -165,6 +188,12 @@ export function Matches() {
       </header>
 
       {error && <p className="error">{error}</p>}
+
+      {!loading && retrieval === "sql" && (
+        <p className="muted" role="status" style={{ fontSize: "0.85rem", margin: "0 0 0.75rem" }}>
+          Showing keyword matches while smart matching is unavailable.
+        </p>
+      )}
 
       {loading ? (
         <div className="loading-state">
@@ -179,8 +208,9 @@ export function Matches() {
             </span>
             <strong>No matches yet</strong>
             <p>
-              Matching only looks at live RFQs on the other side of the market. We'll keep
-              checking as new listings are posted.
+              Matching only looks at live RFQs on the other side of the market, and none of them fit
+              this one closely enough right now. Try broadening the product name or specifications,
+              or browse the marketplace.
             </p>
             <Link to="/marketplace" className="button secondary">
               Browse the marketplace

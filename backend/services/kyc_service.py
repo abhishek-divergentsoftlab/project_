@@ -221,7 +221,7 @@ def validate_tax_id(tax_id: str, country: Optional[str] = None) -> tuple[bool, s
 # ---------------------------------------------------------------- trust score
 
 KYC_VERIFIED_POINTS = 35
-KYC_PENDING_POINTS = 15
+KYC_PENDING_POINTS = 0  # a submitted-but-unreviewed claim earns nothing
 CERTIFICATE_POINTS = 5
 CERTIFICATE_CAP = 15
 REVIEW_CAP = 20
@@ -241,10 +241,10 @@ def calculate_trust_score(
     """
     score = 20  # baseline account creation
 
+    # Only an operator-approved (VERIFIED) claim earns the KYC bonus; PENDING
+    # and FLAGGED claims have proved nothing yet.
     if profile.kyc_status == KYCStatus.VERIFIED:
         score += KYC_VERIFIED_POINTS
-    elif profile.kyc_status == KYCStatus.PENDING:
-        score += KYC_PENDING_POINTS
 
     if profile.phone:
         score += 10
@@ -266,18 +266,20 @@ def calculate_trust_score(
 async def recompute_trust_score(db: AsyncSession, profile: UserProfile) -> int:
     """Recompute and assign ``profile.trust_score`` from the database. No commit."""
     from models.certificate import Certificate
-    from models.review import Review
-
     now = datetime.now(UTC)
     valid_certs = await db.scalar(
         select(func.count(Certificate.id)).where(
             Certificate.user_id == profile.user_id,
-            Certificate.verification_status != CertificationStatus.REJECTED,
+            # Self-declared (PENDING) certificates earn nothing until approved.
+            Certificate.verification_status == CertificationStatus.VERIFIED,
             or_(Certificate.expiry_date.is_(None), Certificate.expiry_date > now),
         )
     )
-    # Same per-review weights review_service applies (+5 for 4-5 stars, +1 for 3, -5 below).
-    ratings = (await db.scalars(select(Review.rating).where(Review.reviewee_id == profile.user_id))).all()
+    # Same per-review weights review_service applies (+5 for 4-5 stars, +1 for 3, -5 below),
+    # counting one review per reviewer (the most recent) so a partner cannot farm points.
+    from services.review_service import effective_reviews
+
+    ratings = [r.rating for r in await effective_reviews(db, profile.user_id)]
     review_points = sum(5 if r >= 4 else (1 if r == 3 else -5) for r in ratings)
 
     profile.trust_score = calculate_trust_score(
@@ -305,6 +307,22 @@ async def gst_claimed_by_other(db: AsyncSession, gst_number: str, user_id: uuid.
                 UserProfile.gst_number == gst_number,
                 UserProfile.user_id != user_id,
                 UserProfile.kyc_status.in_(CLAIMING_STATUSES),
+            )
+            .limit(1)
+        )
+    ).first()
+    return row is not None
+
+
+async def gst_verified_by_other(db: AsyncSession, gst_number: str, user_id: uuid.UUID) -> bool:
+    """True when a different account is already VERIFIED for this GST/tax id."""
+    row = (
+        await db.execute(
+            select(UserProfile.user_id)
+            .where(
+                UserProfile.gst_number == gst_number,
+                UserProfile.user_id != user_id,
+                UserProfile.kyc_status == KYCStatus.VERIFIED,
             )
             .limit(1)
         )
@@ -351,13 +369,10 @@ async def verify_company_kyc(
                 f"({cleaned_gst[2:12]})"
             )
 
-    # 2. Anti-fraud: already claimed by another account
-    if await gst_claimed_by_other(db, cleaned_gst, user_id):
-        raise KYCError(
-            "Anti-Fraud Alert: This GST / Tax ID is already registered to another enterprise account. "
-            "Please contact fraud-support if you believe this is in error.",
-            status_code=409,
-        )
+    # 2. Anti-fraud: already claimed by another account. The newcomer is not
+    # rejected (that let a squatter lock the real owner out); the claim is
+    # recorded as FLAGGED so an operator sees it as a disputed claim.
+    disputed = await gst_claimed_by_other(db, cleaned_gst, user_id)
 
     # 3. Update profile details
     profile.gst_number = cleaned_gst
@@ -371,22 +386,26 @@ async def verify_company_kyc(
     if payload.country is not None and payload.country.strip():
         profile.country = payload.country.strip()
 
-    if strong:
-        profile.kyc_status = KYCStatus.VERIFIED
-        if is_gstin:
-            message = (
-                "GSTIN format and checksum verified"
-                + (" and PAN matches the GSTIN" if pan else "")
-                + ". This is a format-level check; the number has not been confirmed against the GST registry."
-            )
-        else:
-            message = (
-                f"{reason}. This is a format-level check; the number has not been confirmed "
-                "with the issuing tax authority."
-            )
+    # A format/checksum pass never verifies on its own: nothing here confirms the
+    # number against a registry or that the applicant owns the company. An
+    # operator approves it (see api/v1/ops_trust.py).
+    if disputed:
+        profile.kyc_status = KYCStatus.FLAGGED
+        message = (
+            "This GST / Tax ID is already claimed by another account, so your claim needs manual "
+            "review. Our team will contact you; no action is needed meanwhile."
+        )
     else:
         profile.kyc_status = KYCStatus.PENDING
-        message = "Tax ID format accepted. Verification is pending manual review."
+        if strong:
+            message = (
+                "GSTIN format and checksum are valid"
+                + (" and the PAN matches the GSTIN" if pan else "")
+                + ". Your details were submitted for review; the badge is awarded once our team "
+                "confirms them."
+            )
+        else:
+            message = "Tax ID format accepted. Verification is pending manual review."
 
     await recompute_trust_score(db, profile)
 
@@ -394,3 +413,106 @@ async def verify_company_kyc(
     await db.refresh(profile)
 
     return profile, message
+
+
+# ---------------------------------------------------------------- operator review
+
+
+async def list_kyc_claims(db: AsyncSession, status: KYCStatus) -> list[dict]:
+    """KYC claims in ``status`` with the other accounts claiming the same GSTIN."""
+    from models.user import User
+
+    rows = (
+        await db.execute(
+            select(UserProfile, User.email)
+            .join(User, User.id == UserProfile.user_id)
+            .where(UserProfile.kyc_status == status, UserProfile.gst_number.is_not(None))
+            .order_by(UserProfile.updated_at.asc())
+        )
+    ).all()
+    items = []
+    for profile, email in rows:
+        others = (
+            await db.execute(
+                select(UserProfile.user_id, User.email, UserProfile.kyc_status)
+                .join(User, User.id == UserProfile.user_id)
+                .where(
+                    UserProfile.gst_number == profile.gst_number,
+                    UserProfile.user_id != profile.user_id,
+                    UserProfile.kyc_status != KYCStatus.UNVERIFIED,
+                )
+            )
+        ).all()
+        items.append(
+            {
+                "user_id": profile.user_id,
+                "email": email,
+                "company_name": profile.company_name,
+                "gst_number": profile.gst_number,
+                "legal_business_name": profile.legal_business_name,
+                "kyc_status": profile.kyc_status,
+                "submitted_at": profile.updated_at,
+                "other_claimants": [
+                    {"user_id": uid, "email": mail, "kyc_status": st} for uid, mail, st in others
+                ],
+            }
+        )
+    return items
+
+
+async def _claim_for_review(db: AsyncSession, user_id: uuid.UUID) -> UserProfile:
+    profile = (
+        await db.execute(select(UserProfile).where(UserProfile.user_id == user_id).with_for_update())
+    ).scalar_one_or_none()
+    if profile is None or not profile.gst_number:
+        raise KYCError("No KYC claim found for this user", status_code=404)
+    if profile.kyc_status not in (KYCStatus.PENDING, KYCStatus.FLAGGED):
+        raise KYCError(
+            f"Claim is not awaiting review (status: {profile.kyc_status.value})", status_code=409
+        )
+    return profile
+
+
+async def approve_kyc(db: AsyncSession, user_id: uuid.UUID) -> UserProfile:
+    """Operator approval: VERIFIED plus the trust bonus. 409 if another account is VERIFIED."""
+    from services import notification_service
+
+    profile = await _claim_for_review(db, user_id)
+    if await gst_verified_by_other(db, profile.gst_number, user_id):
+        raise KYCError(
+            "Another account is already VERIFIED for this GSTIN; reject one of the claims first",
+            status_code=409,
+        )
+    profile.kyc_status = KYCStatus.VERIFIED
+    await recompute_trust_score(db, profile)
+    await notification_service.create_notification(
+        db,
+        user_id=user_id,
+        type="kyc_approved",
+        title="Company verification approved",
+        body="Your GSTIN was reviewed and your company is now verified.",
+        link="/profile",
+    )
+    await db.commit()
+    await db.refresh(profile)
+    return profile
+
+
+async def reject_kyc(db: AsyncSession, user_id: uuid.UUID, reason: str) -> UserProfile:
+    """Operator rejection: back to UNVERIFIED; the reason goes to the user as a notification."""
+    from services import notification_service
+
+    profile = await _claim_for_review(db, user_id)
+    profile.kyc_status = KYCStatus.UNVERIFIED
+    await recompute_trust_score(db, profile)
+    await notification_service.create_notification(
+        db,
+        user_id=user_id,
+        type="kyc_rejected",
+        title="Company verification was not approved",
+        body=reason,
+        link="/profile",
+    )
+    await db.commit()
+    await db.refresh(profile)
+    return profile

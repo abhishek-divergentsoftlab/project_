@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import difflib
 import logging
+import math
 import re
 import time
 from decimal import Decimal, InvalidOperation
@@ -36,12 +37,18 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from services import chat_specs, unit_converter
+from services import chat_specs, spec_codes, unit_converter, value_canon
 
 logger = logging.getLogger(__name__)
 
 MUST_SUFFIX = chat_specs.MUST_MATCH_SUFFIX
-PASSTHROUGH_KEYS = frozenset({"name", "hsn_code", "hsn_source"})
+PASSTHROUGH_KEYS = frozenset({
+    "name", "hsn_code", "hsn_source",
+    "_negated", "negated_attributes",
+    "min_quantity", "max_quantity", "moq",
+})
+# Dimensions many different specs share (a "width" in mm is not a "thickness" in mm).
+_SHARED_DIMENSIONS = frozenset({"length", "mass", "count", "volume", "time", "area"})
 FUZZY = 0.85
 MAX_OPTIONS = 14
 
@@ -196,6 +203,9 @@ _NUM_RE = re.compile(
     r"(?:(?:-|–|to)\s*(?P<n2>\d[\d,]*(?:\.\d+)?))?\s*(?P<u>[%°a-zA-Z/.\s]*?)\s*$",
     re.IGNORECASE,
 )
+_COMPOUND_NUM_RE = re.compile(
+    r"^\s*(?P<n>\d[\d,]*(?:\.\d+)?)\s*(?P<u>[a-zA-Z]+(?:\s*/\s*[a-zA-Z]+)?\s*\^?\s*[2-3²³])\s*$"
+)
 _UNIT_NOISE_RE = re.compile(r"\b(?:each|per\s+(?:box|bag|carton|pack|packet|piece|unit|crate|sack)|/\s*(?:box|bag|carton|pack)|net|approx(?:imately)?|about|around|only)\b", re.IGNORECASE)
 
 
@@ -220,7 +230,13 @@ def parse_number(value: Any) -> Optional[dict[str, Any]]:
     if isinstance(value, (int, float, Decimal)):
         n = _dec(str(value))
         return None if n is None else {"lo": n, "hi": None, "q": "", "unit": None}
-    text = _UNIT_NOISE_RE.sub(" ", str(value))
+    text = _UNIT_NOISE_RE.sub(" ", spec_codes.normalize_size_text(value))  # 1/2", 1 1/2 inch, 15 NB
+    compound = _COMPOUND_NUM_RE.match(text)
+    if compound:  # "180 g/m2", "5.3 oz/yd^2", "2.5 g/cm³": a unit with a digit in it
+        key = unit_converter._compound_key(compound.group("u"))
+        n = _dec(compound.group("n"))
+        if n is not None and unit_converter.dimension_of_unit(key):
+            return {"lo": n, "hi": None, "q": "", "unit": key}
     m = _NUM_RE.match(text)
     if not m:
         return None
@@ -718,6 +734,7 @@ class Family:
     def normalize_details(self, details: Optional[dict[str, Any]], *, strip_core: bool = False) -> dict[str, Any]:
         """``details`` with canonical keys and values. Nested values are flattened; ``<key>__must_match`` flags follow their
         spec and a False flag is dropped. The form's core fields are kept (or removed with ``strip_core``)."""
+        details = {k: v for k, v in (details or {}).items() if k not in (value_canon.CANON_KEY, value_canon.PENDING_KEY)}  # recomputed by the caller
         flat = chat_specs.flatten_details(details)
         out: dict[str, Any] = {}
         exact: set[str] = set()
@@ -756,6 +773,35 @@ class Family:
             if ckey in PASSTHROUGH_KEYS:
                 continue
             out[f"{ckey}{MUST_SUFFIX}"] = True
+        return out
+
+    def align_by_dimension(self, details: dict[str, Any]) -> dict[str, Any]:
+        """Move a value whose unit says what it is onto the family's canonical key for that dimension.
+
+        {"weight": "180 g/m2"} for a family whose numeric attribute "gsm" is areal density becomes {"gsm": "180 g/m2"};
+        {"width": "20 mm"} stays (several keys share the length dimension, so it is not unambiguous). Only unclaimed
+        keys move and only onto an attribute the listing has not filled.
+        """
+        by_dim: dict[str, list[dict[str, Any]]] = {}
+        for a in self.attributes:
+            dim = unit_converter.dimension_of_unit(a.get("unit")) if a.get("unit") else None
+            if a["type"] == NUMBER and dim and dim not in _SHARED_DIMENSIONS:
+                by_dim.setdefault(dim, []).append(a)
+        if not by_dim:
+            return details
+        out = dict(details)
+        for key, value in details.items():
+            if key in PASSTHROUGH_KEYS or key.startswith("_") or key.endswith(MUST_SUFFIX) or chat_specs.is_core_key(key):
+                continue
+            if self.resolve(key)[0] is not None:
+                continue  # the key is already a catalogue attribute
+            parsed = parse_number(value)
+            unit = parsed["unit"] if parsed else None
+            dim = unit_converter.dimension_of_unit(unit) if unit else None
+            targets = [a for a in by_dim.get(dim or "", []) if a["key"] not in out]
+            if len(targets) == 1:
+                out.pop(key)
+                out[targets[0]["key"]] = normalize_number(value, targets[0].get("unit")) or value
         return out
 
     # -- outputs ---------------------------------------------------------
@@ -985,16 +1031,70 @@ def _lock_for(key: str) -> asyncio.Lock:
     return hit[1]
 
 
+# Families generated from request input (the suggest endpoint, the chat) live here, not in the table: anyone can type any
+# product name, and a stored row is permanent and shared by every later request. They reach the table only through
+# ``persist_generated`` (the RFQ publish path) or ``ensure_family(persist=True)``.
+_GENERATED_MAX = 256
+_GENERATED_TTL = 6 * 3600.0
+_generated: "dict[str, tuple[float, Family]]" = {}
+
+
+def _cached_generated(key: str) -> Optional[Family]:
+    hit = _generated.get(key)
+    if hit is None:
+        return None
+    if time.monotonic() - hit[0] > _GENERATED_TTL:
+        _generated.pop(key, None)
+        return None
+    return hit[1]
+
+
+def _remember_generated(key: str, family: Family) -> None:
+    _generated.pop(key, None)
+    _generated[key] = (time.monotonic(), family)
+    while len(_generated) > _GENERATED_MAX:
+        _generated.pop(next(iter(_generated)))
+
+
 def reset_state() -> None:
     _locks.clear()
     _failed_until.clear()
+    _generated.clear()
+
+
+async def _store_family(key: str, family: Family) -> Family:
+    from db.session import SessionLocal
+    from models.spec_catalog import SpecCatalog
+
+    async with SessionLocal() as db:
+        await db.execute(
+            pg_insert(SpecCatalog).values(
+                family_key=key, display_name=family.display_name, category=family.category,
+                hsn_heading=family.hsn_heading, attributes=family.attributes, source="llm",
+            ).on_conflict_do_nothing(index_elements=["family_key"])
+        )
+        await db.commit()
+        row = (await db.execute(select(SpecCatalog).where(SpecCatalog.family_key == key))).scalar_one()
+        _generated.pop(key, None)
+        return family_from_row(row)
+
+
+async def persist_generated(product_name: Any) -> Optional[Family]:
+    """Store the family generated earlier for ``product_name`` (RFQ publish path); None when there is none cached."""
+    key = family_key_for(product_name)
+    family = _cached_generated(key) if key else None
+    return await _store_family(key, family) if family is not None else None
 
 
 async def ensure_family(
     product_name: Any, category: Optional[str] = None, hsn_code: Any = None, role: Optional[str] = None, *,
-    generate: bool = True,
+    generate: bool = True, persist: bool = False,
 ) -> Family:
-    """The family for a product: the stored row, else one generated ONCE by the attribute recommender and stored.
+    """The family for a product: the stored row, else one generated ONCE by the attribute recommender.
+
+    A generated family is kept in a bounded in-process cache and stored in the table only when ``persist`` is true
+    (or later through ``persist_generated``, from the RFQ publish path): the product name comes from arbitrary request
+    input, so it must not create permanent shared catalogue rows by itself.
 
     Concurrent calls for one family wait on a per-family lock and share a single generation (a second process is covered by
     the unique ``family_key``: the insert is ``ON CONFLICT DO NOTHING`` and the stored row wins). When the recommender
@@ -1017,6 +1117,9 @@ async def ensure_family(
             found = await find_family(db, product_name, category, hsn_code)
         if found is not None:
             return found
+        cached = _cached_generated(key)
+        if cached is not None:
+            return await _store_family(key, cached) if persist else cached
         if _failed_until.get(key, 0.0) > time.monotonic():
             return family_from_suggestions(product_name, category, hsn_code=hsn_code)
         attrs, _source = await attribute_recommender.recommend_product_attributes(key.title(), category, role)
@@ -1024,16 +1127,9 @@ async def ensure_family(
             _failed_until[key] = time.monotonic() + FAILURE_BACKOFF
             return family_from_suggestions(product_name, category, hsn_code=hsn_code)
         merged = attributes_from_suggestions(key, category, attrs)
-        async with SessionLocal() as db:
-            await db.execute(
-                pg_insert(SpecCatalog).values(
-                    family_key=key, display_name=key.title(), category=category, hsn_heading=hsn_heading_of(hsn_code),
-                    attributes=merged, source="llm",
-                ).on_conflict_do_nothing(index_elements=["family_key"])
-            )
-            await db.commit()
-            row = (await db.execute(select(SpecCatalog).where(SpecCatalog.family_key == key))).scalar_one()
-            return family_from_row(row)
+        family = Family(key, key.title(), category, hsn_heading_of(hsn_code), merged, "llm", persisted=True)
+        _remember_generated(key, family)
+        return await _store_family(key, family) if persist else family
 
 
 async def normalize_for_rfq(
@@ -1041,19 +1137,30 @@ async def normalize_for_rfq(
 ) -> dict[str, Any]:
     """``product_details`` of an RFQ through its family's catalogue (stored row, else the common attributes only).
 
-    Never generates (no model call at save time) and never raises: a failure leaves the details as they were.
+    Never generates a family and never raises: a failure leaves the details as they were. The only model call at save
+    time is the batched value canonicalizer (``value_canon``; cached, and a failure just leaves no ``_canon``). A family
+    already generated in this process for the product is stored here (see ``persist_generated``).
     """
     if not isinstance(details, dict) or not details:
         return details or {}
     try:
         name = details.get("name") or title or ""
         fam = await find_family(db, name, category, details.get("hsn_code")) if name else None
+        if fam is None and name:
+            # A family generated earlier for this product (chat / suggest endpoint) becomes permanent only now,
+            # when a real RFQ is saved with it.
+            key = family_key_for(name)
+            if key and _cached_generated(key) is not None:
+                fam = await persist_generated(name)
         if fam is None:
             fam = family_from_suggestions(name, category, hsn_code=details.get("hsn_code"))
-        return fam.normalize_details(details)
+        normalized = fam.align_by_dimension(fam.normalize_details(details))
     except Exception as exc:
         logger.warning("spec normalization skipped: %s", exc)
         return details
+    # Canonical English terms for the product and every free-text value (one cached, batched model call; a failure
+    # simply leaves the listing without them).
+    return await value_canon.add_canon(normalized, title or normalized.get("name"), category=category)
 
 
 # ---------------------------------------------------------------------------
@@ -1072,6 +1179,8 @@ def compare_values(key: str, wanted: Any, offered: Any) -> Optional[tuple[float,
     """(score 0..1, reason) comparing two values of the same catalogue key by type, or None when the pair is not typed
     (the caller then falls back to its generic comparison)."""
     attr = _COMMON_FAMILY.attr(key)
+    if spec_codes.codes_equal(wanted, offered):
+        return 1.0, "Same grade"
     if isinstance(wanted, (list, tuple)) or isinstance(offered, (list, tuple)) or (attr is not None and attr["type"] == MULTI):
         w_items = _as_items(wanted)
         o_items = _as_items(offered)
@@ -1080,7 +1189,7 @@ def compare_values(key: str, wanted: Any, offered: Any) -> Optional[tuple[float,
         if attr is not None and attr["type"] == MULTI:
             canon = lambda x: _COMMON_FAMILY.match_option(attr, x) or _title_item(x)  # noqa: E731
         else:
-            canon = lambda x: _norm(x)  # noqa: E731
+            canon = lambda x: _norm(spec_codes.canonical_value(x))  # noqa: E731
         w, o = {canon(x) for x in w_items}, {canon(x) for x in o_items}
         hit = len(w & o)
         if hit == len(w):
@@ -1088,15 +1197,9 @@ def compare_values(key: str, wanted: Any, offered: Any) -> Optional[tuple[float,
         if hit == 0:
             return 0.0, "None of the requested values offered"
         return min(0.84, 0.35 + 0.6 * hit / len(w)), f"Offers {hit} of {len(w)} requested values"
-    pw, po = parse_number(wanted), parse_number(offered)
-    if pw is not None and po is not None:
-        unit = pw["unit"] or po["unit"] or (attr or {}).get("unit")
-        if not unit:
-            return None  # two bare numbers: the caller's own comparison
-        w, o = _interval_in(pw, unit), _interval_in(po, unit)
-        if w is None or o is None:
-            return None  # different dimensions (kg vs mm)
-        return _interval_score(*w, *o)
+    numeric = numeric_similarity(key, wanted, offered, (attr or {}).get("unit"), numeric_attr=bool(attr and attr["type"] == NUMBER))
+    if numeric is not None:
+        return numeric
     if attr is not None and attr["type"] == CHOICE and isinstance(wanted, str) and isinstance(offered, str):
         cw, co = _COMMON_FAMILY.match_option(attr, wanted), _COMMON_FAMILY.match_option(attr, offered)
         if cw and co:
@@ -1104,11 +1207,128 @@ def compare_values(key: str, wanted: Any, offered: Any) -> Optional[tuple[float,
     return None
 
 
+# Words that make a bare number a magnitude (a "12" under thickness is 12 of something; a "304" under grade is a name).
+_MAGNITUDE_WORDS = frozenset({
+    "thickness", "diameter", "dia", "length", "width", "height", "depth", "size", "weight", "capacity", "power", "voltage",
+    "gsm", "count", "moisture", "purity", "quantity", "year", "age", "rating", "gauge", "volume", "density", "strength",
+    "pressure", "speed", "frequency", "current", "temperature", "percent", "pct", "content", "ply", "denier", "tex",
+})
+_FRACTION_LIKE_RE = re.compile(r"^\s*\d+\s*/\s*\d+\s*$")
+
+
+def key_unit_hint(key: Any) -> Optional[str]:
+    """The unit a key names itself ("gsm", "thickness_mm" -> "mm", "weight_kg" -> "kg"), or None."""
+    words = [w for w in re.split(r"[^a-z0-9]+", str(key).lower()) if w]
+    for w in reversed(words[-2:]):
+        if unit_converter.dimension_of_unit(w) and w not in ("t", "d", "g", "m", "l", "v", "w", "k"):
+            return w
+        if w in ("g", "m", "l", "v", "w") and len(words) > 1 and w == words[-1]:
+            return w  # "weight_g", "length_m"
+    return None
+
+
+def is_magnitude_key(key: Any) -> bool:
+    words = {w for w in re.split(r"[^a-z0-9]+", str(key).lower()) if w}
+    return bool(words & _MAGNITUDE_WORDS) or key_unit_hint(key) is not None
+
+
+def is_known_unit(unit: Any) -> bool:
+    return bool(unit) and (unit == "%" or unit_converter.dimension_of_unit(str(unit)) is not None)
+
+
+def numeric_similarity(
+    key: Any, wanted: Any, offered: Any, attr_unit: Optional[str] = None, *, numeric_attr: bool = False
+) -> Optional[tuple[float, str]]:
+    """(score, reason) when both values are numbers/measurements, else None (the caller compares them as words).
+
+    * Real units on either side: converted to a common unit and compared numerically. Different dimensions conflict.
+    * A bare number next to a unit takes that unit (or the one the key names: "gsm", "thickness_mm").
+    * Two bare numbers are compared as magnitudes only when the catalogue attribute is numeric or the key is a
+      measurement word (thickness, count, year ...). Otherwise they are IDENTIFIERS (grade 304 / 316, variety 1121 /
+      1509, model A52 / A54): equal or in conflict, never "close".
+    * Within 5 % is a match; beyond it the score falls steeply to 0 (a real conflict must rank below "not stated").
+    """
+    if isinstance(wanted, bool) or isinstance(offered, bool):
+        return None
+    for v in (wanted, offered):
+        if isinstance(v, str) and (_FRACTION_LIKE_RE.match(v) or spec_codes.code_tokens(v)):
+            return None
+    pw, po = parse_number(wanted), parse_number(offered)
+    if pw is None or po is None:
+        return None
+    uw, uo = pw["unit"], po["unit"]
+    for u in (uw, uo):
+        if u and not is_known_unit(u):
+            return None  # "30s", "40 Ne": not a physical unit, the words comparison decides
+    hint = canonical_unit(attr_unit) if attr_unit else key_unit_hint(key)
+    if not uw and not uo:
+        if not (numeric_attr or is_magnitude_key(key)):
+            same = pw["lo"] == po["lo"] and pw["hi"] == po["hi"] and pw["q"] == po["q"]
+            return (1.0, "Exact match") if same else (0.0, "Different identifier")
+        unit = hint
+        if unit is None:
+            percent = _percent_closeness(key, pw, po, None)
+            if percent is not None:
+                return percent
+            w, o = _interval(pw), _interval(po)
+            return _interval_score(*w, *o)
+    else:
+        unit = uw or uo
+        if uw and uo and uw != uo:
+            dw, do = unit_converter.dimension_of_unit(uw), unit_converter.dimension_of_unit(uo)
+            if dw != do and "%" not in (uw, uo):
+                return 0.0, "Different quantity"
+        if hint and (not uw or not uo):
+            bare_unit_dim = unit_converter.dimension_of_unit(hint)
+            given = unit_converter.dimension_of_unit(unit) if unit != "%" else "%"
+            if bare_unit_dim and given and bare_unit_dim != given:
+                return 0.0, "Different quantity"
+            if bare_unit_dim and bare_unit_dim == given:  # the bare side is in the unit its key names ("gsm")
+                if not uw:
+                    pw = {**pw, "unit": hint}
+                if not uo:
+                    po = {**po, "unit": hint}
+    percent = _percent_closeness(key, pw, po, unit)
+    if percent is not None:
+        return percent
+    w, o = _interval_in(pw, unit or ""), _interval_in(po, unit or "")
+    if w is None or o is None:
+        return 0.0, "Different quantity"
+    return _interval_score(*w, *o)
+
+
+_PERCENT_WORDS = frozenset({"purity", "moisture", "assay", "concentration", "content", "percent", "pct", "fineness", "humidity"})
+
+
+def _percent_closeness(key: Any, pw: dict[str, Any], po: dict[str, Any], unit: Optional[str]) -> Optional[tuple[float, str]]:
+    """Bounded scale (0-100 %): near 100 the meaningful quantity is the complement (99 % vs 99.99 % purity is 1 % vs
+    0.01 % impurity, 100x apart), near 0 it is the value itself. Both values >= 50 compare on the complement by ratio
+    (within 25 % of each other = 1, a factor of 4 = 0); otherwise the plain relative rule applies."""
+    words = {w for w in re.split(r"[^a-z0-9]+", str(key).lower()) if w}
+    if not (unit == "%" or (not unit and words & _PERCENT_WORDS)):
+        return None
+    if any(p["q"] or p["hi"] is not None for p in (pw, po)):
+        return None
+    a, b = pw["lo"], po["lo"]
+    if not (0 <= a <= 100 and 0 <= b <= 100) or a < 50 or b < 50:
+        return None
+    ca, cb = Decimal(100) - a, Decimal(100) - b
+    if ca == cb:
+        return 1.0, "Exact match"
+    low, high = min(ca, cb), max(ca, cb)
+    if low == 0:
+        return 0.0, "Different value"
+    ratio = float(high / low)
+    if ratio <= 1.25:
+        return 1.0, "Equal within tolerance"
+    return max(0.0, 1.0 - math.log(ratio / 1.25) / math.log(3.2)), "Different value"
+
+
 def _interval_in(parsed: dict[str, Any], unit: str) -> Optional[tuple[Optional[Decimal], Optional[Decimal]]]:
     """The number's interval expressed in ``unit`` (None when its own unit cannot be converted to it)."""
     given = parsed["unit"]
     lo, hi = parsed["lo"], parsed["hi"]
-    if given and given != unit:
+    if given and unit and given != unit:
         lo = _convert(lo, given, unit)
         hi = _convert(hi, given, unit) if hi is not None else None
         if lo is None or (parsed["hi"] is not None and hi is None):
@@ -1123,15 +1343,12 @@ def _interval_score(
     a1, a2 = (lo_w if lo_w is not None else -inf), (hi_w if hi_w is not None else inf)
     b1, b2 = (lo_o if lo_o is not None else -inf), (hi_o if hi_o is not None else inf)
     if lo_w is not None and lo_w == hi_w and lo_o is not None and lo_o == hi_o:  # two exact numbers
-        top = max(abs(a1), abs(b1)) or Decimal(1)
-        rel = abs(a1 - b1) / top
-        if rel <= Decimal("0.05"):
-            return 1.0, "Equal within 5%"
-        return max(0.0, float(1 - rel)), "Different value"
+        close = unit_converter.numeric_closeness(a1, b1)
+        return close, ("Equal within 5%" if close >= 1.0 else "Different value")
     if (b1 >= a1 and b2 <= a2) or (a1 >= b1 and a2 <= b2):
         return 1.0, "Within the requested range"
     if b2 >= a1 and b1 <= a2:
         return 0.7, "Ranges overlap"
     gap = (a1 - b2) if b2 < a1 else (b1 - a2)
     ref = max(abs(a1) if a1 > -inf else Decimal(0), abs(a2) if a2 < inf else Decimal(0), Decimal(1))
-    return max(0.0, float(1 - 2 * gap / ref)), "Outside the requested range"
+    return max(0.0, float(1 - 3 * gap / ref)), "Outside the requested range"

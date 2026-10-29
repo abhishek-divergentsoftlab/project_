@@ -15,6 +15,8 @@ import json
 import logging
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from typing import Optional, Sequence
 
 from core.config import settings
@@ -33,6 +35,11 @@ EMBEDDING_DIMENSIONS = get_expected_dimensions()
 
 
 def _post(path: str, payload: dict, timeout: int) -> Optional[dict]:
+    if path == "/api/embed" and settings.EMBEDDING_NUM_GPU >= 0:
+        # On a unified-memory box (DGX Spark) CUDA reports only a few GB free,
+        # so loading the embedding model on the GPU evicts the chat model and
+        # the next chat message pays a ~45 s reload. num_gpu=0 keeps it on CPU.
+        payload = {**payload, "options": {**payload.get("options", {}), "num_gpu": settings.EMBEDDING_NUM_GPU}}
     request = urllib.request.Request(
         f"{settings.OLLAMA_BASE_URL.rstrip('/')}{path}",
         data=json.dumps(payload).encode(),
@@ -46,7 +53,20 @@ def _post(path: str, payload: dict, timeout: int) -> Optional[dict]:
         return None
 
 
-def _embed_sync(texts: Sequence[str]) -> Optional[list[list[float]]]:
+# Query-time embedding (a user is waiting) must never queue behind slow background indexing or exhaust the default
+# executor: it has its own small pool and a short HTTP timeout. Background indexing keeps the long timeout.
+QUERY_TIMEOUT_SECONDS = 3.0
+_QUERY_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="embed-query")
+
+
+def _query_timeout() -> float:
+    try:
+        return min(QUERY_TIMEOUT_SECONDS, float(getattr(settings, "EMBEDDING_QUERY_TIMEOUT_SECONDS", QUERY_TIMEOUT_SECONDS)))
+    except (TypeError, ValueError):
+        return QUERY_TIMEOUT_SECONDS
+
+
+def _embed_sync(texts: Sequence[str], timeout: Optional[float] = None) -> Optional[list[list[float]]]:
     if not texts:
         return []
 
@@ -58,7 +78,7 @@ def _embed_sync(texts: Sequence[str]) -> Optional[list[list[float]]]:
             "input": list(texts),
             "keep_alive": -1,
         },
-        settings.EMBEDDING_TIMEOUT_SECONDS,
+        timeout if timeout is not None else settings.EMBEDDING_TIMEOUT_SECONDS,
     )
     if not data:
         return None
@@ -85,4 +105,12 @@ async def embed_many(texts: Sequence[str]) -> Optional[list[list[float]]]:
 
 async def embed_one(text: str) -> Optional[list[float]]:
     vectors = await embed_many([text])
+    return vectors[0] if vectors else None
+
+
+async def embed_query(text: str) -> Optional[list[float]]:
+    """Embed a search query: short HTTP timeout, dedicated bounded thread pool (a hung Ollama cannot exhaust the
+    default executor). None when the model does not answer in time."""
+    loop = asyncio.get_running_loop()
+    vectors = await loop.run_in_executor(_QUERY_POOL, partial(_embed_sync, [text], _query_timeout()))
     return vectors[0] if vectors else None

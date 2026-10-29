@@ -18,8 +18,9 @@ const DIMENSIONS: { key: keyof MatchScore; label: string }[] = [
   { key: "deadline", label: "Deadline" },
 ];
 
+/** Whole percent to the nearest 5: the score is an estimate, and "73%" claims a precision it does not have. */
 function percent(value: number) {
-  return `${Math.round(value * 100)}%`;
+  return `${Math.round((value * 100) / 5) * 5}%`;
 }
 
 /** "444 km" reads as a fact; "73%" on its own reads as an opinion. */
@@ -221,7 +222,14 @@ export function MatchCard({ candidate, onContact, onViewRoute }: MatchCardProps)
     .slice(0, 2)
     .join(", ");
 
-  const tier = score.total >= 0.85 ? "Excellent fit" : score.total >= 0.7 ? "Strong fit" : "Possible fit";
+  const tier =
+    score.total >= 0.85
+      ? "Excellent fit"
+      : score.total >= 0.7
+        ? "Strong fit"
+        : score.total >= 0.4
+          ? "Possible fit"
+          : "Weak";
   const rating = counterparty.average_rating;
 
   return (

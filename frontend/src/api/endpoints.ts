@@ -706,12 +706,17 @@ export const translation = {
     return data;
   },
   async batchTranslate(texts: string[], targetLanguage: string, sourceLanguage?: string): Promise<BatchTranslationResponse> {
-    const { data } = await api.post<BatchTranslationResponse>("/translation/batch", {
-      texts,
-      target_language: targetLanguage,
-      source_language: sourceLanguage,
-    });
-    return data;
+    // The API accepts at most 20 items (2000 characters each) per batch, so longer lists go out in chunks.
+    const translations: BatchTranslationResponse["translations"] = [];
+    for (let i = 0; i < Math.max(texts.length, 1); i += 20) {
+      const { data } = await api.post<BatchTranslationResponse>("/translation/batch", {
+        texts: texts.slice(i, i + 20),
+        target_language: targetLanguage,
+        source_language: sourceLanguage,
+      });
+      translations.push(...data.translations);
+    }
+    return { translations };
   },
   async translateConnectionMessage(
     connectionId: string,
@@ -731,6 +736,11 @@ export const translation = {
 export const escrow = {
   async getEscrow(connectionId: string): Promise<EscrowAccount> {
     const { data } = await api.get<EscrowAccount>(`/connections/${connectionId}/escrow`);
+    return data;
+  },
+  /** Explicitly open the vault for the live order (GET is read-only and 404s until then). */
+  async openEscrow(connectionId: string): Promise<EscrowAccount> {
+    const { data } = await api.post<EscrowAccount>(`/connections/${connectionId}/escrow`);
     return data;
   },
   async fundEscrow(connectionId: string, payload: EscrowDepositPayload = {}): Promise<EscrowAccount> {
@@ -769,6 +779,11 @@ export const escrow = {
     payload: DealDisputeResolvePayload,
   ): Promise<DealDispute> {
     const { data } = await api.post<DealDispute>(`/connections/${connectionId}/disputes/${disputeId}/resolve`, payload);
+    return data;
+  },
+  /** Only the party who raised the dispute may withdraw it. */
+  async withdrawDispute(connectionId: string, disputeId: string): Promise<DealDispute> {
+    const { data } = await api.post<DealDispute>(`/connections/${connectionId}/disputes/${disputeId}/withdraw`);
     return data;
   },
 };
@@ -830,6 +845,8 @@ export interface HsnItem {
   /** Shorter codes folded into this (most specific) row, e.g. ["080810"]. */
   also_codes?: string[] | null;
   recommended?: boolean | null;
+  /** Hierarchy string, e.g. "Vegetables > Onions". */
+  path?: string | null;
 }
 
 export interface HsnChapterItem {
@@ -852,8 +869,17 @@ export interface HsnSuggestion {
   category: string;
   chapter: string;
   chapter_name: string;
-  confidence: string;
+  confidence: "high" | "medium" | "low" | string;
   reason?: string;
+  path?: string | null;
+  source?: string | null;
+  needs_confirmation?: boolean;
+  alternatives?: HsnAlternative[];
+}
+
+export interface HsnAlternative {
+  code: string;
+  title: string;
 }
 
 export const hsnApi = {
@@ -872,6 +898,13 @@ export const hsnApi = {
   async getCategories(): Promise<HsnCategoryGroup[]> {
     const { data } = await api.get<HsnCategoryGroup[]>("/hsn/categories");
     return data;
+  },
+  /** Fire-and-forget vote: the user picked `code` for `text`. Never throws. */
+  confirm(text: string, code: string): void {
+    const t = text.trim();
+    const c = code.replace(/[^\d]/g, "");
+    if (t.length < 2 || c.length < 4) return;
+    void api.post("/hsn/confirm", { text: t.slice(0, 150), code: c.slice(0, 8) }).catch(() => undefined);
   },
   async suggest(text: string): Promise<HsnSuggestion | null> {
     try {

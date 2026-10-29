@@ -96,11 +96,18 @@ export function Dashboard() {
       key: "kyc",
       to: "/profile",
       tone: "is-warning",
-      title: kycStatus === "pending" ? "Verification in review" : "Verify your business",
+      title:
+        kycStatus === "pending"
+          ? "Verification pending"
+          : kycStatus === "flagged"
+            ? "Verification under review"
+            : "Verify your business",
       detail:
         kycStatus === "pending"
           ? "we'll add your verified badge once it's approved"
-          : "add your GST details to earn a verified badge",
+          : kycStatus === "flagged"
+            ? "our team will contact you about your GST details"
+            : "add your GST details to earn a verified badge",
     });
   }
 
@@ -182,7 +189,9 @@ export function Dashboard() {
                 <IconShield size={13} /> Verified business
               </span>
             ) : kycStatus === "pending" ? (
-              "Verification in review"
+              "Verification pending"
+            ) : kycStatus === "flagged" ? (
+              "Under review"
             ) : (
               "Not verified yet"
             )}

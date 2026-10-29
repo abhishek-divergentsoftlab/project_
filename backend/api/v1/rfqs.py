@@ -8,9 +8,10 @@ narrower projection -- these routes only ever serve the caller's own rows.
 import uuid
 from typing import Annotated, Optional
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from api.deps import CurrentUser, DbSession
+from core.rate_limit import RateLimit
 from models.enums import RFQStatus
 from models.rfq import RFQ
 from schemas.rfq import RFQCreate, RFQListOut, RFQOut, RFQPatch, SuggestedAttribute, SuggestedAttributesResponse
@@ -44,7 +45,13 @@ def _raise_for(exc: RFQError) -> None:
     raise HTTPException(code, str(exc)) from exc
 
 
-@router.post("", response_model=RFQOut, status_code=status.HTTP_201_CREATED)
+# Create and edit run the HSN / embedding / attribute models on the shared GPU.
+_rfq_write_limit = Depends(RateLimit("rfq-write", "RATE_LIMIT_RFQ_WRITE", per="user"))
+
+
+@router.post(
+    "", response_model=RFQOut, status_code=status.HTTP_201_CREATED, dependencies=[_rfq_write_limit]
+)
 async def create_rfq(
     payload: RFQCreate, current_user: CurrentUser, db: DbSession
 ) -> RFQOut:
@@ -105,8 +112,13 @@ async def list_saved_rfqs(
     )
 
 
-@router.get("/suggest-attributes", response_model=SuggestedAttributesResponse)
+@router.get(
+    "/suggest-attributes",
+    response_model=SuggestedAttributesResponse,
+    dependencies=[Depends(RateLimit("suggest-attributes", "RATE_LIMIT_SUGGEST", per="user"))],
+)
 async def suggest_attributes(
+    current_user: CurrentUser,
     product_name: Annotated[str, Query(min_length=1, max_length=200)],
     category: Annotated[Optional[str], Query(max_length=120)] = None,
     role: Annotated[Optional[str], Query(max_length=20)] = None,
@@ -137,7 +149,7 @@ async def get_rfq(rfq_id: uuid.UUID, current_user: CurrentUser, db: DbSession) -
     return rfq_service.to_out(rfq, pending_connections=pending_counts.get(rfq.id, 0))
 
 
-@router.patch("/{rfq_id}", response_model=RFQOut)
+@router.patch("/{rfq_id}", response_model=RFQOut, dependencies=[_rfq_write_limit])
 async def update_rfq(
     rfq_id: uuid.UUID, payload: RFQPatch, current_user: CurrentUser, db: DbSession
 ) -> RFQOut:

@@ -29,15 +29,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from models.connection import Connection
-from models.enums import ConnectionStatus, EmbeddingStatus, RFQRole, RFQStatus
+from models.enums import ConnectionStatus, EmbeddingStatus, KYCStatus, RFQRole, RFQStatus
 from models.match import MatchResult, MatchSearch
 from models.rfq import RFQ
-from models.user import User
+from models.user import User, UserProfile
 from schemas.common import DeadlineOut, Location, Money, Quantity
 from schemas.match import Counterparty, MatchCandidate, MatchResponse, MatchScore
 from core.config import settings
-from services import hsn_service, categories, match_scoring, product_synonyms, qdrant_index
-from services.embeddings import embed_one
+from services import ai_lexicon, hsn_service, categories, match_scoring, product_synonyms, qdrant_index, spec_codes, value_canon
+from services.embeddings import embed_query as embed_one  # query-time: short timeout, own thread pool
 from services.query_extractor import is_broad_product
 from services.rfq_indexing import build_match_text
 
@@ -55,6 +55,11 @@ MAX_POOL = 1000
 MIN_VECTOR_ROWS = 10
 
 # Embedding + vector search must answer within this, or SQL takes over.
+# Longest a search waits for the model to canonicalize the requester's own terms (cached after the first time).
+MATCH_CANON_TIMEOUT_SECONDS = 12.0
+MATCH_CANON_BACKFILL_SECONDS = 8.0
+MATCH_CANON_BACKFILL_MAX = 3
+
 # Overridable with a MATCH_VECTOR_TIMEOUT_SECONDS setting.
 VECTOR_TIMEOUT_SECONDS = 1.0
 
@@ -69,10 +74,10 @@ COMPARABLE_FLOOR = 0.35
 
 # Category as a multiplier on product fit. A red chilli LED light is not a red
 # chilli, however many words the two share.
-CATEGORY_MISMATCH_FACTOR = 0.3
+CATEGORY_MISMATCH_FACTOR = 0.55
 # Near-identical products in different categories are usually one listing filed
 # in the wrong place; they keep most of their score.
-CATEGORY_MISMATCH_HIGH_RELEVANCE = 0.92
+CATEGORY_MISMATCH_HIGH_RELEVANCE = 0.85
 CATEGORY_MISMATCH_FACTOR_HIGH_RELEVANCE = 0.85
 # One side used a free-text category we cannot map: a mild, not a hard, penalty.
 CUSTOM_CATEGORY_MISMATCH_FACTOR = 0.8
@@ -206,6 +211,8 @@ async def _load_active(
                 RFQ.embedding_status == EmbeddingStatus.INDEXED,
                 *_active_filters(rfq, requester_id, now),
             )
+            # Deterministic: the IN() result has no inherent order, and equal scores are tie-broken by it.
+            .order_by(RFQ.created_at.desc(), RFQ.id)
         )
     ).all()
     return rows
@@ -311,6 +318,9 @@ def _search_terms(rfq: RFQ) -> dict[str, int]:
 
 def _term_pattern(term: str) -> str:
     """A POSIX word-start regex for one term: 'cable' also finds 'cables'."""
+    code = re.fullmatch(r"(ss|en|fe|cat)(\d+[a-z]?)", term)
+    if code:  # canonical grade code: also finds "SS 304" / "ss-304" in the listing text
+        return rf"\m{code.group(1)}[\s\-_]*{code.group(2)}\M"
     stem = term[:-1] if term.endswith("y") and len(term) > 3 else term  # battery/batteries
     stem = re.escape(stem)
     if len(term) <= 2:
@@ -468,6 +478,120 @@ def _finite(value: Optional[float]) -> Optional[float]:
     return max(0.0, min(1.0, number))
 
 
+_AI_RELATION_NOTES = {
+    4: "AI: same product",
+    3: "AI: same product, different spec",
+    2: "AI: close substitute",
+}
+
+
+class _RelationState:
+    """One search's AI budget: a single deadline and the names still allowed.
+
+    The clock starts at the first warm-up, not at construction: retrieval (a
+    CPU embedding of the query) runs first and must not eat the AI's budget.
+    """
+
+    def __init__(self) -> None:
+        self.deadline: Optional[float] = None
+        self.names_left = int(getattr(settings, "MATCH_AI_MAX_NAMES", 40))
+
+
+async def _warm_relations(
+    rfq: RFQ,
+    rows: Iterable[RFQ],
+    similarities: dict[uuid.UUID, float],
+    state: _RelationState,
+) -> None:
+    """Ask the AI lexicon how each candidate's product relates to the request.
+
+    Scoring is synchronous, so the judgements are fetched here, before it runs,
+    and read back from the lexicon's cache by ``_score``. Best-effort: any
+    failure or exhausted budget leaves those pairs unknown and the deterministic
+    rules decide.
+    """
+    try:
+        if not getattr(settings, "MATCH_AI_ENABLED", True):
+            return
+        reference = _product_name(rfq)
+        if not reference or state.names_left <= 0:
+            return
+        now = asyncio.get_running_loop().time()
+        if state.deadline is None:
+            state.deadline = now + float(getattr(settings, "MATCH_AI_BUDGET_SECONDS", 15.0))
+        remaining = state.deadline - now
+        if remaining <= 0:
+            return
+        ranked: list[tuple[float, int, str]] = []
+        seen_names: set[str] = set()
+        for i, c in enumerate(rows):
+            name = _product_name(c) or c.title or ""
+            key = " ".join(name.lower().split())
+            if not key or key in seen_names:
+                continue
+            seen_names.add(key)
+            if ai_lexicon.relation(reference, name) is not None:
+                continue
+            sim = similarities.get(c.id)
+            ranked.append((-(sim if sim is not None else -1.0), i, name))
+        ranked.sort()
+        names = [n for _, _, n in ranked[: state.names_left]]
+        if not names:
+            return
+        state.names_left -= len(names)
+        await ai_lexicon.relate(reference, names, budget=remaining)
+    except Exception:
+        logger.debug("AI relation warm-up failed; using deterministic matching", exc_info=True)
+
+
+# Embedding similarity below which two listings are taken to be different commodities.
+DIFFERENT_COMMODITY_SIMILARITY = 0.80
+
+
+def _unresolved_specs(missing: set[str], candidate: RFQ) -> set[str]:
+    """Spec tokens the candidate does not literally contain AND does not express another way: a canonical code
+    ("ms" = "mild steel"), a synonym ("cord" ~ "cable"), or a canonical term from its saved ``_canon`` block."""
+    details = candidate.product_details or {}
+    text = f"{candidate.title or ''} {candidate.search_text or ''}"
+    canon = value_canon.get_canon(details) or {}
+    canon_text = " ".join([str(canon.get("product") or ""), *map(str, (canon.get("values") or {}).values())])
+    expressed = match_scoring.tokenize(f"{spec_codes.canonical_codes(text)} {canon_text}")
+    cand_concepts = {c for t in expressed for c, _ in match_scoring._resolve_all_synonyms(t)}
+    left: set[str] = set()
+    for token in missing:
+        singular = match_scoring.singularise(token)
+        if token in expressed or singular in expressed:
+            continue
+        if any(c in cand_concepts for c, _ in match_scoring._resolve_all_synonyms(token)):
+            continue
+        left.add(token)
+    return left
+
+
+def _conflicting_code(missing: set[str], candidate: RFQ) -> bool:
+    """The requester named a code (316l, cat6) and the candidate names a DIFFERENT code of the same kind."""
+    codes = {t for t in missing if any(c.isdigit() for c in t) and any(c.isalpha() for c in t)}
+    if not codes:
+        return False
+    theirs = spec_codes.code_tokens(f"{candidate.title or ''} {candidate.search_text or ''}")
+    return bool(theirs) and not (theirs & {spec_codes.canonical_value(c) for c in codes} | theirs & codes)
+
+
+def _commodities_differ(rfq: RFQ, candidate: RFQ, similarity: Optional[float]) -> bool:
+    """Positive evidence that the two listings are different commodities."""
+    a, b = value_canon.canon_product(rfq.product_details), value_canon.canon_product(candidate.product_details)
+    if a and b and a != b:
+        return True
+    try:
+        r_hsn = hsn_service.resolve_hsn(rfq.product_details, _product_name(rfq) or rfq.title or "")
+        c_hsn = hsn_service.resolve_hsn(candidate.product_details, _product_name(candidate) or candidate.title or "")
+        if r_hsn and c_hsn and len(str(r_hsn)) >= 6 and len(str(c_hsn)) >= 6 and str(r_hsn)[:6] != str(c_hsn)[:6]:
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    return similarity is not None and similarity < DIFFERENT_COMMODITY_SIMILARITY
+
+
 def _score(
     rfq: RFQ,
     candidate: RFQ,
@@ -503,6 +627,31 @@ def _score(
         )
         floor = COMPARABLE_FLOOR
 
+    # AI product relation (cached by _warm_relations before scoring). When the
+    # lexicon has judged this pair it decides the commodity question, so the
+    # token/HSN/embedding heuristics below are skipped.
+    req_prod = _product_name(rfq)
+    cand_name = _product_name(candidate) or candidate.title or ""
+    rel = (
+        ai_lexicon.relation(req_prod, cand_name)
+        if req_prod and cand_name and getattr(settings, "MATCH_AI_ENABLED", True)
+        else None
+    )
+    if rel == 4:
+        relevance = max(relevance, 0.90)
+    elif rel == 3:
+        relevance = max(relevance, 0.75)
+    elif rel == 2:
+        relevance = min(relevance, 0.65)
+
+    # Canonical product (AI value canonicalizer, stored on both listings at save time): the same standard English
+    # trade term means the same product whatever language or slang each side used.
+    same_canon_product = False
+    req_canon, cand_canon = value_canon.canon_product(rfq.product_details), value_canon.canon_product(candidate.product_details)
+    if req_canon and cand_canon and req_canon == cand_canon:
+        same_canon_product = True
+        relevance = max(relevance, 0.90)
+
     # Dynamic Asymmetric Specificity Check (Pillar 2): when the requester's
     # structured product data names a distinguishing sub-type ('type-c',
     # '316l', 'organic', 'fuji', 'cat6') and the candidate never mentions it,
@@ -512,13 +661,29 @@ def _score(
         cand_tokens_all = match_scoring.tokenize(
             f"{candidate.title or ''} {candidate.search_text or ''}"
         )
-        if required_specs - cand_tokens_all:
+        missing = required_specs - cand_tokens_all
+        if missing:
+            missing = _unresolved_specs(missing, candidate)
+        # A different wording is not evidence of a different product: drop relevance only on positive evidence
+        # (different canonical products, different tariff heading, a low embedding similarity, or a conflicting code).
+        if missing and (
+            _commodities_differ(rfq, candidate, similarity)
+            or _conflicting_code(missing, candidate)
+        ):
             relevance = max(0.10, relevance * 0.40)
 
     comparable = relevance >= floor
 
-    attr_score = match_scoring.attribute_score(
-        rfq.product_details or {}, candidate.product_details or {}
+    # Extract buyer negated attributes if any
+    negated_attrs = None
+    buyer_details = buyer.product_details or {}
+    raw_neg = buyer_details.get("_negated") or buyer_details.get("negated_attributes")
+    if isinstance(raw_neg, (list, set, tuple)):
+        negated_attrs = set(raw_neg)
+
+    attr_score, attr_breakdown = match_scoring.attribute_score_with_breakdown(
+        rfq.product_details or {}, candidate.product_details or {},
+        negated_attributes=negated_attrs,
     )
     category_factor, category = _category_factor(rfq.category, candidate.category, relevance)
 
@@ -533,6 +698,7 @@ def _score(
             seller.price_per_unit or seller.quantity_unit,
             buyer_attributes=buyer.product_details or {},
             seller_attributes=seller.product_details or {},
+            buyer_quantity=buyer.quantity_value,
         ) if comparable else None,
         "quantity": match_scoring.quantity_score(
             buyer.quantity_value, buyer.quantity_unit,
@@ -558,17 +724,29 @@ def _score(
     scores = {k: _finite(v) for k, v in scores.items()}
 
     keep = comparable
+    if rel in (0, 1):
+        keep = False
 
     # Two-Tier Multiplicative Gating (Pillar 3):
     # Tier 1: Feasibility (F) = does the product, its specs and its category match?
     # Tier 2: Commercial (C) = price, quantity, location, deadline.
     # Commercial terms (cheap price, close location) CANNOT compensate for an
     # incorrect product or missing spec.
+    # Once the listings are clearly the same product the exact similarity is noise: saturate it so specs, price,
+    # quantity and location decide. A listing naming many unrelated products is not a specific offer.
+    rel_eff = match_scoring.saturate_relevance(relevance)
+    breadth = match_scoring.breadth_factor(value_canon.listing_breadth(candidate.product_details, candidate.title))
     if attr_score is not None:
-        feasibility = relevance * ((1 - attribute_gate) + attribute_gate * attr_score)
+        feasibility = rel_eff * ((1 - attribute_gate) + attribute_gate * attr_score)
     else:
-        feasibility = relevance
-    feasibility = min(1.0, feasibility * category_factor)
+        feasibility = rel_eff
+    feasibility = min(1.0, feasibility * category_factor) * breadth
+
+    # Enhancement #4: Negation violation hard penalty
+    if negated_attrs and candidate.product_details:
+        neg_factor, violations = match_scoring.negation_penalty(negated_attrs, candidate.product_details)
+        if violations:
+            feasibility *= neg_factor
 
     commercial_scores = {
         k: v for k, v in scores.items() if k in _COMMERCIAL_DIMS and v is not None
@@ -581,6 +759,12 @@ def _score(
         # default to an unquoted baseline utility of 0.70 rather than an unfair 1.0.
         base_total = feasibility * ((1 - commercial_gate) + commercial_gate * 0.70)
 
+    # If negation violations occurred, crush base_total
+    if negated_attrs and candidate.product_details:
+        neg_factor, violations = match_scoring.negation_penalty(negated_attrs, candidate.product_details)
+        if violations:
+            base_total *= neg_factor
+
     # Core Product Gatekeeping:
     if relevance < settings.RELEVANCE_FLOOR:
         base_total = min(base_total, relevance * category_factor)
@@ -590,15 +774,16 @@ def _score(
     # with no product word in common -- after plurals and local names are
     # normalised, so "tamatar" and "tomato" are one word -- it is not a match
     # unless the vector index is highly confident (similarity >= 0.85).
-    req_prod = _product_name(rfq)
-    if req_prod and not is_broad_product(req_prod):
+    if rel is None and not same_canon_product and req_prod and not is_broad_product(req_prod):
         req_tokens = match_scoring.tokenize(req_prod)
-        cand_name = _product_name(candidate) or candidate.title or ""
         cand_tokens = match_scoring.tokenize(cand_name)
-        is_strong_semantic = similarity is not None and similarity >= 0.85
+        # Same-family commodities (tomato/potato, chana/moong) sit at 0.85-0.94
+        # in embedding space, so only near-identity may override disjoint names.
+        is_strong_semantic = similarity is not None and similarity >= 0.95
 
         # Dynamic Open-World Commodity Resolution (HSN + Vector Embedding Fallback)
         hsn_or_dynamic_match = False
+        different_heading = False
         r_hsn = hsn_service.resolve_hsn(rfq.product_details, req_prod)
         c_hsn = hsn_service.resolve_hsn(candidate.product_details, cand_name)
         if r_hsn and c_hsn:
@@ -607,6 +792,12 @@ def _score(
             # 4-digit heading matches (0.88) are broad industry families and must not conflate distinct crops (e.g. chickpeas vs moong).
             if h_sim is not None and h_sim >= 0.95:
                 hsn_or_dynamic_match = True
+            # Different tariff headings (first 4 digits) plus disjoint names is a
+            # different commodity (turmeric vs onion); synonyms such as pyaz/onion
+            # resolve to the same code and never reach this.
+            n_r, n_c = hsn_service.normalize_hsn(r_hsn), hsn_service.normalize_hsn(c_hsn)
+            if n_r and n_c and len(n_r) >= 4 and len(n_c) >= 4 and n_r[:4] != n_c[:4]:
+                different_heading = True
         if not hsn_or_dynamic_match and req_prod and cand_name:
             dyn_sim = match_scoring._dynamic_semantic_similarity(req_prod, cand_name)
             if dyn_sim is not None and dyn_sim >= 0.82:
@@ -619,7 +810,17 @@ def _score(
             and not is_strong_semantic
             and not hsn_or_dynamic_match
         ):
-            keep = False
+            # Soft fallback: if the titles share tokens or vector similarity clears fallback floor, keep with soft decay
+            title_req = match_scoring.tokenize(rfq.title)
+            title_cand = match_scoring.tokenize(candidate.title)
+            if different_heading:
+                keep = False
+            elif title_req & title_cand:
+                relevance *= 0.80
+            elif similarity is not None and similarity >= settings.RELEVANCE_FALLBACK_FLOOR:
+                relevance *= 0.70
+            else:
+                keep = False
 
     # Review & rating reputation adjustment for future match ranking
     profile = candidate.user.profile if candidate.user else None
@@ -627,9 +828,45 @@ def _score(
         avg = float(profile.average_rating)
         base_total += (avg - 3.5) * 0.04
 
+    # Enhancement #6: Explain match breakdown
+    dist_km = match_scoring.distance_km(
+        {"latitude": rfq.latitude, "longitude": rfq.longitude},
+        {"latitude": candidate.latitude, "longitude": candidate.longitude},
+    )
+    seller_moq = match_scoring._extract_moq(seller.product_details)
+    moq_text = None
+    if match_scoring.moq_shortfall(
+        buyer.quantity_value, buyer.quantity_unit, buyer.product_details,
+        seller.product_details, seller.quantity_unit,
+    ) is not None:
+        raw_moq = match_scoring._parse_moq(seller.product_details)
+        moq_text = (
+            f"order is below the seller's minimum of {raw_moq[0].normalize():f} "
+            f"{raw_moq[1] or seller.quantity_unit or buyer.quantity_unit or ''}"
+        ).strip()
+    explanation, dim_explanations = match_scoring.explain_match(
+        scores=scores,
+        attribute_breakdown=attr_breakdown,
+        buyer_qty=buyer.quantity_value,
+        buyer_unit=buyer.quantity_unit,
+        seller_qty=seller.quantity_value,
+        seller_unit=seller.quantity_unit,
+        seller_moq=seller_moq,
+        moq_text=moq_text,
+        distance_km=dist_km,
+    )
+    ai_note = _AI_RELATION_NOTES.get(rel)
+    if ai_note:
+        explanation = f"{explanation}; {ai_note}" if explanation else ai_note
+
     # Whatever the weights, the total is a probability-like score in [0, 1].
     total = round(_finite(base_total) or 0.0, 4)
-    return MatchScore(total=total, **scores), keep
+    return MatchScore(
+        total=total,
+        explanation=explanation,
+        dimension_explanations=dim_explanations,
+        **scores,
+    ), keep
 
 
 async def _connections_for(
@@ -803,9 +1040,16 @@ def _to_candidate(
     attribute_breakdown = None
     req_details = getattr(requester, "product_details", None)
     cand_details = getattr(candidate, "product_details", None)
+    negated_attrs = None
+    if req_details:
+        raw_neg = req_details.get("_negated") or req_details.get("negated_attributes")
+        if isinstance(raw_neg, (list, set, tuple)):
+            negated_attrs = set(raw_neg)
+
     if req_details or cand_details:
         _, raw_breakdown = match_scoring.attribute_score_with_breakdown(
-            req_details or {}, cand_details or {}
+            req_details or {}, cand_details or {},
+            negated_attributes=negated_attrs,
         )
         if raw_breakdown:
             attribute_breakdown = raw_breakdown
@@ -830,6 +1074,8 @@ def _to_candidate(
         counterparty=_counterparty(candidate, connection),
         score=score,
         attribute_breakdown=attribute_breakdown,
+        explanation=score.explanation,
+        dimension_explanations=score.dimension_explanations,
     )
 
 
@@ -848,6 +1094,54 @@ async def match_for_rfq(
     )
 
 
+def _norm_gstin(value: Optional[str]) -> Optional[str]:
+    cleaned = re.sub(r"\s+", "", value or "").upper()
+    return cleaned or None
+
+
+async def _verified_gstin(db: AsyncSession, user_id: uuid.UUID) -> Optional[str]:
+    """The requester's GSTIN, only when their KYC is verified (an unverified number proves nothing)."""
+    row = (
+        await db.execute(
+            select(UserProfile.gst_number, UserProfile.kyc_status).where(UserProfile.user_id == user_id)
+        )
+    ).first()
+    if row is None or row.kyc_status != KYCStatus.VERIFIED:
+        return None
+    return _norm_gstin(row.gst_number)
+
+
+def _owner_gstin(candidate: RFQ) -> Optional[str]:
+    """The candidate owner's GSTIN when verified (profile already loaded with the row)."""
+    profile = candidate.user.profile if candidate.user is not None else None
+    if profile is None or profile.kyc_status != KYCStatus.VERIFIED:
+        return None
+    return _norm_gstin(profile.gst_number)
+
+
+def _closest(rows: Sequence[RFQ], similarities: dict[uuid.UUID, float], limit: int = 12) -> list[RFQ]:
+    return sorted(rows, key=lambda r: -(similarities.get(r.id) or 0.0))[:limit]
+
+
+async def _backfill_canon(rows: Sequence[RFQ], budget: float = MATCH_CANON_BACKFILL_SECONDS) -> None:
+    """Listings saved while the model was busy have no ``_canon``: canonicalize a few of them now (cached afterwards).
+
+    Cache hits cost nothing; only genuinely new terms use the model, a handful at a time, within ``budget`` seconds.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + budget
+    done = 0
+    for row in rows:
+        value_canon.ensure_for_rfq_cached(row)
+        if value_canon.get_canon(row.product_details) or done >= MATCH_CANON_BACKFILL_MAX:
+            continue
+        left = deadline - loop.time()
+        if left <= 1.0:
+            break
+        done += 1
+        await value_canon.ensure_for_rfq(row, allow_llm=True, timeout=left)
+
+
 async def _collect(
     db: AsyncSession,
     rfq: RFQ,
@@ -861,12 +1155,20 @@ async def _collect(
     seen: set[uuid.UUID] = set()
     scored: list[tuple[RFQ, MatchScore]] = []
 
+    state = _RelationState()
+    own_gstin = await _verified_gstin(db, requester_id)
+    # The requester's canonical terms: from the cache, else one model call (never blocks the search on failure).
+    await value_canon.ensure_for_rfq(rfq, allow_llm=True, timeout=MATCH_CANON_TIMEOUT_SECONDS)
+
     def consider(rows: Iterable[RFQ], similarities: dict[uuid.UUID, float]) -> int:
         kept = 0
         for candidate in rows:
             if candidate.id in seen:
                 continue
             seen.add(candidate.id)
+            if own_gstin and _owner_gstin(candidate) == own_gstin:
+                continue  # the same legal entity on both sides is not a counterparty
+            value_canon.ensure_for_rfq_cached(candidate)
             score, keep = _score(
                 rfq, candidate, similarities.get(candidate.id),
                 matching_preferences=matching_preferences,
@@ -880,12 +1182,14 @@ async def _collect(
     vector_hits = await _vector_candidates(rfq, requester_id)
     if vector_hits is not None:
         rows = await _load_active(db, list(vector_hits), rfq, requester_id)
+        await _backfill_canon(_closest(rows, vector_hits))
+        await _warm_relations(rfq, rows, vector_hits, state)
         consider(rows, vector_hits)
         # Rows without a current vector are invisible to Qdrant; SQL is the
         # only way they can be found.
-        consider(
-            await _sql_candidates(db, rfq, requester_id, unindexed_only=True), {}
-        )
+        unindexed = await _sql_candidates(db, rfq, requester_id, unindexed_only=True)
+        await _warm_relations(rfq, unindexed, {}, state)
+        consider(unindexed, {})
         if len(rows) >= MIN_VECTOR_ROWS:
             return scored, "vector"
         # Empty index, stale ids, or a thin answer: top up from SQL.
@@ -896,6 +1200,8 @@ async def _collect(
         batch = await _sql_candidates(
             db, rfq, requester_id, limit=min(CANDIDATE_POOL, MAX_POOL - offset), offset=offset
         )
+        await _backfill_canon(batch[:12])
+        await _warm_relations(rfq, batch, {}, state)
         kept = consider(batch, {})
         # The pool is relevance-ordered, so a batch that produced nothing means
         # the remainder will not either.
@@ -935,7 +1241,8 @@ async def run_match(
 
     scored, path = await _collect(db, rfq, user.id, user_prefs)
     # Tie-break on recency so equal scores return in a stable, sensible order.
-    scored.sort(key=lambda pair: (pair[1].total, pair[0].created_at), reverse=True)
+    # then on the row id, so two pages of the same search never reorder or repeat a row.
+    scored.sort(key=lambda pair: (pair[1].total, pair[0].created_at, str(pair[0].id)), reverse=True)
 
     page = scored[offset : offset + limit]
 
@@ -984,4 +1291,5 @@ async def run_match(
         total=len(scored),
         limit=limit,
         offset=offset,
+        retrieval="sql" if path == "sql" else "vector",
     )

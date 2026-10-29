@@ -201,7 +201,11 @@ export function Marketplace() {
         } else {
           const res = await marketApi.getCatalog(params, controller.signal);
           if (!isCurrent()) return;
-          setItems((prev) => [...prev, ...res.items]);
+          // A page can repeat a row the previous page already showed (the list moved while paging): keep one per id.
+          setItems((prev) => {
+            const seen = new Set(prev.map((it) => it.id));
+            return [...prev, ...res.items.filter((it) => !seen.has(it.id))];
+          });
           setTotal(res.total);
         }
       } catch (err) {
@@ -980,6 +984,11 @@ export function Marketplace() {
                               <IconShield size={13} />
                             </span>
                           )}
+                          {(cp.kyc_status === "pending" || cp.kyc_status === "flagged") && (
+                            <span className="muted" style={{ marginLeft: 6, fontSize: "0.75em", fontWeight: 400 }}>
+                              {cp.kyc_status === "pending" ? "Verification pending" : "Under review"}
+                            </span>
+                          )}
                         </span>
                         <span className="company-meta-row">
                           <span title={`Trust score ${cp.trust_score}/100`}>
@@ -1162,17 +1171,23 @@ export function Marketplace() {
                     <IconShield size={13} /> Verified
                   </span>
                 ) : (
-                  <span className="muted">Not verified</span>
+                  <span className="muted">
+                    {activeModalItem.counterparty.kyc_status === "pending"
+                      ? "Verification pending"
+                      : activeModalItem.counterparty.kyc_status === "flagged"
+                        ? "Under review"
+                        : "Not verified"}
+                  </span>
                 )}
               </div>
             </div>
 
-            {Object.keys(activeModalItem.product_details || {}).filter((k) => !k.endsWith("__must_match")).length > 0 && (
+            {Object.keys(activeModalItem.product_details || {}).filter((k) => !k.endsWith("__must_match") && !k.startsWith("_")).length > 0 && (
               <div className="listing-detail-section">
                 <h3>Specifications</h3>
                 <dl className="specs-table">
                   {Object.entries(activeModalItem.product_details)
-                    .filter(([k]) => !k.endsWith("__must_match"))
+                    .filter(([k]) => !k.endsWith("__must_match") && !k.startsWith("_"))
                     .map(([key, value]) => (
                       <div key={key} className="specs-table-row">
                         <dt>{key.replace(/_/g, " ")}</dt>

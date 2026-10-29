@@ -16,6 +16,7 @@ perfect precision and no latency.
 
 """
 
+import asyncio
 import re
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -26,8 +27,9 @@ from pydantic import BaseModel, Field
 import logging
 
 from models.enums import RFQRole
-from services import ai_query_parser, learned_vocabulary, query_grounding
+from services import ai_lexicon, ai_query_parser, learned_vocabulary, query_grounding
 from services import currency as currency_service, product_synonyms, unit_converter
+from services import locations
 from services.locations import City, Location, find_city, find_location
 from services.match_scoring import singularise
 
@@ -55,10 +57,25 @@ _BUY_CUES = (
     "खरीद", "चाहिए", "मंगवाना", "comprar", "compra",
 )
 
+# Whole-word cues, matched with word boundaries because short words ("need", "bech")
+# would otherwise fire inside other words. Used only by the rule fallback, i.e. when
+# the model is unavailable; with a model the role comes from its parse.
+_SELL_WORD_CUES = re.compile(
+    r"\b(?:selling|we\s+sell|for\s+sale|bech|bechna|bechni|bechenge|bech\s+raha|bech\s+rahe|sell\s+karna|"
+    r"supply\s+karenge|maal\s+hai|stock\s+hai)\b"
+)
+_BUY_WORD_CUES = re.compile(
+    r"\b(?:chahiye|kharidna|kharidni|lena\s+hai|required|wanted|need)\b"
+)
+# "koi jeera bech raha hai?" asks whether ANYONE sells: a buyer's question, not an offer.
+_ASKING_ANYONE = re.compile(r"\b(?:koi|kya|kisi|anyone|anybody|who)\b")
+
 _CURRENCIES: dict[str, str] = {
     "₹": "INR", "rs": "INR", "rs.": "INR", "inr": "INR",
     "rupee": "INR", "rupees": "INR", "ruppes": "INR", "rupes": "INR",
     "rupess": "INR", "ruppees": "INR", "rupe": "INR",
+    "rupaye": "INR", "rupay": "INR", "rupya": "INR", "rupiya": "INR", "rupaiye": "INR",
+    "रुपये": "INR", "रुपया": "INR",
     "$": "USD", "usd": "USD", "dollar": "USD", "dollars": "USD",
     "buck": "USD", "bucks": "USD",
     "€": "EUR", "eur": "EUR", "euro": "EUR", "euros": "EUR",
@@ -188,7 +205,10 @@ def is_broad_product(product: Optional[str]) -> bool:
     if not product:
         return False
     words = product.lower().strip().split()
-    return len(words) <= 2 and any(w in _BROAD_PRODUCTS for w in words)
+    if len(words) <= 2 and any(w in _BROAD_PRODUCTS for w in words):
+        return True
+    # A family the model flagged ("vegetables", "masala") that the static list lacks.
+    return ai_lexicon.is_generic(product) is True
 
 _ORDINALS = frozenset(
     """1st 2nd 3rd 4th 5th 6th 7th 8th 9th 10th 11th 12th 13th 14th 15th
@@ -201,7 +221,7 @@ _ORDINALS = frozenset(
 # Stripped from the residual product phrase.
 _FILLER = frozenset(
     """metric i we want need looking for buy sell selling buying supply supplying show me
-    find get me some any please pls of the a an at in on to from with and or for is
+    find get me some any please pls of the a an at in on to from with and or but for is
     are am was were been be will would can could should must my our your it its that this these those now next
     also plus per each price prices priced pricing cost costs costing rate rates
     pay pays paying paid payment budget budgets target targets spend spending spent
@@ -212,11 +232,14 @@ _FILLER = frozenset(
     prefer preferably instead rather change switch convert set update make it them one give requirement
     almost exactly total overall
     actually actully actualy basically literally sorry sry apologies excuse
+    mistake mistakes mistaken said say saying meant mean meaning typo typos wrong scratch product
     ok okay okey then well alright fine search check rfq yes yeah yep sure k definitely absolutely
     dont don't not didnt didn't wont won't never no nope
+    wait waitt hold
     cancel remove drop delete forgetting forget
     just simple plain basic standard regular ordinary
-    date dates calendar schedule
+    date dates calendar schedule yesterday today tomorrow tonight
+    whole lot lots lump sum altogether entire
     jan jan feb mar apr jun jul aug sep sept oct nov dec
     january february march april may june july august september october november december
     st nd rd th
@@ -320,6 +343,9 @@ class Requirements(BaseModel):
 
     quantity_value: Optional[Decimal] = None
     quantity_unit: Optional[str] = None
+    # Enhancement #3: Quantity range support ("500-1000 kg")
+    min_quantity: Optional[Decimal] = None
+    max_quantity: Optional[Decimal] = None
 
     price_amount: Optional[Decimal] = None
     price_currency: Optional[str] = None
@@ -339,6 +365,12 @@ class Requirements(BaseModel):
 
     # Attributes explicitly negated or rejected by the user in refinements.
     negated_attributes: set[str] = Field(default_factory=set)
+
+    # The price is the WHOLE order's value ("total budget 1.5 crore"), not a per-unit price.
+    price_is_total: bool = False
+    # Things the message said that cannot be stored as they are (a negative quantity, an impossible date, a second
+    # product ...): the chat explains them and asks, it never stores a guess. See ``_sanity_flags``.
+    flags: dict[str, Any] = Field(default_factory=dict)
 
     def known(self, field: str) -> bool:
         if field == "quantity":
@@ -368,8 +400,10 @@ def _normalise_currency(token: Optional[str]) -> Optional[str]:
     if not token:
         return None
     cleaned = token.strip().lower().rstrip(".")
-    if cleaned in ("रुपये", "रुपया", "rupee", "rupees", "ruppes", "rupess"):
+    if cleaned in ("रुपये", "रुपया", "rupee", "rupees", "ruppes", "rupess", "rupe"):
         return "INR"
+    if cleaned in ("dollar", "dollars", "dolar", "dolars"):
+        return "USD"
     norm = currency_service.normalize_currency(cleaned)
     if norm:
         return norm
@@ -380,7 +414,7 @@ def _normalise_currency(token: Optional[str]) -> Optional[str]:
 
 _CURRENCY_SYMBOLS = (
     r"₹|\$|€|£|¥|₩|c\$|a\$|rs\.?|inr|usd|eur|gbp|jpy|cny|rmb|cad|aud|aed|chf|sek|nok|dkk|krw|sgd|"
-    r"(?:india[n]?\s+)?rup+[e|p]*s*|रुपये|रुपया|(?:u\.?s\.?\s+)?(?:dollars?|bucks?)|"
+    r"(?:india[n]?\s+)?(?:rupaye?|rup+[e|p]*s*)|रुपये|रुपया|(?:u\.?s\.?\s+)?(?:dollars?|dol+ars?|bucks?)|"
     r"euros?|pounds?|(?:swedish\s+)?krona|(?:norwegian\s+)?krone|kronor|kroner|kr|"
     r"dirhams?|yen|yuan|renminbi|won|francs?"
 )
@@ -394,7 +428,11 @@ def _extract_price(text: str) -> tuple[Optional[Decimal], Optional[str], Optiona
     read as a quantity of 2.
     """
     symbols = _CURRENCY_SYMBOLS
-    per = rf"(?:\s*(?:per\b|par\b|/|a|प्रति)\s*(?P<unit>[a-z\u0900-\u097f]+))?"
+    # "per kg", "/kg", "a kilo" and, right after a currency, a bare unit word: "12 rs kilo".
+    per = (
+        rf"(?:(?:\s*(?:per\b|par\b|/|\ba\b|प्रति)\s*|\s+(?=(?:kg|kgs|kilo|kilos|kilogram|quintal|quintals|qtl|ton|tons|tonne|tonnes|"
+        rf"pcs|pc|piece|pieces|meter|meters|litre|litres|liter|liters)\b))(?P<unit>[a-z\u0900-\u097f]+))?"
+    )
     known_units = (
         r"kg|kgs|kilo|kilos|kilogram|kilograms|quintal|quintals|qtl|ton|tons|tonne|tonnes|mt|g|gm|gram|grams|"
         r"pcs|pc|piece|pieces|unit|units|dozen|bora|boras|katta|bag|bags|meter|meters|m|l|liter|liters|litre|litres|"
@@ -403,13 +441,13 @@ def _extract_price(text: str) -> tuple[Optional[Decimal], Optional[str], Optiona
 
     patterns = (
         # "₹200/kg", "rs 200 per kg", "$2 per unit", "inr 210/unit"
-        rf"(?P<cur>{symbols})\s*(?P<amt>{_PRICE_NUMBER}){per}",
+        rf"(?<![a-z])(?P<cur>{symbols})\s*(?P<amt>{_PRICE_NUMBER}){per}",
         # "200 rupees per kg", "2 dollar per unit", "210 ruppes per unit"
         rf"(?P<amt>{_PRICE_NUMBER})\s*(?P<cur>{symbols}){per}",
         # "210/- per unit" (Indian currency notation)
         rf"(?P<amt>{_PRICE_NUMBER})\s*(?P<cur>/-){per}",
         # "at price 200 per kg", "can pay 210 per unit", "budget 200/kg", "pay 210"
-        rf"(?:at|for|price|rate|budget|pay|paying|target|upto|up\s+to|max|around)\s+(?:of\s+)?(?P<amt>{_PRICE_NUMBER}){per}",
+        rf"\b(?:at|for|price|rate|budget|pay|paying|target|upto|up\s+to|max|around)\s+(?:of\s+)?(?P<amt>{_PRICE_NUMBER}){per}",
         # Bare price per unit: "1000/quintal", "15/kg", "1.5/kg", "1000 per quintal", "1.5k/quintal"
         rf"(?:^|\s)(?P<amt>{_PRICE_NUMBER})\s*(?:/|per\b|par\b|प्रति)\s*(?P<unit>{known_units})\b",
     )
@@ -419,7 +457,7 @@ def _extract_price(text: str) -> tuple[Optional[Decimal], Optional[str], Optiona
         if not match:
             continue
         amount = _to_decimal(match.group("amt"))
-        if amount is None:
+        if amount is None or amount <= 0:
             continue
         cur_raw = match.groupdict().get("cur")
         if cur_raw == "/-":
@@ -560,8 +598,8 @@ def _parse_calendar_date(
 
 def _extract_deadline(text: str) -> tuple[Optional[int], str]:
     patterns = (
-        rf"(?:within|in|after|next)\s+(?P<n>\d+)\s*(?P<unit>day|days|week|weeks|month|months)",
-        rf"(?P<n>\d+)\s*(?P<unit>day|days|week|weeks|month|months)\s*(?:deadline|delivery)?",
+        rf"(?:within|in|after|next)\s+(?:\d+\s*(?:-|to)\s*)?(?P<n>\d+)\s*(?P<unit>day|days|week|weeks|month|months)",
+        rf"(?:\d+\s*(?:-|to)\s*)?(?P<n>\d+)\s*(?P<unit>day|days|week|weeks|month|months)\s*(?:deadline|delivery)?",
     )
     for pattern in patterns:
         match = re.search(pattern, text, flags=re.IGNORECASE)
@@ -580,6 +618,8 @@ def _extract_deadline(text: str) -> tuple[Optional[int], str]:
 
     # "before 30 sep", "it can be before 12'th of november", "before november 2026"
     calendar, span = _parse_calendar_date(text)
+    if calendar is not None and span is not None and re.match(rf"\s*(?:{_unit_alternation()})\b", text[span[1]:], re.IGNORECASE):
+        calendar = None  # "1.5 tonnes" is a size, not the 1st of May
     if calendar is not None and span is not None:
         days = (calendar - datetime.now().date()).days
         start, end = span
@@ -650,11 +690,32 @@ _PACK_COUNT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# e.g. "each box is 5 dozen", "each carton has 24 pieces", "12 pcs per box": how MANY units one pack holds
+_PACK_CONTENT_RE = re.compile(
+    r"\b(?:(?:each|every|per)\s+(?P<p1>[a-z]+)\s+(?:is|has|have|contains?|holds?|of|with|=|:)?\s*(?P<n1>\d[\d,]*(?:\.\d+)?)\s*(?P<u1>dozens?|doz|pcs|pieces?|units?|nos|bottles?|packets?)"
+    r"|(?P<n2>\d[\d,]*(?:\.\d+)?)\s*(?P<u2>dozens?|doz|pcs|pieces?|units?|nos|bottles?|packets?)\s*(?:in\s+each|per|in\s+every|each)\s+(?P<p2>[a-z]+))\b",
+    re.IGNORECASE,
+)
+
 # e.g. "in bora pcs", "packed in bags", "packaging in sacks"
 _PACKAGING_PREF_RE = re.compile(
     r"\b(?:in|packed\s+in|packaging\s*(?:in|:)?)\s+(?P<pack_pref>bora|boras|bori|boris|katta|kattas|gunny\s+bags?|bag|bags|sack|sacks|bale|bales|carton|cartons|box|boxes|crate|crates|drum|drums|pallet|pallets|pack|packs)(?:\s+pcs)?\b",
     re.IGNORECASE,
 )
+
+
+def _extract_pack_contents(text: str) -> tuple[Optional[str], Optional[str], str]:
+    """"each box is 5 dozen" -> ("5 dozen", "box", text without it): what one pack holds, never the order quantity."""
+    m = _PACK_CONTENT_RE.search(text)
+    if not m:
+        return None, None, text
+    holder = (m.group("p1") or m.group("p2") or "").lower()
+    if holder not in _PACKAGING_UNITS_SET and holder not in _CANONICAL_PACKAGING:
+        return None, None, text
+    n = (m.group("n1") or m.group("n2")).replace(",", "")
+    u = (m.group("u1") or m.group("u2") or "").lower()
+    u = "dozen" if u.startswith("doz") else u
+    return f"{n} {u}", _CANONICAL_PACKAGING.get(holder, holder), text[: m.start()] + " " + text[m.end():]
 
 
 def _extract_compound_packaging(
@@ -755,6 +816,13 @@ _MULTIPLIER_RE = re.compile(
     re.IGNORECASE,
 )
 _DOZEN_RE = re.compile(rf"(?P<n>{_NUMBER})\s*(?:dozens?|doz)\b", re.IGNORECASE)
+# "half a tonne", "quarter tonne", Hindi "dedh quintal" (1.5), "dhai tonne" (2.5): only before a unit, so
+# "half sleeve" or "dedh" in a product name is left alone.
+_FRACTIONS = {"half": "0.5", "quarter": "0.25", "dedh": "1.5", "derh": "1.5", "dhai": "2.5", "dhaai": "2.5", "adha": "0.5", "aadha": "0.5"}
+_FRACTION_RE = re.compile(
+    r"\b(?P<f>half|quarter|dedh|derh|dhai|dhaai|adha|aadha)\s+(?:(?:a|an|of\s+a)\s+)?(?=(?:tonnes?|tons?|mt|quintals?|qtl|kgs?|kilos?|kilograms?|litres?|liters?|dozens?)\b)",
+    re.IGNORECASE,
+)
 _CURRENCY_BEFORE_K = r"(?:₹|\$|€|£|rs\.?|inr|usd|eur|gbp)"
 
 
@@ -787,13 +855,17 @@ def _expand_multipliers(text: str) -> str:
             return match.group(0)
         return _plain(number * 12)
 
+    def fraction(match: re.Match) -> str:
+        return _FRACTIONS[match.group("f").lower()] + " "
+
     def thousands(match: re.Match) -> str:
         number = _to_decimal(match.group("n"))
         if number is None:
             return match.group(0)
         return f"{match.group('pre') or ''}{_plain(number * 1000)}"
 
-    out = _MULTIPLIER_RE.sub(mult, text)
+    out = _FRACTION_RE.sub(fraction, text)
+    out = _MULTIPLIER_RE.sub(mult, out)
     out = _DOZEN_RE.sub(dozen, out)
     out = re.sub(
         rf"(?P<pre>)(?P<n>\d+(?:\.\d+)?)\s?k\b(?=\s*(?:{_unit_alternation()})\b)",
@@ -806,14 +878,84 @@ def _expand_multipliers(text: str) -> str:
     return out
 
 
+# Enhancement #3: Quantity range parsing ("500-1000 kg", "between 5 and 10 tonnes")
+_RANGE_PATTERNS = (
+    # "500-1000 kg", "500 - 1000 kg", "500~1000 kg"
+    rf"(?P<min>{_NUMBER})\s*(?:-|–|~|to)\s*(?P<max>{_NUMBER})\s*(?P<unit>{{unit_alt}})\b",
+    # "between 5 and 10 tonnes"
+    rf"between\s+(?P<min>{_NUMBER})\s+and\s+(?P<max>{_NUMBER})\s*(?P<unit>{{unit_alt}})\b",
+    # "500 to 1000 kg"
+    rf"(?P<min>{_NUMBER})\s+to\s+(?P<max>{_NUMBER})\s*(?P<unit>{{unit_alt}})\b",
+)
+
+
+def _extract_quantity_range(
+    text: str,
+) -> tuple[Optional[Decimal], Optional[Decimal], Optional[Decimal], Optional[str], str]:
+    """Extract quantity range (min, max) from text.
+
+    Returns (quantity_value, min_quantity, max_quantity, unit, cleaned_text).
+    quantity_value is set to min_quantity for backward compatibility.
+    """
+    unit_alt = _unit_alternation()
+    for pattern_template in _RANGE_PATTERNS:
+        pattern = pattern_template.format(unit_alt=unit_alt)
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            min_val = _to_decimal(match.group("min"))
+            max_val = _to_decimal(match.group("max"))
+            unit = _canonical_unit(match.group("unit"))
+            cleaned = text[: match.start()] + " " + text[match.end() :]
+            if min_val is not None and max_val is not None:
+                if min_val > max_val:
+                    min_val, max_val = max_val, min_val
+                return min_val, min_val, max_val, unit, cleaned
+    return None, None, None, None, text
+
+
+def _extend_compound(
+    text: str, match: "re.Match[str]", value: Optional[Decimal], unit: str
+) -> tuple[Optional[Decimal], int]:
+    """"5 ton 200 kg": a smaller unit of the same kind right after the quantity adds to it (5.2 ton).
+
+    Returns the summed value (in the first unit) and the end of the text consumed."""
+    if value is None:
+        return value, match.end()
+    base = unit_converter.base_unit(unit)
+    if base is None:
+        return value, match.end()
+    unit_alt = _unit_alternation()
+    end, total = match.end(), value
+    while True:
+        nxt = re.match(
+            rf"\s*(?:and\s+|&\s*|\+\s*|,\s*)?(?P<amt>{_NUMBER})\s*(?P<unit>{unit_alt})\b", text[end:], flags=re.IGNORECASE
+        )
+        if not nxt:
+            break
+        small = unit_converter.base_unit(_canonical_unit(nxt.group("unit")))
+        amount = _to_decimal(nxt.group("amt"))
+        if small is None or amount is None or small[1] != base[1] or small[0] >= base[0]:
+            break
+        total += amount * small[0] / base[0]
+        end += nxt.end()
+    return total.quantize(Decimal("0.000001")).normalize() if total != value else value, end
+
+
 def _extract_quantity(text: str) -> tuple[Optional[Decimal], Optional[str], str]:
+    value, unit, cleaned, _compound = _extract_quantity_ex(text)
+    return value, unit, cleaned
+
+
+def _extract_quantity_ex(text: str) -> tuple[Optional[Decimal], Optional[str], str, bool]:
+    """Like ``_extract_quantity``, plus whether a compound ("5 ton 200 kg") was summed."""
     unit_alt = _unit_alternation()
     match = re.search(rf"(?P<amt>{_NUMBER})\s*(?P<unit>{unit_alt})\b", text, flags=re.IGNORECASE)
     if match:
         value = _to_decimal(match.group("amt"))
         unit = _canonical_unit(match.group("unit"))
-        cleaned = text[: match.start()] + " " + text[match.end() :]
-        return value, unit, cleaned
+        summed, end = _extend_compound(text, match, value, unit)
+        cleaned = text[: match.start()] + " " + text[end:]
+        return summed, unit, cleaned, summed != value
 
     # A bare number, once price and deadline have already been consumed --
     # skipping any that is really a specification.
@@ -824,12 +966,19 @@ def _extract_quantity(text: str) -> tuple[Optional[Decimal], Optional[str], str]
     for match in re.finditer(rf"\b(?P<amt>{_NUMBER})\b", text):
         if _SPEC_SUFFIX.match(text, match.end()):
             continue
-        value = _to_decimal(match.group("amt"))
+        amt_str = match.group("amt")
+        # Ignore 4-digit calendar years (e.g. 2024, 2025, 2026)
+        if re.match(r"^(?:19|20)\d{2}$", amt_str):
+            continue
+        # Ignore numbers followed by duration/deadline ranges (e.g. "within 10-15 days", "10 days")
+        if re.match(r"^\s*(?:-\s*\d+)?\s*(?:days?|weeks?|months?|years?|hours?)\b", text[match.end():], re.IGNORECASE):
+            continue
+        value = _to_decimal(amt_str)
         if value is not None and value >= 10:
             cleaned = text[: match.start()] + " " + text[match.end() :]
-            return value, None, cleaned
+            return value, None, cleaned, False
 
-    return None, None, text
+    return None, None, text, False
 
 
 # "supply" as people actually type it in a chat box.
@@ -839,15 +988,16 @@ _SUPPLY_VERB = r"(?:supply|suppy|suply|supplly|suplly|sypply|supplie)"
 def _extract_role(text: str) -> Optional[RFQRole]:
     lowered = f" {text.lower()} "
 
-    # 0. Explicit role switches: "update the rfq from buyer to seller".
+    # 0. Explicit role switches: "update the rfq from buyer to seller", "actually the seller not buyer".
     switch = re.search(
         r"\b(?:from|fron|frm)\s+(?:a\s+)?(buyer|seller|supplier)\s+to\s+(?:a\s+)?(buyer|seller|supplier)\b"
         r"|\b(?:change|switch|convert|make|set|udpate|update)\b[^.?!\n]{0,30}\bto\s+(?:a\s+)?(buyer|seller|supplier|selling|buying)\b"
-        r"|\b(?:make|mark|set)\s+it\s+(?:an?\s+)?(buyer|seller|supplier|sell|buy)\w*\s+(?:rfq|listing|post)\b",
+        r"|\b(?:make|mark|set)\s+it\s+(?:an?\s+)?(buyer|seller|supplier|sell|buy)\w*\s+(?:rfq|listing|post)\b"
+        r"|\b(?:i\s+am|im|i'm)?\s*(?:actually\s+)?(?:a\s+|the\s+)?(seller|buyer|supplier)\s+(?:not|not\s+a)\s+(buyer|seller)\b",
         lowered,
     )
     if switch:
-        target = switch.group(2) or switch.group(3) or switch.group(4)
+        target = switch.group(2) or switch.group(3) or switch.group(4) or switch.group(5)
         target = {"sell": "seller", "selling": "seller", "buy": "buyer", "buying": "buyer"}.get(target, target)
         return RFQRole.BUYER if target == "buyer" else RFQRole.SELLER
 
@@ -859,7 +1009,7 @@ def _extract_role(text: str) -> Optional[RFQRole]:
         rf"\b(?:i\s+)?(?:want|looking|plan|planning|ready|wish|wishing|aim|aiming)\s+to\s+(?:{_SUPPLY_VERB}|sell|offer|provide)\b",
         rf"\b(?:i\s+)?(?:can|could|will|would)\s+(?:{_SUPPLY_VERB}|sell|offer|provide)\b",
         r"\b(?:i\s+)?(?:am|'m|we\s+are|we're)\s+(?:selling|supplying|offering|providing)\b",
-        r"\b(?:i\s+)?(?:am|'m|we\s+are|we're)\s+(?:a\s+)?(?:supplier|seller|vendor|exporter|manufacturer|wholesaler|producer)s?\b",
+        r"\b(?:i\s+)?(?:am|'m|we\s+are|we're)\s+(?:actually\s+|now\s+)?(?:a\s+|the\s+)?(?:supplier|seller|vendor|exporter|manufacturer|wholesaler|producer)s?\b",
         r"\b(?:as\s+a\s+)?(?:supplier|seller|vendor|exporter|manufacturer|wholesaler)s?\b[^.?!\n]{0,50}\b(?:searching|looking)\s+for\s+buyers?\b",
         r"\b(?:have|got|with)\s+(?:ready\s+)?(?:stock|inventory|supplies|availability)\b",
         r"\bready\s+stock\b",
@@ -875,6 +1025,7 @@ def _extract_role(text: str) -> Optional[RFQRole]:
         r"\b(?:i\s+)?(?:want|looking|plan|planning|ready|wish|wishing|aim|aiming)\s+to\s+(?:buy|purchase|procure|order)\b",
         r"\b(?:i\s+)?(?:can|could|will|would)\s+(?:buy|purchase|procure)\b",
         r"\b(?:i\s+)?(?:am|'m|we\s+are|we're)\s+(?:buying|purchasing|procuring)\b",
+        r"\b(?:i\s+)?(?:am|'m|we\s+are|we're)\s+(?:actually\s+|now\s+)?(?:a\s+|the\s+)?(?:buyer|purchaser)s?\b",
         r"\b(?:need|require|seeking|looking\s+for|in\s+search\s+of)\b",
         r"\b(?:requirement\s+of|quote\s+for|rfq\s+for)\b",
         r"\b(?:khareedna|khareedne|chahiye|mangwana)\b",
@@ -895,8 +1046,18 @@ def _extract_role(text: str) -> Optional[RFQRole]:
         return learned_role
 
     # 2. General cues fallback
-    sell_at = min((lowered.find(cue) for cue in _SELL_CUES if cue in lowered), default=-1)
-    buy_at = min((lowered.find(cue) for cue in _BUY_CUES if cue in lowered), default=-1)
+    sell_hits = [lowered.find(cue) for cue in _SELL_CUES if cue in lowered]
+    buy_hits = [lowered.find(cue) for cue in _BUY_CUES if cue in lowered]
+    asking = "?" in lowered and _ASKING_ANYONE.search(lowered) is not None
+    sell_word = _SELL_WORD_CUES.search(lowered)
+    if sell_word and not asking:
+        sell_hits.append(sell_word.start())
+    buy_word = _BUY_WORD_CUES.search(lowered)
+    if buy_word:
+        buy_hits.append(buy_word.start())
+    # The earliest cue of either kind decides.
+    sell_at = min(sell_hits, default=-1)
+    buy_at = min(buy_hits, default=-1)
 
     if sell_at == -1 and buy_at == -1:
         return None
@@ -1008,10 +1169,8 @@ def _extract_attributes(text: str) -> dict[str, Any]:
         if re.search(rf"\b{re.escape(quality)}\b", lowered):
             attributes[quality.replace(" ", "_")] = True
 
-    # Values the model has met before (any colour, material, finish...).
-    for value, key in learned_vocabulary.learned_attribute_values().items():
-        if key not in attributes and value in lowered and re.search(rf"(?<!\w){re.escape(value)}(?!\w)", lowered):
-            attributes[key] = value
+    # Values the model has met before are HINTS for the model (see ``extract_async``), never rules that write a
+    # field here: "5" once learned as a ply count must not turn up on wheat.
 
     ply = re.search(r"(\d+)\s*-?\s*ply", lowered)
     if ply:
@@ -1051,7 +1210,9 @@ def _extract_attributes(text: str) -> dict[str, Any]:
     # "500 kg of basmati rice" is an order for 500kg and not also a product with
     # a 500kg capacity -- which would have penalised every seller who did not
     # declare a field the buyer never meant to ask about.
-    _, _, without_quantity = _extract_quantity(_strip_grades(text))
+    _, min_q, max_q, _, without_quantity = _extract_quantity_range(_strip_grades(text))
+    if min_q is None:
+        _, _, without_quantity = _extract_quantity(_strip_grades(text))
     attributes.update(_extract_measurements(without_quantity.lower()))
     return attributes
 
@@ -1121,7 +1282,10 @@ def _extract_product(
         flags=re.IGNORECASE,
     )
     if clause_splits and clause_splits[0].strip():
-        lowered = clause_splits[0]
+        if len(clause_splits) > 1 and re.search(r"\b(?:mistake|typo|wrong|said|thought|meant|earlier)\b", clause_splits[0], re.IGNORECASE):
+            lowered = clause_splits[1]
+        else:
+            lowered = clause_splits[0]
 
     # Strip prompt & transactional scaffolding words
     _SCAFFOLDING = (
@@ -1130,7 +1294,9 @@ def _extract_product(
         r"typical|condition|conditions|viable|viability|commercial|commercials|"
         r"fair|high|cheap|expensive|compare|comparison|budget|budgets|"
         r"category|categories|specification|specifications|draft|drafting|"
-        r"manufacturers?|producer|producers|factory|factories|available|stock|ready)\b"
+        r"manufacturers?|producer|producers|factory|factories|available|stock|ready|"
+        r"bhav|daam|dar|rate|rates|ke\s+paas|paas|ke\s+andar|andar|chahiye|mujhe|hamen|humein|"
+        r"around|near|within|under|below|approx|approximately)\b"
     )
     lowered = re.sub(_SCAFFOLDING, " ", lowered, flags=re.IGNORECASE)
 
@@ -1239,12 +1405,20 @@ def _extract_product(
 
 _NEGATION_PATTERNS = (
     # e.g. "i dont need type c cables", "dont need type c", "do not want white"
-    r"\b(?:i\s+)?(?:don't|dont|do\s+not|didnt|didn't|wont|won't)\s+(?:need|want|require|ask\s+for)\s+(?P<neg>[^,;.\n]+?)(?=(?:i\s+(?:need|want|require|prefer)|but|instead|rather|make\s+it|,|;|\.|$))",
+    r"\b(?:i\s+)?(?:don't|dont|do\s+not|didnt|didn't|wont|won't)\s+(?:need|want|require|ask\s+for)\s+(?P<neg>[^,;.\n]+?)(?=(?:i\s+(?:need|want|require|prefer)|but|instead|rather|make\s+it|it\'?s|its|is|actually|meant|mean|now|chahiye|mujhe|,|;|\.|$))",
     # e.g. "not type c", "not white", "no type c", "without type c", "free from type c"
-    r"\b(?:not|no|without|free\s+from|except|excluding)\s+(?P<neg>[a-z0-9\s\-]+?)(?=(?:i\s+(?:need|want|require|prefer)|but|instead|rather|make\s+it|,|;|\.|$))",
+    r"\b(?:not|no|without|free\s+from|except|excluding)\s+(?P<neg>[a-z0-9\s\-]+?)(?=(?:i\s+(?:need|want|require|prefer)|but|instead|rather|make\s+it|it\'?s|its|is|actually|meant|mean|now|chahiye|mujhe|,|;|\.|$))",
     # e.g. "remove type c", "drop type c", "cancel type c"
-    r"\b(?:remove|drop|cancel|delete|forget)\s+(?:the\s+)?(?P<neg>[a-z0-9\s\-]+?)(?=(?:i\s+(?:need|want|require|prefer)|but|instead|rather|make\s+it|,|;|\.|$))",
+    r"\b(?:remove|drop|cancel|delete|forget)\s+(?:the\s+)?(?P<neg>[a-z0-9\s\-]+?)(?=(?:i\s+(?:need|want|require|prefer)|but|instead|rather|make\s+it|it\'?s|its|is|actually|meant|mean|now|chahiye|mujhe|,|;|\.|$))",
 )
+# Verbs of the 3rd pattern are commands; their object is negated only when it names a product property we can
+# recognise ("remove type c"), never an arbitrary word ("cancel everything", "drop table rfqs").
+_COMMAND_NEGATION_VERBS = frozenset({"remove", "drop", "cancel", "delete", "forget"})
+# Words that can follow "no / not / without" without being a property of the goods.
+_NOT_A_PROPERTY = learned_vocabulary._STOPWORDS | frozenset({
+    "need", "wait", "problem", "worry", "doubt", "idea", "time", "way", "one", "more", "less", "other", "else", "such",
+    "questions", "question", "details", "detail", "table", "rfq", "rfqs", "draft", "listing", "order", "orders",
+})
 
 # Product-specific technical attributes that should be pruned when a product changes
 _PRODUCT_SPECIFIC_ATTRS = frozenset({
@@ -1264,9 +1438,12 @@ def _detect_negations(text: str) -> tuple[set[str], str]:
     for pat in _NEGATION_PATTERNS:
         for match in re.finditer(pat, text, flags=re.IGNORECASE):
             neg_span = match.group("neg").strip()
+            is_command = match.group(0).split()[0].lower() in _COMMAND_NEGATION_VERBS
             attrs = _extract_attributes(neg_span)
-            for k in attrs.keys():
+            for k, v in attrs.items():
                 negated_keys.add(k)
+                if isinstance(v, str):
+                    negated_keys.add(v.lower())
             lowered_span = neg_span.lower()
             if re.search(r"\btype\s*-?\s*c\b", lowered_span):
                 negated_keys.add("type")
@@ -1276,11 +1453,52 @@ def _detect_negations(text: str) -> tuple[set[str], str]:
                 negated_keys.add("grade")
             if re.search(r"\bmaterial\b", lowered_span):
                 negated_keys.add("material")
+            _neg_exclude = {
+                "the", "any", "and", "with", "from", "for", "buy", "sell", "buyer",
+                "seller", "buying", "selling", "purchaser", "vendor", "supplier",
+                "purchase", "it", "this", "that", "them", "want", "need", "have",
+                "order", "rfq", "change", "make", "wait", "not", "dont",
+                "used", "needed", "wanted", "required", "added", "given", "allowed", "applied",
+            }
+            for word in lowered_span.split():
+                clean_w = word.strip(".,;:!?\"'")
+                if is_command and not attrs:
+                    continue  # "cancel everything" is a command, not a rejected property
+                if (
+                    len(clean_w) > 2 and clean_w not in _neg_exclude and clean_w not in _NOT_A_PROPERTY
+                    and not clean_w.endswith("ing") and clean_w.isalpha() and len(lowered_span.split()) <= 3
+                ):
+                    negated_keys.add(clean_w)
 
             start, end = match.span()
             cleaned = cleaned[:start] + " " * (end - start) + cleaned[end:]
 
     return negated_keys, cleaned
+
+
+# "10 tonnes, no wait make it 12 tonnes": the user's last stated quantity is the one that counts.
+_CORRECTION_RE = re.compile(
+    r"\b(?:no[,.]?\s+wait|wait[,.]?\s+no|actually|change\s+(?:it\s+|that\s+|the\s+quantity\s+)?to|make\s+(?:it|that)|"
+    r"i\s+mean|scratch\s+that|sorry[,.]?|correction|nahi[,.]?\s+(?=\d)|nahin[,.]?\s+(?=\d))",
+    re.IGNORECASE,
+)
+
+
+def _corrected_quantity(text: str) -> tuple[Optional[Decimal], Optional[str]]:
+    """The quantity stated after the last correction word, if the text has one."""
+    last = None
+    for last in _CORRECTION_RE.finditer(text):
+        pass
+    if last is None:
+        return None, None
+    value, unit, _ = _extract_quantity(_strip_grades(_expand_multipliers(text[last.end():])))
+    return value, unit
+
+
+_RETRACTION_RE = re.compile(
+    r"\b(?:by\s+mistake|mistakenly|sorry|typo|wrongly)?\s*(?:i\s+)?(?:said|wrote|typed|told|mentioned|put|asked\s+for)\s+([a-zA-Z0-9\s-]+?)(?=\s*(?:but|however|instead|now|its|it'?s|is|actually|,|;|\.|$))",
+    re.IGNORECASE,
+)
 
 
 def _rule_extract(message: str) -> Requirements:
@@ -1291,9 +1509,16 @@ def _rule_extract(message: str) -> Requirements:
     if role is not None:
         requirements.role = role
 
+    # 0. Blank out apologies and retractions ("by mistake i said apple but ...")
+    clean_msg = message
+    m_retract = _RETRACTION_RE.search(message)
+    if m_retract:
+        clean_msg = message[: m_retract.start()] + " " * (m_retract.end() - m_retract.start()) + message[m_retract.end() :]
+
     # 1. Negation detection: extract negated attributes and blank out negated clauses
-    negated_attrs, positive_text = _detect_negations(message)
+    negated_attrs, positive_text = _detect_negations(clean_msg)
     requirements.negated_attributes = negated_attrs
+    pack_contents, contents_holder, positive_text = _extract_pack_contents(positive_text)
     working = _expand_multipliers(positive_text)
 
     # Explicit category extraction from message (e.g. in category "Food & Beverages")
@@ -1316,7 +1541,28 @@ def _rule_extract(message: str) -> Requirements:
     # Packaging & compound weight extraction
     pack_count, pack_unit, pack_attrs, working = _extract_compound_packaging(working)
 
-    quantity, unit, working = _extract_quantity(_strip_grades(working))
+    # Enhancement #3: Quantity range parsing ("500-1000 kg", "between 5 and 10 tonnes")
+    range_qty, min_q, max_q, range_unit, working_range = _extract_quantity_range(_strip_grades(working))
+    if min_q is not None and max_q is not None:
+        quantity = range_qty
+        unit = range_unit
+        working = working_range
+        requirements.min_quantity = min_q
+        requirements.max_quantity = max_q
+    else:
+        quantity, unit, working, compound = _extract_quantity_ex(_strip_grades(working))
+        if compound:
+            requirements.flags["quantity_compound"] = True
+
+    fixed_qty, fixed_unit = _corrected_quantity(positive_text)
+    if fixed_qty is not None:
+        quantity, unit, pack_count = fixed_qty, fixed_unit or unit, None
+        requirements.min_quantity = requirements.max_quantity = None
+    # An absurd size is not accepted silently: with no quantity the conversation asks how much is wanted.
+    if quantity is not None and query_grounding.quantity_is_absurd(quantity, pack_unit or unit):
+        quantity = None
+    if pack_count is not None and query_grounding.quantity_is_absurd(pack_count, pack_unit or unit):
+        pack_count = None
 
     if price is not None:
         requirements.price_amount = price
@@ -1344,30 +1590,310 @@ def _rule_extract(message: str) -> Requirements:
         requirements.longitude = Decimal(str(loc.longitude))
 
     # Attributes extracted from positive_text (with negated clauses removed, but specs intact)
-    extracted_attrs = _extract_attributes(positive_text)
+    # (the price is cut out first: "rs 15 kg" is a rate, not a 15 kg capacity)
+    extracted_attrs = _extract_attributes(_extract_price(_expand_multipliers(positive_text))[3])
     for k in negated_attrs:
         extracted_attrs.pop(k, None)
     requirements.attributes = extracted_attrs
     if pack_attrs:
         requirements.attributes.update(pack_attrs)
+    if pack_contents:
+        requirements.attributes["pack_contents"] = pack_contents
+        requirements.attributes.setdefault("packaging", contents_holder)
     if not requirements.category:
         requirements.category = _infer_category(working)
-    requirements.product = _extract_product(working, requirements.attributes, location=loc)
+    prod = _extract_product(working, requirements.attributes, location=loc)
+    if prod:
+        # Enhancement #1: Phonetic + fuzzy typo recovery for product name
+        # If the word is already a known English plural or noun, preserve user phrasing
+        from services.match_scoring import singularise
+        is_known = (
+            singularise(prod) in product_synonyms._GROUPS
+            or prod.rstrip("s") in product_synonyms._GROUPS
+            or prod.rstrip("es") in product_synonyms._GROUPS
+        )
+        if not is_known:
+            norm = product_synonyms.canonical_token(prod) or product_synonyms.fuzzy_match(prod)
+            if norm:
+                prod = norm
+            else:
+                tokens = prod.split()
+                corrected = []
+                for t in tokens:
+                    t_known = (
+                        singularise(t) in product_synonyms._GROUPS
+                        or t.rstrip("s") in product_synonyms._GROUPS
+                        or t.rstrip("es") in product_synonyms._GROUPS
+                    )
+                    c = None if t_known else (product_synonyms.canonical_token(t) or product_synonyms.fuzzy_match(t))
+                    corrected.append(c if c else t)
+                prod = " ".join(corrected)
+    requirements.product = prod
 
     return requirements
 
 
 
-def _requirements_from_ai(ai: query_grounding.AIParse, rules: Requirements, message: str) -> Requirements:
-    """AI understanding first; the rule parse only fills what the model left empty."""
+
+# --- sanity of what was read -------------------------------------------------------------------------------------
+# Nothing below guesses a replacement: a value that cannot be real is removed and named in ``Requirements.flags`` so
+# the chat can say why and ask again.
+
+_NEGATIVE_QTY_RE = re.compile(r"(?<![\w.\-])(?:-(?=\d)|minus\s+)(?P<n>\d[\d,]*(?:\.\d+)?)\s*(?P<u>{unit_alt})\b", re.IGNORECASE)
+_ZERO_QTY_RE = re.compile(r"(?<![\d.,])(?P<n>0+(?:\.0*)?)\s*(?P<u>{unit_alt})\b", re.IGNORECASE)
+_ANY_QTY_RE = re.compile(r"(?P<n>\d[\d,]*(?:\.\d+)?)\s*(?P<u>{unit_alt})\b", re.IGNORECASE)
+_PAST_WORDS_RE = re.compile(
+    r"\b(?:yesterday|day\s+before\s+yesterday|last\s+(?:week|month|year|night)|(?:\d+|a|an|one|two|three)\s+(?:days?|weeks?|months?|years?)\s+ago)\b",
+    re.IGNORECASE,
+)
+# Price bounds per BASE unit (kg, piece, litre, metre), in any currency: no real trade is below one hundredth or above
+# a hundred million of a currency unit per kg or per piece.
+_MIN_PRICE_PER_BASE = Decimal("0.01")
+_MAX_PRICE_PER_BASE = Decimal("100000000")
+
+
+def _days_in_month(year: int, month: int) -> int:
+    import calendar
+
+    return calendar.monthrange(year, month)[1]
+
+
+def date_issues(text: str, today: Optional[date] = None) -> list[tuple[str, str]]:
+    """Dates in ``text`` that cannot be a delivery date: ("invalid", "31 february") or ("past", "yesterday")."""
+    today = today or datetime.now().date()
+    lowered = (text or "").lower()
+    found: list[tuple[str, str]] = []
+    for m in re.finditer(
+        rf"\b(?P<day>\d{{1,2}})\s*(?:'?(?:st|nd|rd|th))?\s*(?:of\s+)?(?P<mon>{_MONTH_ALT})\b(?:\s+(?P<year>20\d{{2}}))?", lowered
+    ):
+        day, month = int(m.group("day")), _MONTHS[m.group("mon")]
+        year = int(m.group("year")) if m.group("year") else today.year
+        if day < 1 or day > _days_in_month(year, month) if 1 <= month <= 12 else True:
+            found.append(("invalid", m.group(0).strip()))
+        elif m.group("year") and date(year, month, day) < today:
+            found.append(("past", m.group(0).strip()))
+    for m in re.finditer(
+        rf"\b(?P<mon>{_MONTH_ALT})\s+(?:the\s+)?(?P<day>\d{{1,2}})\b(?!\s*(?:{_unit_alternation()})\b)(?:\s*(?:'?(?:st|nd|rd|th)))?(?:\s+(?P<year>20\d{{2}}))?", lowered
+    ):
+        day, month = int(m.group("day")), _MONTHS[m.group("mon")]
+        if m.group("mon") == "may" and not re.search(r"\bmay\s+\d", lowered):
+            continue
+        year = int(m.group("year")) if m.group("year") else today.year
+        if day < 1 or day > _days_in_month(year, month):
+            if day <= 31:
+                found.append(("invalid", m.group(0).strip()))
+        elif m.group("year") and date(year, month, day) < today:
+            found.append(("past", m.group(0).strip()))
+    for m in re.finditer(r"\b(?P<d>\d{1,2})[/.](?P<m>\d{1,2})[/.](?P<y>\d{2,4})\b", lowered):
+        day, month, year = int(m.group("d")), int(m.group("m")), int(m.group("y"))
+        year += 2000 if year < 100 else 0
+        if not 1 <= month <= 12 or day < 1 or day > _days_in_month(year, month):
+            found.append(("invalid", m.group(0)))
+        elif date(year, month, day) < today:
+            found.append(("past", m.group(0)))
+    for m in re.finditer(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b", lowered):
+        year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if not 1 <= month <= 12 or day < 1 or day > _days_in_month(year, month):
+            found.append(("invalid", m.group(0)))
+        elif date(year, month, day) < today:
+            found.append(("past", m.group(0)))
+    for m in _PAST_WORDS_RE.finditer(lowered):
+        found.append(("past", m.group(0)))
+    return found
+
+
+def _segments(message: str) -> list[dict[str, Any]]:
+    """Every "<number> <unit> <product words>" group of a message ("10 ton onion and 5 ton potato")."""
+    unit_alt = _unit_alternation()
+    text = _expand_multipliers(message)
+    out: list[dict[str, Any]] = []
+    for m in re.finditer(
+        rf"(?P<n>{_NUMBER})\s*(?P<u>{unit_alt})\s+(?:of\s+)?(?P<p>[a-zA-Z][a-zA-Z\-]*(?:\s+[a-zA-Z][a-zA-Z\-]*){{0,2}})", text, flags=re.IGNORECASE
+    ):
+        words = []
+        for w in m.group("p").lower().split():
+            if w in _FILLER or w in _CHITCHAT or w in _COUNT_UNITS or singularise(w) in _COUNT_UNITS or w in _MONTHS:
+                break
+            if find_location(w) is not None or w in {"each", "per", "box", "boxes"}:
+                break
+            words.append(w)
+        phrase = " ".join(words)
+        if phrase and learned_vocabulary.valid_product_term(phrase):
+            out.append({"product": phrase, "quantity_value": _to_decimal(m.group("n")), "quantity_unit": _canonical_unit(m.group("u"))})
+    return out
+
+
+def _extra_items(message: str, req: Requirements) -> list[dict[str, Any]]:
+    """The other products when one message orders several ("10 ton onion and 5 ton potato"); [] for a single one."""
+    segs = _segments(message)
+    distinct: list[dict[str, Any]] = []
+    for seg in segs:
+        key = singularise(seg["product"].split()[-1])
+        if all(singularise(d["product"].split()[-1]) != key for d in distinct):
+            distinct.append(seg)
+    if len(distinct) < 2:
+        return []
+    main = singularise((req.product or "").split()[-1]) if req.product else None
+    if main and all(singularise(d["product"].split()[-1]) != main for d in distinct):
+        return []  # the segments do not describe the product we understood: not a multi-product order
+    return [d for d in distinct if not main or singularise(d["product"].split()[-1]) != main]
+
+
+def _finalise(req: Requirements, message: str) -> Requirements:
+    """Remove what cannot be real and say so in ``req.flags``; derive nothing from a guess."""
+    unit_alt = _unit_alternation()
+    flags = req.flags
+    if req.product and all(_looks_like_gibberish(w) for w in re.findall(r"[^\W\d_]+", req.product)):
+        req.product = None  # keyboard mash is not a product
+    if req.product and len(req.product.split()) > 3:
+        # a product is a short noun phrase: cut a long leftover to its known-commodity ending, else do not guess one
+        req.product = _head_product(req.product)
+        if req.product and len(req.product.split()) > 4:
+            req.product = None
+    neg = re.search(_NEGATIVE_QTY_RE.pattern.replace("{unit_alt}", unit_alt), message, re.IGNORECASE)
+    zero = re.search(_ZERO_QTY_RE.pattern.replace("{unit_alt}", unit_alt), message, re.IGNORECASE)
+    bad = neg or zero
+    if bad or (req.quantity_value is not None and req.quantity_value <= 0):
+        flags["quantity_nonpositive"] = bad.group(0).strip() if bad else str(req.quantity_value)
+        req.quantity_value = req.quantity_unit = req.min_quantity = req.max_quantity = None
+    for m in re.finditer(_ANY_QTY_RE.pattern.replace("{unit_alt}", unit_alt), _expand_multipliers(message), re.IGNORECASE):
+        value = _to_decimal(m.group("n"))
+        if value is not None and query_grounding.quantity_is_absurd(value, _canonical_unit(m.group("u"))):
+            flags["quantity_absurd"] = f"{m.group('n')} {m.group('u')}"
+            req.quantity_value = req.quantity_unit = req.min_quantity = req.max_quantity = None
+            break
+    if req.quantity_value is not None and not req.quantity_unit and "quantity_nonpositive" not in flags:
+        flags["quantity_unit_missing"] = str(req.quantity_value)
+    if req.price_amount is not None:
+        if req.price_is_total or (
+            query_grounding.states_total_price(message) and not _price_unit_stated(message)
+        ):
+            req.price_is_total = True
+            flags["price_total"] = {"total": str(req.price_amount), "currency": req.price_currency}
+            if req.quantity_value is not None and req.quantity_value > 0 and req.quantity_unit:
+                per = (req.price_amount / req.quantity_value).quantize(Decimal("0.0001")).normalize()
+                flags["price_total"].update(per_unit_amount=str(per), qty=str(req.quantity_value), unit=req.quantity_unit)
+        elif req.price_per_unit:
+            base = unit_converter.base_unit(req.price_per_unit)
+            if base is not None:
+                per_base = req.price_amount / base[0]
+                if per_base < _MIN_PRICE_PER_BASE or per_base > _MAX_PRICE_PER_BASE:
+                    flags["price_absurd"] = f"{req.price_amount.normalize():f} {req.price_currency or ''} per {req.price_per_unit}".replace("  ", " ")
+                    req.price_amount = req.price_currency = req.price_per_unit = None
+    for kind, text in date_issues(message):
+        flags.setdefault(f"date_{kind}", text)
+    if "date_invalid" in flags or "date_past" in flags:
+        req.deadline_days = None
+    extras = _extra_items(message, req)
+    ai_items = flags.pop("ai_products", None)
+    if ai_items:
+        # the model's list of the message's goods (any joining words): everything but the main product is queued
+        main = singularise((req.product or ai_items[0]["product"]).split()[-1])
+        extras = [
+            {"product": i["product"], "quantity_value": _to_decimal(str(i["quantity_value"])) if i.get("quantity_value") else None,
+             "quantity_unit": i.get("quantity_unit")}
+            for i in ai_items if singularise(i["product"].split()[-1]) != main
+        ]
+    if extras:
+        flags["extra_items"] = [
+            {"product": e["product"], "quantity_value": str(e["quantity_value"]) if e.get("quantity_value") is not None else None,
+             "quantity_unit": e.get("quantity_unit")} for e in extras
+        ]
+    return req
+
+
+def _price_unit_stated(message: str) -> bool:
+    """The price names its unit ("per kg", "/kg", "rs kilo"), so it is a unit price whatever else the text says."""
+    return _extract_price(_expand_multipliers(message))[2] is not None
+
+
+def _is_pack_contents(value: Any, pack_contents: Any) -> bool:
+    """True when ``value`` is the number a pack was said to hold ("5 dozen" -> 5 or 60)."""
+    m = re.match(r"([\d.]+)\s*(dozen)?", str(pack_contents or ""))
+    if not m:
+        return False
+    n = _to_decimal(m.group(1))
+    if n is None:
+        return False
+    return Decimal(str(value)) in {n, n * 12 if m.group(2) else n}
+
+
+def _looks_like_gibberish(word: str) -> bool:
+    """Keyboard mash ("asdfghjkl"): almost no vowels, or a run of six consonants no real word has."""
+    w = word.lower()
+    if len(w) < 5 or not w.isascii():
+        return False
+    vowels = sum(ch in "aeiouy" for ch in w)
+    return vowels / len(w) < 0.15 or bool(re.search(r"[^aeiouy\W\d_]{6,}", w))
+
+
+def _head_product(product: Optional[str]) -> Optional[str]:
+    """A product is a short noun phrase. A long one ("sir small family business doing groundnut") is cut to its
+    longest known-commodity ending; with none the phrase is kept only up to four words."""
+    if not product:
+        return product
+    words = product.split()
+    if len(words) <= 3:
+        return product
+    for n in (3, 2, 1):
+        tail = " ".join(words[-n:])
+        if _known_commodity(tail):
+            return tail
+    return " ".join(words[-3:]) if len(words) > 4 else product
+
+
+def _known_commodity(name: str) -> bool:
+    """A product name the verified seed, the AI lexicon or learned vocabulary already knows."""
+    key = " ".join(name.lower().split())
+    return bool(
+        key in product_synonyms._GROUPS
+        or product_synonyms.canonical_token(key)
+        or ai_lexicon.term(key)
+        or key in learned_vocabulary._load()["product_category"]
+    )
+
+
+def _requirements_from_ai(
+    ai: query_grounding.AIParse, rules: Requirements, message: str, loc: Optional[Location] = None
+) -> Requirements:
+    """AI understanding first; the rule parse only fills what the model left empty.
+
+    ``loc`` is the AI location already resolved (possibly by the model, for a town no
+    table knows); without it the static tables are consulted.
+    """
     merged = rules.model_copy(deep=True)
     stated_role = ai.role or None
     if stated_role is None:
         stated_role = learned_vocabulary.role_for(message) or _extract_role(message)
     merged.role = stated_role or RFQRole.BUYER
 
+    if not ai.product and merged.product and not _known_commodity(merged.product):
+        # The model read the message and found no goods ("15 din mein", "write me a
+        # poem about love"); a rule-parser leftover ("din", "write poem clove") is noise.
+        merged.product = None
     if ai.product:
-        merged.product = clean_product_phrase(ai.product) or rules.product
+        cleaned = clean_product_phrase(ai.product)
+        words = ai.product.lower().split()
+        # The last word heads the model's product name ("PET bottles", "hair colour"):
+        # when the rule cleaner strips it as a unit or a colour, the name is the model's.
+        if (
+            cleaned and len(words) > 1
+            and singularise(words[-1]) not in {singularise(w) for w in cleaned.split()}
+        ):
+            cleaned = " ".join(words)
+        # A product the user wrote (almost) literally keeps its own spelling: "t-shirt" is not the rule cleaner's "shirt".
+        literal = ai.product.strip().lower()
+        squash = lambda t: re.sub(r"[\s\-]+", "", t.lower())  # noqa: E731
+        if literal and 0 < len(literal.split()) <= 3 and squash(singularise(literal)) in squash(message):
+            cleaned = singularise(literal) if len(literal.split()) == 1 else literal
+        if len(literal.split()) == 1:
+            # the model cut a glued word ("shirt" from "tshirts"): the user's own word is the product
+            for word in re.findall(r"[^\W\d_]+", message.lower()):
+                sing = singularise(word)
+                if sing != singularise(literal) and sing.endswith(singularise(literal)) and 0 < len(sing) - len(singularise(literal)) <= 2:
+                    cleaned = sing
+                    break
+        merged.product = _head_product(cleaned or rules.product)
     if ai.category:
         merged.category = ai.category
     elif not merged.category and merged.product:
@@ -1375,30 +1901,53 @@ def _requirements_from_ai(ai: query_grounding.AIParse, rules: Requirements, mess
 
     if ai.attributes:
         merged.attributes = {**rules.attributes, **ai.attributes}
-    negated = {k for k in ai.negated_attributes} | set(rules.negated_attributes)
+    # The model reads negations in context ("no seamless"); the rule parser's (already filtered) guess is kept only
+    # when the model found none.
+    negated = {k for k in ai.negated_attributes} or set(rules.negated_attributes)
     merged.negated_attributes = negated
     for key in ai.negated_attributes:
         merged.attributes.pop(key, None)
 
-    if ai.quantity_value is not None:
+    if ai.quantity_value is not None and rules.flags.get("quantity_compound") and rules.quantity_value is not None:
+        pass  # "5 ton 200 kg": the model read the first part; the rules summed both (5.2 ton)
+    elif ai.quantity_value is not None and _is_pack_contents(ai.quantity_value, rules.attributes.get("pack_contents")):
+        merged.quantity_value = rules.quantity_value  # "each box is 5 dozen": that is what a box holds, not the order
+        merged.quantity_unit = rules.quantity_unit
+    elif ai.quantity_value is not None:
         merged.quantity_value = ai.quantity_value
         merged.quantity_unit = ai.quantity_unit or rules.quantity_unit
+    elif merged.quantity_value is not None and not merged.quantity_unit:
+        # A bare number the model did not read as a quantity is a day count, a
+        # grade or a size ("15 din mein" overwrote 80 quintal with 15 pcs).
+        merged.quantity_value = None
     if ai.price_amount is not None:
         merged.price_amount = ai.price_amount
         merged.price_currency = ai.price_currency or rules.price_currency
         merged.price_per_unit = ai.price_per_unit or rules.price_per_unit
+        merged.price_is_total = ai.price_is_total or rules.price_is_total
+    if len(ai.products) > 1:
+        merged.flags["ai_products"] = ai.products
+    elif merged.price_amount is not None and merged.price_amount == merged.quantity_value:
+        # The model read the number as a quantity ("looking for 100 kg"); the rule
+        # parser's "for 100" price pattern must not reuse it as a price.
+        merged.price_amount = merged.price_currency = merged.price_per_unit = None
     if ai.deadline_days is not None:
         merged.deadline_days = ai.deadline_days
 
-    if ai.location and not rules.city:
-        loc = find_location(ai.location)
+    if ai.location:
+        # The model read the whole message, so its place beats a rule-parser city that may
+        # be a fuzzy false positive.
+        if loc is None and not rules.city:
+            loc = find_location(ai.location)
         if loc:
             merged.city, merged.state, merged.country = loc.city, loc.state, loc.country
             merged.currency_hint = loc.currency
             merged.latitude = Decimal(str(loc.latitude))
             merged.longitude = Decimal(str(loc.longitude))
-        else:
-            merged.city = ai.location
+        elif not rules.city:
+            # A place no gazetteer, cached place or model lookup knows is asked about, never stored as a guess.
+            merged.flags["location_unresolved"] = ai.location
+            merged.city = merged.state = merged.country = None
     return merged
 
 
@@ -1412,20 +1961,50 @@ def extract(message: str) -> Requirements:
     rules = _rule_extract(message)
     ai = ai_query_parser.cached(message)
     if ai is None:
-        return rules
-    return _requirements_from_ai(ai, rules, message)
+        return _finalise(rules, message)
+    return _finalise(_requirements_from_ai(ai, rules, message), message)
 
 
-async def extract_async(message: str) -> Requirements:
-    """AI-first parse with grounding, falling back to the rules, then learn from it."""
+async def extract_async(message: str, user_id: Any = None) -> Requirements:
+    """AI-first parse with grounding, falling back to the rules, then learn from it.
+
+    ``user_id`` (who wrote the message) lets the parse count as one vote for the vocabulary it contains; without it
+    nothing is learned, because a single user must not redefine words for everyone."""
     rules = _rule_extract(message)
+    # Values remembered for this product family are hints for the model, never rules of their own.
+    family = rules.category or learned_vocabulary.category_for(message)
     ai = await ai_query_parser.understand(
-        message, known_categories=learned_vocabulary.known_categories()
+        message,
+        known_categories=learned_vocabulary.known_categories(),
+        hints=learned_vocabulary.attribute_hints(family),
     )
     if ai is None:
-        return rules
-    learned_vocabulary.learn_from(ai, message)
-    return _requirements_from_ai(ai, rules, message)
+        return _finalise(rules, message)
+    learned_vocabulary.learn_from(ai, message, user_id)
+    loc = await locations.resolve_location(ai.location) if ai.location else None
+    if ai.product:
+        ai_lexicon.note_parse(
+            ai.product, ai.product_as_written, ai.category, getattr(ai, "product_is_generic", None), user_id
+        )
+        _schedule_term_lookup([ai.product, ai.product_as_written])
+    return _finalise(_requirements_from_ai(ai, rules, message, loc), message)
+
+
+# Strong references to fire-and-forget lexicon lookups, so the loop does not drop them mid-flight.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _schedule_term_lookup(terms: list[Optional[str]]) -> None:
+    """Learn the product's names in the background; never delays the reply."""
+    wanted = [t for t in terms if t and t.strip()]
+    if not wanted:
+        return
+    try:
+        task = asyncio.get_running_loop().create_task(ai_lexicon.resolve_terms(wanted))
+    except RuntimeError:
+        return
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 def detect_role(message: str) -> Optional[RFQRole]:
@@ -1499,7 +2078,7 @@ def parse_answer(field: str, message: str) -> Optional[Requirements]:
                 end_pos = bare.end()
                 if not re.match(r"\s*(?:'?(?:st|nd|rd|th))\b", without_deadline[end_pos:], re.IGNORECASE):
                     value = _to_decimal(bare.group(1))
-        if value is None:
+        if value is None or value <= 0:
             return None
         answer.quantity_value = value
         answer.quantity_unit = unit or _bare_unit(without_deadline)
@@ -1510,10 +2089,9 @@ def parse_answer(field: str, message: str) -> Optional[Requirements]:
     if field == "price":
         amount, currency, per_unit, _ = _extract_price(message)
         if amount is None:
-            bare = re.search(rf"\b({_NUMBER})\b", message)
-            amount = _to_decimal(bare.group(1)) if bare else None
+            amount = _bare_price_answer(message)
             currency = _currency_in(message)
-        if amount is None:
+        if amount is None or amount <= 0:
             return None
         answer.price_amount = amount
         answer.price_currency = currency
@@ -1544,6 +2122,50 @@ def parse_answer(field: str, message: str) -> Optional[Requirements]:
         return None
 
     return None
+
+
+# Words that may surround a bare number that answers "what price?" ("ok 15", "around 15 only").
+_ANSWER_FILLER = frozenset({
+    "ok", "okay", "about", "around", "approx", "approximately", "roughly", "only", "just", "maybe", "say", "like", "is",
+    "it", "its", "the", "a", "price", "rate", "of", "to", "be", "should", "make", "keep", "then", "yes", "haan", "bas",
+    "lagbhag", "hai", "per", "pls", "please", "kindly", "so", "i", "can", "pay", "offer", "target",
+}) | learned_vocabulary._COMMAND_WORDS
+
+
+def _bare_price_answer(message: str) -> Optional[Decimal]:
+    """The number of a reply that answers the price question without naming a currency or unit ("15", "ok 15 only").
+
+    A number that belongs to another statement is not a price: one followed by an order unit ("0 kg", "5 ton"), or in
+    a sentence of its own words ("I want to sell 10 pistols", "each box is 5 dozen")."""
+    numbers = list(re.finditer(rf"(?<![\w.]){_NUMBER}\b", message))
+    if len(numbers) != 1:
+        return None
+    m = numbers[0]
+    after = message[m.end():].strip().lower()
+    word = re.match(r"[^\W\d_]+", after)
+    if word and (unit_converter.base_unit(word.group(0)) is not None or unit_converter.is_packaging_unit(word.group(0))
+                 or _canonical_unit(word.group(0)) in _COUNT_UNITS or word.group(0) in {"dozen", "dozens", "doz"}):
+        return None
+    leftover = [w for w in re.findall(r"[^\W\d_]+", (message[:m.start()] + " " + message[m.end():]).lower())
+                if w not in _ANSWER_FILLER and not _normalise_currency(w)]
+    if len(leftover) > 1:
+        return None
+    return _to_decimal(m.group(0))
+
+
+def parse_unit_answer(message: str) -> Optional[str]:
+    """The unit of a reply that only names one ("kg", "tonnes please", "in pieces"), else None."""
+    words = re.findall(r"[^\W\d_]+", (message or "").lower())
+    if not words or len(words) > 4:
+        return None
+    unit = _bare_unit(message)
+    if not unit:
+        return None
+    rest = [w for w in words if w not in _ANSWER_FIELD_FILLER and _canonical_unit(w) != _canonical_unit(unit)]
+    return _canonical_unit(unit) if not rest else None
+
+
+_ANSWER_FIELD_FILLER = frozenset({"in", "ok", "okay", "please", "pls", "only", "it", "is", "are", "the", "of", "sorry", "yes", "its", "kindly"})
 
 
 def _bare_unit(message: str) -> Optional[str]:

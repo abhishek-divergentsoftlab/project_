@@ -1,10 +1,12 @@
 """Certificate service for managing seller compliance and quality certificates.
 
-Certificates are self-declared: nobody reviews them yet. ``verification_status``
-keeps the existing enum value, but the trust-score effect is bounded and
-derived from facts: ``kyc_service.recompute_trust_score`` counts the user's
-currently valid (unexpired) certificates at +5 each, capped at +15, so deleting
-or expiring one removes its bonus and certificates cannot farm the score.
+Certificates are self-declared and start as PENDING; an operator approves
+(VERIFIED) or rejects them (see api/v1/ops_trust.py). Only VERIFIED ones earn
+trust: ``kyc_service.recompute_trust_score`` counts the user's currently valid
+(unexpired) VERIFIED certificates at +5 each, capped at +15, so deleting or
+expiring one removes its bonus and certificates cannot farm the score. The
+public listing also shows PENDING ones, which the UI labels "Self-declared,
+not verified".
 """
 
 import re
@@ -114,7 +116,7 @@ async def create_certificate(
         issue_date=payload.issue_date,
         expiry_date=payload.expiry_date,
         document_url=document_url,
-        verification_status=CertificationStatus.VERIFIED,
+        verification_status=CertificationStatus.PENDING,
     )
     db.add(certificate)
     await db.flush()
@@ -146,7 +148,9 @@ async def get_public_certificates(
         select(Certificate)
         .where(
             Certificate.user_id == user_id,
-            Certificate.verification_status == CertificationStatus.VERIFIED,
+            Certificate.verification_status.in_(
+                (CertificationStatus.VERIFIED, CertificationStatus.PENDING)
+            ),
         )
         .order_by(Certificate.created_at.desc())
     )
@@ -175,8 +179,31 @@ async def delete_certificate(
 
 def _verify_magic_bytes(file_bytes: bytes, ext: str) -> bool:
     """Validate binary header/magic bytes to prevent MIME-sniffing or extension-spoofing attacks."""
+    if not file_bytes:
+        return False
+
+    # Block disguised binaries with embedded executable headers
+    _BLOCKED_EXECUTABLE_SIGNATURES = (
+        b"\x7fELF",           # Linux ELF executable
+        b"MZ",                # Windows DOS/PE executable
+        b"\xfe\xed\xfa\xce",  # Mach-O 32-bit
+        b"\xfe\xed\xfa\xcf",  # Mach-O 64-bit
+        b"\xce\xfa\xed\xfe",  # Mach-O reverse
+        b"\xcf\xfa\xed\xfe",  # Mach-O reverse 64-bit
+        b"#!/",               # Unix script hashbang
+        b"#!\x20",            # Unix script hashbang space
+    )
+    # Check within the first 1KB of file header
+    header_chunk = file_bytes[:1024]
+    for sig in _BLOCKED_EXECUTABLE_SIGNATURES:
+        if sig in header_chunk:
+            return False
+
     if ext == ".pdf":
-        return file_bytes.startswith(b"%PDF-")
+        if not file_bytes.startswith(b"%PDF-"):
+            return False
+        # Genuine PDF must contain standard PDF structural tokens
+        return any(marker in file_bytes for marker in (b"obj", b"xref", b"trailer", b"%%EOF", b"/Root"))
     if ext == ".png":
         return file_bytes.startswith(b"\x89PNG\r\n\x1a\n")
     if ext in (".jpg", ".jpeg"):
@@ -267,6 +294,87 @@ async def upload_certificate_document(
     )
 
     cert.document_url = document_url
+    if cert.verification_status != CertificationStatus.PENDING:
+        # A new document is a new claim: it must be reviewed again.
+        cert.verification_status = CertificationStatus.PENDING
+        await db.flush()
+        await _refresh_trust(db, user_id)
+    await db.commit()
+    await db.refresh(cert)
+    return cert
+
+
+# ---------------------------------------------------------------- operator review
+
+
+async def list_certificates_for_review(
+    db: AsyncSession, status: CertificationStatus = CertificationStatus.PENDING
+) -> list[dict]:
+    from models.user import User
+
+    rows = (
+        await db.execute(
+            select(Certificate, User.email, UserProfile.company_name)
+            .join(User, User.id == Certificate.user_id)
+            .outerjoin(UserProfile, UserProfile.user_id == Certificate.user_id)
+            .where(Certificate.verification_status == status)
+            .order_by(Certificate.created_at.asc())
+        )
+    ).all()
+    return [
+        {
+            "id": c.id,
+            "user_id": c.user_id,
+            "email": email,
+            "company_name": company,
+            "name": c.name,
+            "issuing_body": c.issuing_body,
+            "certificate_number": c.certificate_number,
+            "issue_date": c.issue_date,
+            "expiry_date": c.expiry_date,
+            "document_url": c.document_url,
+            "verification_status": c.verification_status,
+            "created_at": c.created_at,
+        }
+        for c, email, company in rows
+    ]
+
+
+async def review_certificate(
+    db: AsyncSession,
+    certificate_id: uuid.UUID,
+    *,
+    approve: bool,
+    reason: Optional[str] = None,
+) -> Certificate:
+    """Operator decision on a PENDING certificate: VERIFIED or REJECTED."""
+    from services import notification_service
+
+    cert = (
+        await db.execute(
+            select(Certificate).where(Certificate.id == certificate_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if cert is None:
+        raise CertificateError("Certificate not found", status_code=404)
+    if cert.verification_status != CertificationStatus.PENDING:
+        raise CertificateError(
+            f"Certificate is not awaiting review (status: {cert.verification_status.value})",
+            status_code=409,
+        )
+    cert.verification_status = (
+        CertificationStatus.VERIFIED if approve else CertificationStatus.REJECTED
+    )
+    await db.flush()
+    await _refresh_trust(db, cert.user_id)
+    await notification_service.create_notification(
+        db,
+        user_id=cert.user_id,
+        type="certificate_approved" if approve else "certificate_rejected",
+        title=f"Certificate {'verified' if approve else 'not accepted'}: {cert.name}",
+        body=None if approve else reason,
+        link="/profile",
+    )
     await db.commit()
     await db.refresh(cert)
     return cert

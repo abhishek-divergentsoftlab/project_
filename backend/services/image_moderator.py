@@ -15,6 +15,7 @@ from typing import Any, Optional
 import httpx
 
 from core.config import settings
+from services import llm_client
 
 logger = logging.getLogger(__name__)
 
@@ -125,8 +126,9 @@ async def inspect_live_image(
     url = f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/generate"
 
     try:
-        async with httpx.AsyncClient(timeout=float(settings.IMAGE_MODERATION_TIMEOUT_SECONDS)) as client:
-            response = await client.post(url, json=payload)
+        async with llm_client.generation_slot():
+            async with httpx.AsyncClient(timeout=float(settings.IMAGE_MODERATION_TIMEOUT_SECONDS)) as client:
+                response = await client.post(url, json=payload)
 
         if response.status_code != 200:
             logger.error("Ollama moderation returned HTTP %d: %s", response.status_code, response.text)
@@ -176,7 +178,7 @@ async def inspect_live_image(
 
         return True, None, parsed
 
-    except (httpx.RequestError, httpx.TimeoutException, OSError) as exc:
+    except (httpx.RequestError, httpx.TimeoutException, OSError, llm_client.LLMBusy) as exc:
         logger.error("Ollama moderation connection failed: %s", exc)
         if settings.IMAGE_MODERATION_FAIL_CLOSED:
             return (

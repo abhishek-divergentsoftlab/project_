@@ -3,10 +3,11 @@
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Path, status
+from fastapi import APIRouter, Depends, HTTPException, Path, status
 from sqlalchemy import select
 
 from api.deps import CurrentUser, DbSession
+from core.rate_limit import RateLimit
 from models.connection import Connection
 from schemas.translation import (
     BatchTranslationRequest,
@@ -19,6 +20,9 @@ from services import translation_service
 
 router = APIRouter(prefix="/translation", tags=["translation"])
 
+# Each call runs the translation model; one bucket shared by translate and batch.
+_translate_limit = Depends(RateLimit("translate", "RATE_LIMIT_TRANSLATE", per="user"))
+
 
 @router.get("/languages", response_model=list[LanguageInfo])
 async def get_supported_languages() -> list[LanguageInfo]:
@@ -26,7 +30,7 @@ async def get_supported_languages() -> list[LanguageInfo]:
     return translation_service.SUPPORTED_LANGUAGES
 
 
-@router.post("/translate", response_model=TranslationResponse)
+@router.post("/translate", response_model=TranslationResponse, dependencies=[_translate_limit])
 async def translate_text_endpoint(
     payload: TranslationRequest,
     current_user: CurrentUser,
@@ -39,7 +43,7 @@ async def translate_text_endpoint(
     )
 
 
-@router.post("/batch", response_model=BatchTranslationResponse)
+@router.post("/batch", response_model=BatchTranslationResponse, dependencies=[_translate_limit])
 async def batch_translate_endpoint(
     payload: BatchTranslationRequest,
     current_user: CurrentUser,
@@ -56,7 +60,11 @@ async def batch_translate_endpoint(
     return BatchTranslationResponse(translations=results)
 
 
-@router.post("/connections/{connection_id}/translate", response_model=TranslationResponse)
+@router.post(
+    "/connections/{connection_id}/translate",
+    response_model=TranslationResponse,
+    dependencies=[_translate_limit],
+)
 async def translate_connection_message(
     connection_id: Annotated[uuid.UUID, Path(description="Connection UUID")],
     payload: TranslationRequest,

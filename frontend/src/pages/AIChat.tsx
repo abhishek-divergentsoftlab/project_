@@ -632,7 +632,8 @@ export function AIChat() {
 
   async function handleSend(textToSend?: string) {
     const query = (textToSend ?? input).trim();
-    if (!query || loading) return;
+    // loadingRef, not only state: two Enter presses in one render tick both see loading === false.
+    if (!query || loading || loadingRef.current) return;
 
     const userMessage: MessageItem = {
       id: `user-${Date.now()}`,
@@ -684,7 +685,8 @@ export function AIChat() {
             setSearchParams({ c: chunk.conversation_id }, { replace: true });
           }
 
-          if (chunk.rfq_draft && (Object.keys(chunk.rfq_draft).length > 0 || (chunk.done && chunk.created_rfq))) {
+          // A final chunk is authoritative even when empty: "cancel" discards the draft and the panel must follow.
+          if (chunk.rfq_draft && (Object.keys(chunk.rfq_draft).length > 0 || chunk.done)) {
             currentRfqRef.current = chunk.rfq_draft;
             setCurrentRfq(chunk.rfq_draft);
           }

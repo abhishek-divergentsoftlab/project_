@@ -13,15 +13,26 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Annotated, Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
+from api.deps import CurrentUser
 from services.hsn_service import (
     HS_CHAPTERS,
-    _COMMON_HEADING_KEYWORDS,
-    classify_hsn_with_ai,
+    classify_shared,
+    confirm_learned,
+    vote_eligible,
     enrich_search_results,
-    normalize_hsn,
-    predict_hsn_from_text,
+    is_code_query,
+    is_plausible_query,
+    keyword_hint,
+    learned_get,
+    lexical_rows,
+    normalise_trade_text,
+    norm_query,
+    query_terms,
+    resolve_code,
+    validate_master,
+    warm_in_background,
 )
 
 logger = logging.getLogger(__name__)
@@ -35,7 +46,13 @@ DB_PATH = os.path.join(
 )
 
 
+_PIPE_HEADINGS = frozenset({"7303", "7304", "7305", "7306"})
+_PIPE_PROCESS_RE = re.compile(r"\b(?:seamless|welded|erw|hfw|saw|ssaw|lsaw|cdw|extruded|cast)\b")
+_db_validated = False
+
+
 def _get_db():
+    global _db_validated
     if not os.path.exists(DB_PATH):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -43,6 +60,9 @@ def _get_db():
         )
     conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    if not _db_validated:  # once per process: log rows whose chapter is not their code's first two digits
+        _db_validated = True
+        validate_master(conn)
     return conn
 
 
@@ -451,95 +471,75 @@ _POPULAR_COMMERCIAL_BRANDS: dict[str, tuple[str, str]] = {
 }
 
 
+
+_SYNONYMS: dict[str, str] = {
+    "cococola": "coca cola", "coco cola": "coca cola", "softdrink": "soft drink", "sunglass": "sunglasses",
+    "sun glasses": "sunglasses", "sun glass": "sunglasses", "laptopbag": "laptop bag", "tshirt": "t-shirt",
+    "smart phone": "smartphone", "cellphone": "mobile phone", "cell phone": "mobile phone",
+    "ear phones": "earphones", "ear phone": "earphones", "head phone": "headphones", "powerbank": "power bank",
+    "motor oil": "engine oil",
+}
+
+
 def _resolve_commercial_intent(text: str) -> tuple[Optional[str], Optional[str]]:
-    """Resolve consumer search phrases, brands, compound terms, and common typos into HSN codes."""
+    """A HINT for a phrase: brand / compound spelling variants / keyword-table heading. It is only one candidate
+    among several that the classifier weighs (it used to be the final answer, which let one word hijack a phrase)."""
     if not text:
         return None, None
-    clean_lower = text.strip().lower()
-
-    # 1. Normalization of colloquial typos and compound variants
-    synonyms: dict[str, str] = {
-        "cococola": "coca cola",
-        "coco cola": "coca cola",
-        "softdrink": "soft drink",
-        "sunglass": "sunglasses",
-        "sun glasses": "sunglasses",
-        "sun glass": "sunglasses",
-        "laptopbag": "laptop bag",
-        "tshirt": "t-shirt",
-        "smart phone": "smartphone",
-        "cellphone": "mobile phone",
-        "cell phone": "mobile phone",
-        "ear phones": "earphones",
-        "ear phone": "earphones",
-        "head phone": "headphones",
-        "powerbank": "power bank",
-        "motor oil": "engine oil",
-    }
-    for syn_k, syn_v in sorted(synonyms.items(), key=lambda x: len(x[0]), reverse=True):
+    clean_lower = normalise_trade_text(text.strip().lower())  # SS304 -> stainless steel, chawal -> rice
+    for syn_k, syn_v in sorted(_SYNONYMS.items(), key=lambda x: len(x[0]), reverse=True):
         clean_lower = re.sub(rf"\b{re.escape(syn_k)}\b", syn_v, clean_lower)
-
-    # 2. Exact or substring match in commercial brands dictionary
     for brand_key in sorted(_POPULAR_COMMERCIAL_BRANDS.keys(), key=len, reverse=True):
         if re.search(rf"\b{re.escape(brand_key)}\b", clean_lower):
             return _POPULAR_COMMERCIAL_BRANDS[brand_key]
-
-    # 3. Deterministic keyword table match
-    predicted = predict_hsn_from_text(clean_lower)
-    if predicted:
-        return predicted, f"Trade classification for '{text}'"
-
-    # 4. Typo tolerance: fuzzy match tokens / full query against brand and keyword keys
-    from difflib import get_close_matches
-
-    brand_keys = list(_POPULAR_COMMERCIAL_BRANDS.keys())
-    kw_keys = list(_COMMON_HEADING_KEYWORDS.keys())
-    candidates = [clean_lower] + [t for t in re.findall(r"[a-z0-9]+", clean_lower) if len(t) >= 4]
-    for cand in dict.fromkeys(candidates):
-        for key in get_close_matches(cand, brand_keys, n=1, cutoff=0.8):
-            return _POPULAR_COMMERCIAL_BRANDS[key][0], f"Closest match '{key}' for '{text}'"
-        for key in get_close_matches(cand, kw_keys, n=1, cutoff=0.8):
-            return _COMMON_HEADING_KEYWORDS[key], f"Closest match '{key}' for '{text}'"
-
+    kw = keyword_hint(clean_lower)
+    if kw:
+        return kw, f"Trade keyword for '{text}'"
     return None, None
 
 
-
 def format_title(code: str, desc: str, aliases: str = "", heading_desc: str = "") -> str:
-    """Format clean commercial trade title.
-
-    ``heading_desc`` (optional) is the parent 4-digit heading description, used when the
-    code's own description is a meaningless "Other".
-    """
+    """Display title from a bare description (used only when a row has no hierarchy title)."""
     c = code.strip()
     if c in _TRADE_TITLE_OVERRIDES:
         return _TRADE_TITLE_OVERRIDES[c]
-
-    _own = desc.split(":")[-1].strip(" :.-").lower() if desc else ""
-    if _own in ("", "other", "others") and len(c) > 4:
-        parent = _TRADE_TITLE_OVERRIDES.get(c[:4]) or (heading_desc or "").strip()
-        if parent:
-            if parent.isupper():
-                parent = parent.title()
-            return f"Other ({parent})"[:100]
-
-    # If heading matches override
-    if len(c) > 4 and c[:4] in _TRADE_TITLE_OVERRIDES:
-        parent_name = _TRADE_TITLE_OVERRIDES[c[:4]]
-        clean = desc.strip()
-        if ":" in clean:
-            clean = clean.split(":")[-1].strip()
-        if clean.isupper() and len(clean) > 3:
-            clean = clean.title()
-        if clean and clean.lower() not in parent_name.lower():
-            return f"{clean} ({parent_name})"
-
-    clean = desc.strip()
+    clean = (desc or "").strip()
     if ":" in clean:
         clean = clean.split(":")[-1].strip() or clean.replace(":", "")
     if clean.isupper() and len(clean) > 3:
         clean = clean.title()
     return clean[:100]
+
+
+_SEL = (
+    "c.code, c.description, c.level, c.chapter, c.heading, c.subheading, c.category, c.is_service, c.aliases, "
+    "c.is_group, c.title, c.path, c.parent, "
+    "EXISTS(SELECT 1 FROM hsn_codes s WHERE s.parent = c.code) AS has_kids"
+)
+
+
+def _title(r: sqlite3.Row) -> str:
+    """formatted_title: built from the hierarchy at build time (a fragment such as "Other" carries its parents)."""
+    if r["code"] in _TRADE_TITLE_OVERRIDES:
+        return _TRADE_TITLE_OVERRIDES[r["code"]]
+    return (r["title"] or format_title(r["code"], r["description"]))[:200]
+
+
+def _item(r: sqlite3.Row, aliases: Optional[str] = None) -> "HsnItemOut":
+    return HsnItemOut(
+        code=r["code"],
+        description=r["description"],
+        formatted_title=_title(r),
+        level=r["level"],
+        chapter=r["chapter"],
+        heading=r["heading"],
+        subheading=r["subheading"],
+        category=r["category"],
+        is_service=bool(r["is_service"]),
+        aliases=aliases if aliases is not None else (r["aliases"] or ""),
+        has_children=bool(r["has_kids"]),
+        path=r["path"] or None,
+    )
 
 
 class HsnItemOut(BaseModel):
@@ -554,12 +554,18 @@ class HsnItemOut(BaseModel):
     is_service: bool = False
     aliases: str = ""
     has_children: bool = False
+    path: Optional[str] = None
     # Search-only extras (optional, so every other endpoint keeps returning the same shape).
     display_title: Optional[str] = None
     context: Optional[str] = None
     parent_description: Optional[str] = None
     also_codes: Optional[list[str]] = None
     recommended: Optional[bool] = None
+
+
+class HsnAlternative(BaseModel):
+    code: str
+    title: str
 
 
 class HsnSuggestionOut(BaseModel):
@@ -569,158 +575,73 @@ class HsnSuggestionOut(BaseModel):
     category: str
     chapter: str
     chapter_name: str
-    confidence: str = "high"
+    confidence: str = "high"  # high | medium | low
     reason: Optional[str] = None
+    path: Optional[str] = None
+    source: Optional[str] = None  # code | cache | ai | lexical
+    # low confidence = a suggestion for the user to confirm, not an answer
+    needs_confirmation: bool = False
+    alternatives: list[HsnAlternative] = []
 
 
 @router.get("/suggest", response_model=Optional[HsnSuggestionOut])
 async def suggest_hsn_for_product(
     text: Annotated[str, Query(min_length=2, max_length=150)],
 ) -> Optional[HsnSuggestionOut]:
-    """Smart classification assistant: maps consumer products & brands (e.g. 'sun glasses', 'soft drink', 'cococola')
-    to standard HSN codes & categories using AI and semantic trade dictionaries."""
+    """Classification assistant: retrieves candidate tariff lines for a product phrase (full phrase, head noun,
+    learned cache), lets the AI choose among them with their full hierarchy, then validates the pick."""
     return await suggest_hsn(text)
 
 
 async def suggest_hsn(text: str, use_ai: bool = True) -> Optional[HsnSuggestionOut]:
     """Shared implementation of GET /hsn/suggest (also used by the AI chat).
 
-    ``use_ai=False`` skips the LLM fallback (used by the instant /hsn/search ranking).
-    """
-    clean = text.strip().lower()
+    ``use_ai=False`` skips the LLM (text matching only, always ``low`` confidence)."""
+    clean = (text or "").strip().lower()
     if not clean:
+        return None
+    code, reason = _resolve_commercial_intent(clean)
+    hints = [(code, reason or "")] if code else None
+    res = await classify_shared(clean, hints, use_ai=use_ai)
+    if not res.code:
         return None
 
     conn = _get_db()
-    cur = conn.cursor()
-    code: Optional[str] = None
-    reason: Optional[str] = None
-
     try:
-        # Step 1: Check known commercial intent, synonyms & deterministic trade keywords
-        code, reason = _resolve_commercial_intent(clean)
-
-        # Step 2: De-spaced exact compound phrase match in FTS (e.g. 'sun glasses' -> 'sunglasses')
-        # CRITICAL: Require c.level >= 4 so broad 2-digit chapters (e.g. Chapter 66) never intercept!
-        if not code:
-            despaced = clean.replace(" ", "")
-            if despaced != clean and len(despaced) > 3:
-                try:
-                    row = cur.execute(
-                        """
-                        SELECT c.code, c.description, c.category, c.chapter
-                        FROM hsn_codes c
-                        JOIN hsn_fts f ON c.rowid = f.rowid
-                        WHERE hsn_fts MATCH ? AND c.level >= 4
-                        ORDER BY c.level DESC
-                        LIMIT 1
-                        """,
-                        (f"{despaced}*",),
-                    ).fetchone()
-                    if row:
-                        code = row["code"]
-                        reason = f"Tariff commodity match for '{despaced}'"
-                except Exception as e:
-                    logger.debug("De-spaced FTS search error: %s", e)
-
-        # Step 3: AI LLM Classification fallback (Ollama)
-        if not code and use_ai:
-            try:
-                ai_code = await classify_hsn_with_ai(clean)
-                if ai_code:
-                    code = ai_code
-                    reason = f"AI classified '{clean}' into international customs nomenclature"
-            except Exception as e:
-                logger.debug("AI classification fallback failed: %s", e)
-
-        # Step 4: Strict token-level fallback: ALL tokens must match (AND) with level >= 4
-        if not code:
-            clean_alnum = re.sub(r"[^\w\s]", " ", clean).strip()
-            tokens = [t for t in clean_alnum.split() if len(t) > 2]
-            if len(tokens) >= 2:
-                token_query = " AND ".join(f"{t}*" for t in tokens[:3])
-                try:
-                    row = cur.execute(
-                        """
-                        SELECT c.code, c.description, c.category, c.chapter
-                        FROM hsn_codes c
-                        JOIN hsn_fts f ON c.rowid = f.rowid
-                        WHERE hsn_fts MATCH ? AND c.level >= 4
-                        ORDER BY c.level DESC
-                        LIMIT 1
-                        """,
-                        (token_query,),
-                    ).fetchone()
-                    if row:
-                        code = row["code"]
-                        reason = f"Tariff match for '{clean}'"
-                except Exception as e:
-                    logger.debug("Token fallback search error: %s", e)
-
-        if not code:
+        row = conn.execute(f"SELECT {_SEL} FROM hsn_codes c WHERE c.code = ? AND c.is_group = 0", (res.code,)).fetchone()
+        if row is None:
             return None
-
-        # Step 5: Fetch official database metadata for the code
-        norm_code = normalize_hsn(code) or code
-        row = cur.execute(
-            """
-            SELECT code, description, level, chapter, heading, subheading, category, is_service, aliases
-            FROM hsn_codes
-            WHERE code = ?
-            LIMIT 1
-            """,
-            (norm_code,),
-        ).fetchone()
-
-        # If not found directly, walk down prefixes (8 -> 6 -> 4)
-        if not row and len(norm_code) > 4:
-            for plen in (8, 6, 4):
-                if plen >= len(norm_code):
-                    continue
-                row = cur.execute(
-                    """
-                    SELECT code, description, level, chapter, heading, subheading, category, is_service, aliases
-                    FROM hsn_codes
-                    WHERE code = ?
-                    LIMIT 1
-                    """,
-                    (norm_code[:plen],),
-                ).fetchone()
-                if row:
-                    break
-
-        if not row:
-            return None
-
         ch_code = row["chapter"]
-        ch_name = HS_CHAPTERS.get(ch_code, row["category"])
-        head_row = cur.execute(
-            "SELECT description FROM hsn_codes WHERE code = ? LIMIT 1", (row["code"][:4],)
-        ).fetchone()
-        head_desc = head_row["description"] if head_row else ""
-
+        confidence, why = res.confidence, res.reason
+        if confidence == "high" and row["code"][:4] in _PIPE_HEADINGS and not _PIPE_PROCESS_RE.search(clean):
+            # 7304 (seamless) vs 7306 (welded) is a different tariff line and rate: do not claim certainty.
+            confidence = "medium"
+            why = f"{why}; seamless or welded is not stated, please confirm the pipe type"
+        if confidence == "low":
+            why = f"Unconfirmed suggestion, please check: {why}"
+        alts = []
+        if res.alternatives:
+            codes = [a["code"] for a in res.alternatives if a["code"] != row["code"]][:3]
+            if codes:
+                ph = ", ".join("?" for _ in codes)
+                titles = {r["code"]: r for r in conn.execute(f"SELECT {_SEL} FROM hsn_codes c WHERE c.code IN ({ph})", codes)}
+                alts = [HsnAlternative(code=c, title=_title(titles[c])) for c in codes if c in titles]
         return HsnSuggestionOut(
             code=row["code"],
             description=row["description"],
-            formatted_title=format_title(row["code"], row["description"], row["aliases"] or "", head_desc),
+            formatted_title=_title(row),
             category=row["category"],
             chapter=ch_code,
-            chapter_name=ch_name,
-            confidence="high" if reason and "AI" not in reason else "ai_suggested",
-            reason=reason,
+            chapter_name=HS_CHAPTERS.get(ch_code, row["category"]),
+            confidence=confidence,
+            reason=why,
+            path=row["path"] or None,
+            source=res.source,
+            needs_confirmation=confidence == "low",
+            alternatives=alts,
         )
     finally:
         conn.close()
-
-
-def _run_sync(coro):
-    """Run a coroutine from sync code, also when an event loop is already running in this thread."""
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(coro)
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(asyncio.run, coro).result()
 
 
 def _enrich_text_search(
@@ -741,12 +662,6 @@ def _enrich_text_search(
         ).fetchall()
     } if prefixes else {}
     try:
-        if suggested is None:
-            sug = _run_sync(suggest_hsn(query, use_ai=False))
-            suggested = sug.code if sug else None
-    except Exception as e:  # ranking is best-effort, never break the search
-        logger.debug("HSN search recommendation failed: %s", e)
-    try:
         enriched = enrich_search_results(rows, descriptions, query, suggested)
     except Exception as e:
         logger.warning("HSN search enrichment failed, returning plain results: %s", e)
@@ -754,147 +669,162 @@ def _enrich_text_search(
     return [HsnItemOut(**r) for r in enriched]
 
 
-@router.get("/search", response_model=list[HsnItemOut])
+def _fetch_items(cur: sqlite3.Cursor, codes: list[str], aliases: Optional[dict[str, str]] = None) -> list[HsnItemOut]:
+    """Items for ``codes`` in the given order; unknown codes and group rows are dropped."""
+    if not codes:
+        return []
+    ph = ", ".join("?" for _ in codes)
+    by_code = {r["code"]: r for r in cur.execute(f"SELECT {_SEL} FROM hsn_codes c WHERE c.code IN ({ph}) AND c.is_group = 0", codes)}
+    return [_item(by_code[c], (aliases or {}).get(c)) for c in codes if c in by_code]
+
+
+def _flatten_children(cur: sqlite3.Cursor, parent: str, limit: int) -> list[sqlite3.Row]:
+    """Direct children of ``parent`` with group rows looked through (their children are listed instead)."""
+    return cur.execute(
+        f"""
+        WITH RECURSIVE d(code, grp) AS (
+            SELECT code, is_group FROM hsn_codes WHERE parent = ?
+            UNION ALL
+            SELECT c.code, c.is_group FROM hsn_codes c JOIN d ON c.parent = d.code WHERE d.grp = 1
+        )
+        SELECT {_SEL} FROM hsn_codes c WHERE c.code IN (SELECT code FROM d WHERE grp = 0)
+        ORDER BY c.code ASC LIMIT ?
+        """,
+        (parent, limit),
+    ).fetchall()
+
+
+def _search_impl(q: str, limit: int) -> tuple[list[HsnItemOut], bool]:
+    """The synchronous search: (items, weak) where ``weak`` means text matching found nothing usable on its own
+    (the caller may warm the learned cache in the background). Never calls the model."""
+    clean = q.strip().replace("'", "").replace('"', "")
+    if not clean:
+        return [], False
+    conn = _get_db()
+    cur = conn.cursor()
+    try:
+        # Code browsing only for a query that IS a code ("0304", "0304 10", "7306.30").
+        if is_code_query(clean):
+            digits = "".join(c for c in clean if c.isdigit())
+            rows = cur.execute(
+                f"SELECT {_SEL} FROM hsn_codes c WHERE c.code LIKE ? AND c.is_group = 0 "
+                "ORDER BY c.level ASC, c.code ASC LIMIT ?",
+                (digits + "%", limit),
+            ).fetchall()
+            if len(digits) in (5, 7, 8):  # a group row itself is not selectable: show the lines under it
+                exact = cur.execute("SELECT code FROM hsn_codes WHERE code = ? AND is_group = 1", (digits,)).fetchone()
+                if exact:
+                    rows = _flatten_children(cur, digits, limit)
+            items = [_item(r) for r in rows]
+            for it in items:
+                it.display_title = it.formatted_title
+            return items, False
+        if not is_plausible_query(clean):
+            return [], False
+
+        key = norm_query(clean)
+        terms = query_terms(key) or query_terms(clean)
+        ordered: list[str] = []
+        alias_note: dict[str, str] = {}
+
+        def add(codes: list[str]) -> None:
+            for c in codes:
+                if c not in ordered:
+                    ordered.append(c)
+
+        cached = learned_get(key)
+        suggested = cached["code"] if cached and cached.get("code") else None
+        if suggested:
+            add([suggested])
+        # The lexicon (synchronous, no model call) knows many Indian trade names: search its English name too.
+        lex_phrase: list[str] = []
+        try:
+            from services import ai_lexicon
+
+            canon = ai_lexicon.canonical(clean)
+            if canon and canon.strip().lower() != clean.lower():
+                lex_phrase = [r["code"] for r in lexical_rows(query_terms(canon), limit, prefix_last=True)]
+            lt = ai_lexicon.term(clean)
+            lex_hsn = resolve_code(lt.hsn) if lt is not None and lt.hsn else None
+            if lex_hsn and not suggested:
+                add([lex_hsn])
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("lexicon lookup failed: %s", exc)
+        phrase = [r["code"] for r in lexical_rows(terms, limit * 2, prefix_last=True)]
+        phrase = list(dict.fromkeys(lex_phrase + phrase))
+        # rows whose own title is the query rank first, then rows that start with it, then the rest (bm25 order)
+        qn = " ".join(terms)
+        if phrase:
+            ph = ", ".join("?" for _ in phrase)
+            meta = {r["code"]: (r["label"] or "", r["path"] or "") for r in cur.execute(f"SELECT code, label, path FROM hsn_codes WHERE code IN ({ph})", phrase)}
+            titles = {c: m[0].lower() for c, m in meta.items()}
+            qwords = set(terms)
+            def tier(c: str) -> tuple[int, int]:
+                t = re.sub(r"[^\w\s]", " ", titles.get(c, "")).split()
+                t = " ".join(_stem_word(w) for w in t)
+                qs = " ".join(_stem_word(w) for w in terms)
+                # unless the query names a processed form, the unprocessed line is the likelier one
+                processed = {w for w in _PROCESSED_WORDS if w in meta[c][1].lower()} - qwords
+                return (0 if t == qs else 1 if t.startswith(qs) else 2, 1 if processed else 0)
+            phrase.sort(key=tier)  # stable: keeps bm25 order inside a tier
+        add(phrase)
+        hint_code, hint_reason = _resolve_commercial_intent(clean)
+        if hint_code and len(hint_code) in (4, 6, 8):
+            kids = [r["code"] for r in cur.execute(
+                "SELECT code FROM hsn_codes WHERE code LIKE ? AND is_group = 0 ORDER BY level ASC, code ASC LIMIT 12",
+                (hint_code + "%",))]
+            add(kids)
+            if hint_reason:
+                for c in kids:
+                    alias_note[c] = f"Trade match: {clean} ({hint_reason})"
+        weak = not phrase and not suggested
+        items = _fetch_items(cur, ordered[:limit], alias_note)
+        return _enrich_text_search(cur, items, qn or key, suggested=suggested), weak
+    finally:
+        conn.close()
+
+
+_PROCESSED_WORDS = ("dried", "dehydrated", "powder", "flour", "prepared", "preserved", "frozen", "extract", "oil", "seeds", "waste", "roasted", "juice", "sauce", "paste")
+
+
+def _stem_word(w: str) -> str:
+    return w[:-1] if len(w) > 3 and w.endswith("s") and not w.endswith("ss") else w
+
+
 def search_hsn(
     q: Annotated[str, Query(min_length=1, max_length=100)],
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
 ) -> list[HsnItemOut]:
-    """Instant search across all 22,616 HSN/SAC codes, descriptions, and commercial trade terms."""
-    clean = q.strip().replace("'", "").replace('"', "")
-    if not clean:
-        return []
+    """Instant search across all HSN/SAC codes, descriptions and the learned cache (sync; no model call)."""
+    return _search_impl(q, limit)[0]
 
-    conn = _get_db()
-    cur = conn.cursor()
-    digits = "".join(c for c in clean if c.isdigit())
-    clean_lower = clean.lower()
 
-    try:
-        # Step 1: Check known commercial intent (e.g. 'sun glasses', 'soft drink', 'cococola', 'sneakers')
-        matched_brand_code, matched_brand_reason = _resolve_commercial_intent(clean_lower)
+@router.get("/search", response_model=list[HsnItemOut])
+async def search_hsn_endpoint(
+    q: Annotated[str, Query(min_length=1, max_length=100)],
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+) -> list[HsnItemOut]:
+    """Instant search over descriptions, hierarchy and learned results. Never waits for the model; when the text
+    matches nothing it starts a background classification so the next search for the phrase is meaningful."""
+    items, weak = _search_impl(q, limit)
+    if weak:
+        try:
+            warm_in_background(q)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("HSN warm-up not started: %s", exc)
+    return items
 
-        if matched_brand_code:
-            norm_code = normalize_hsn(matched_brand_code) or matched_brand_code
-            # Also include any directly related complementary codes (e.g. if searching sunglasses, include raw glass blanks 70159020)
-            extra_codes = []
-            if norm_code.startswith("9004"):
-                extra_codes = ["70159020"]
-            elif norm_code == "70159020":
-                extra_codes = ["90041000"]
 
-            placeholders = ", ".join("?" for _ in [norm_code, *extra_codes])
-            rows = cur.execute(
-                f"""
-                SELECT c.code, c.description, c.level, c.chapter, c.heading, c.subheading, c.category, c.is_service, c.aliases,
-                       (SELECT count(*) FROM hsn_codes sub WHERE sub.code LIKE c.code || "%" AND sub.code != c.code LIMIT 1) as child_cnt
-                FROM hsn_codes c
-                WHERE c.code IN ({placeholders}) OR c.code LIKE ? OR c.heading = ?
-                ORDER BY (c.code = ?) DESC, (c.code IN ({placeholders})) DESC, c.level ASC, c.code ASC
-                LIMIT ?
-                """,
-                (*[norm_code, *extra_codes], norm_code + "%", norm_code[:4], norm_code, *[norm_code, *extra_codes], limit),
-            ).fetchall()
+class HsnConfirmIn(BaseModel):
+    text: Annotated[str, Field(min_length=2, max_length=150)]
+    code: Annotated[str, Field(min_length=4, max_length=8)]
 
-            items = [
-                HsnItemOut(
-                    code=r["code"],
-                    description=r["description"],
-                    formatted_title=format_title(r["code"], r["description"], r["aliases"]),
-                    level=r["level"],
-                    chapter=r["chapter"],
-                    heading=r["heading"],
-                    subheading=r["subheading"],
-                    category=r["category"],
-                    is_service=bool(r["is_service"]),
-                    aliases=f"Trade match: {clean} ({matched_brand_reason})" if matched_brand_reason else (r["aliases"] or ""),
-                    has_children=bool(r["child_cnt"] > 0),
-                )
-                for r in rows
-            ]
-            return _enrich_text_search(cur, items, clean_lower, suggested=norm_code)
 
-        # Step 2: Code prefix match if query is numeric digits
-        if len(digits) >= 2:
-            rows = cur.execute(
-                """
-                SELECT c.code, c.description, c.level, c.chapter, c.heading, c.subheading, c.category, c.is_service, c.aliases,
-                       (SELECT count(*) FROM hsn_codes sub WHERE sub.code LIKE c.code || "%" AND sub.code != c.code LIMIT 1) as child_cnt
-                FROM hsn_codes c
-                WHERE c.code LIKE ?
-                ORDER BY c.level ASC, c.code ASC
-                LIMIT ?
-                """,
-                (digits + "%", limit),
-            ).fetchall()
-        else:
-            # Step 3: Full text search over descriptions and aliases with compound de-spacing
-            despaced = clean.replace(" ", "")
-            if despaced != clean and len(despaced) > 3:
-                fts_query = f'"{clean}"* OR {despaced}*'
-            else:
-                fts_query = f"{clean}*"
-
-            try:
-                rows = cur.execute(
-                    """
-                    SELECT c.code, c.description, c.level, c.chapter, c.heading, c.subheading, c.category, c.is_service, c.aliases,
-                           (SELECT count(*) FROM hsn_codes sub WHERE sub.code LIKE c.code || "%" AND sub.code != c.code LIMIT 1) as child_cnt
-                    FROM hsn_codes c
-                    JOIN hsn_fts f ON c.rowid = f.rowid
-                    WHERE hsn_fts MATCH ?
-                    ORDER BY (c.level >= 4) DESC, c.level ASC
-                    LIMIT ?
-                    """,
-                    (fts_query, limit),
-                ).fetchall()
-            except Exception:
-                rows = []
-
-            # Step 4: Token-level fallback if full phrase gave 0 results (using strict AND with level >= 4)
-            if not rows:
-                clean_alnum = re.sub(r"[^\w\s]", " ", clean).strip()
-                tokens = [t for t in clean_alnum.split() if len(t) > 2]
-                if tokens:
-                    token_query = " AND ".join(f"{t}*" for t in tokens[:3])
-                    try:
-                        rows = cur.execute(
-                            """
-                            SELECT c.code, c.description, c.level, c.chapter, c.heading, c.subheading, c.category, c.is_service, c.aliases,
-                                   (SELECT count(*) FROM hsn_codes sub WHERE sub.code LIKE c.code || "%" AND sub.code != c.code LIMIT 1) as child_cnt
-                            FROM hsn_codes c
-                            JOIN hsn_fts f ON c.rowid = f.rowid
-                            WHERE hsn_fts MATCH ? AND c.level >= 4
-                            ORDER BY c.level DESC
-                            LIMIT ?
-                            """,
-                            (token_query, limit),
-                        ).fetchall()
-                    except Exception:
-                        rows = []
-
-        items = [
-            HsnItemOut(
-                code=r["code"],
-                description=r["description"],
-                formatted_title=format_title(r["code"], r["description"], r["aliases"]),
-                level=r["level"],
-                chapter=r["chapter"],
-                heading=r["heading"],
-                subheading=r["subheading"],
-                category=r["category"],
-                is_service=bool(r["is_service"]),
-                aliases=r["aliases"] or "",
-                has_children=bool(r["child_cnt"] > 0),
-            )
-            for r in rows
-        ]
-        if len(digits) >= 2:  # code browsing: keep the plain level-by-level listing
-            for it in items:
-                it.display_title = it.formatted_title
-            return items
-        return _enrich_text_search(cur, items, clean_lower)
-    finally:
-        conn.close()
+@router.post("/confirm")
+async def confirm_hsn_choice(body: HsnConfirmIn, user: CurrentUser) -> dict[str, Any]:
+    """The user picked ``code`` for ``text``. This is one VOTE (one per user per phrase), not a global answer: it
+    becomes a high-confidence result only with enough distinct established accounts and no model contradiction."""
+    return await confirm_learned(body.text, body.code, user.id, eligible=vote_eligible(user))
 
 
 @router.get("/children", response_model=list[HsnItemOut])
@@ -902,97 +832,12 @@ def get_hsn_children(
     parent: Annotated[str, Query(min_length=2, max_length=8)],
     limit: Annotated[int, Query(ge=1, le=200)] = 100,
 ) -> list[HsnItemOut]:
-    """Fetch direct children for a chapter (2 digits), heading (4 digits), or subheading (6 digits)."""
+    """Direct children of a chapter, heading, subheading or tariff line (group rows are looked through)."""
     p = parent.strip()
     conn = _get_db()
     cur = conn.cursor()
-
     try:
-        if len(p) == 2:
-            # Headings under chapter (4 digits)
-            rows = cur.execute(
-                """
-                SELECT c.code, c.description, c.level, c.chapter, c.heading, c.subheading, c.category, c.is_service, c.aliases,
-                       (SELECT count(*) FROM hsn_codes sub WHERE sub.heading = c.code AND sub.level > 4 LIMIT 1) as child_cnt
-                FROM hsn_codes c
-                WHERE c.chapter = ? AND c.level = 4
-                ORDER BY c.code ASC
-                LIMIT ?
-                """,
-                (p, limit),
-            ).fetchall()
-        elif len(p) == 4:
-            # Subheadings (6 digits) or direct tariff items (8 digits)
-            l6_count = cur.execute(
-                "SELECT count(*) FROM hsn_codes WHERE heading = ? AND level = 6", (p,)
-            ).fetchone()[0]
-
-            if l6_count > 0:
-                rows = cur.execute(
-                    """
-                    SELECT c.code, c.description, c.level, c.chapter, c.heading, c.subheading, c.category, c.is_service, c.aliases,
-                           (SELECT count(*) FROM hsn_codes sub WHERE sub.code LIKE c.code || "%" AND sub.level = 8 LIMIT 1) as child_cnt
-                    FROM hsn_codes c
-                    WHERE c.heading = ? AND c.level = 6
-                    ORDER BY c.code ASC
-                    LIMIT ?
-                    """,
-                    (p, limit),
-                ).fetchall()
-            else:
-                rows = cur.execute(
-                    """
-                    SELECT c.code, c.description, c.level, c.chapter, c.heading, c.subheading, c.category, c.is_service, c.aliases,
-                           0 as child_cnt
-                    FROM hsn_codes c
-                    WHERE c.heading = ? AND c.level = 8
-                    ORDER BY c.code ASC
-                    LIMIT ?
-                    """,
-                    (p, limit),
-                ).fetchall()
-        elif len(p) == 6:
-            # 8-digit tariff items under 6-digit subheading
-            rows = cur.execute(
-                """
-                SELECT c.code, c.description, c.level, c.chapter, c.heading, c.subheading, c.category, c.is_service, c.aliases,
-                       0 as child_cnt
-                FROM hsn_codes c
-                WHERE c.code LIKE ? AND c.level = 8
-                ORDER BY c.code ASC
-                LIMIT ?
-                """,
-                (p + "%", limit),
-            ).fetchall()
-        else:
-            rows = cur.execute(
-                """
-                SELECT c.code, c.description, c.level, c.chapter, c.heading, c.subheading, c.category, c.is_service, c.aliases,
-                       0 as child_cnt
-                FROM hsn_codes c
-                WHERE c.code LIKE ? AND c.code != ?
-                ORDER BY c.level ASC, c.code ASC
-                LIMIT ?
-                """,
-                (p + "%", p, limit),
-            ).fetchall()
-
-        return [
-            HsnItemOut(
-                code=r["code"],
-                description=r["description"],
-                formatted_title=format_title(r["code"], r["description"], r["aliases"]),
-                level=r["level"],
-                chapter=r["chapter"],
-                heading=r["heading"],
-                subheading=r["subheading"],
-                category=r["category"],
-                is_service=bool(r["is_service"]),
-                aliases=r["aliases"] or "",
-                has_children=bool(r["child_cnt"] > 0),
-            )
-            for r in rows
-        ]
+        return [_item(r) for r in _flatten_children(cur, p, limit)]
     finally:
         conn.close()
 
@@ -1006,7 +851,7 @@ def get_hsn_categories() -> list[dict[str, Any]]:
         rows = cur.execute(
             """
             SELECT c.chapter, c.category, c.description,
-                   (SELECT count(*) FROM hsn_codes total WHERE total.chapter = c.chapter) as item_count
+                   (SELECT count(*) FROM hsn_codes total WHERE total.chapter = c.chapter AND total.is_group = 0) as item_count
             FROM hsn_codes c
             WHERE c.level = 2
             ORDER BY c.chapter ASC
@@ -1015,15 +860,9 @@ def get_hsn_categories() -> list[dict[str, Any]]:
 
         categories_map: dict[str, list[dict[str, Any]]] = {}
         for r in rows:
-            cat = r["category"]
-            categories_map.setdefault(cat, []).append(
-                {
-                    "chapter": r["chapter"],
-                    "description": r["description"],
-                    "total_items": r["item_count"],
-                }
+            categories_map.setdefault(r["category"], []).append(
+                {"chapter": r["chapter"], "description": r["description"], "total_items": r["item_count"]}
             )
-
         return [
             {
                 "category": cat,
@@ -1051,36 +890,10 @@ def get_hsn_by_code(code: str) -> HsnItemOut:
 
 
 def lookup_hsn_item(c: str) -> Optional[HsnItemOut]:
-    """Shared implementation of GET /hsn/code/{code}; None when the code is unknown."""
+    """Shared implementation of GET /hsn/code/{code}; None when the code is unknown or only a group row."""
     conn = _get_db()
-    cur = conn.cursor()
     try:
-        row = cur.execute(
-            """
-            SELECT c.code, c.description, c.level, c.chapter, c.heading, c.subheading, c.category, c.is_service, c.aliases,
-                   (SELECT count(*) FROM hsn_codes sub WHERE sub.code LIKE c.code || "%" AND sub.code != c.code LIMIT 1) as child_cnt
-            FROM hsn_codes c
-            WHERE c.code = ?
-            LIMIT 1
-            """,
-            (c,),
-        ).fetchone()
-
-        if not row:
-            return None
-
-        return HsnItemOut(
-            code=row["code"],
-            description=row["description"],
-            formatted_title=format_title(row["code"], row["description"], row["aliases"]),
-            level=row["level"],
-            chapter=row["chapter"],
-            heading=row["heading"],
-            subheading=row["subheading"],
-            category=row["category"],
-            is_service=bool(row["is_service"]),
-            aliases=row["aliases"] or "",
-            has_children=bool(row["child_cnt"] > 0),
-        )
+        row = conn.execute(f"SELECT {_SEL} FROM hsn_codes c WHERE c.code = ? AND c.is_group = 0 LIMIT 1", (c,)).fetchone()
+        return _item(row) if row else None
     finally:
         conn.close()

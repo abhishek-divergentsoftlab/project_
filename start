@@ -31,7 +31,86 @@ else
     echo -e "${YELLOW}[!] Docker not found or docker-compose.yml missing. Skipping containers.${NC}"
 fi
 
-# 2. Backend Service (Port 8011)
+# 2. vLLM Inference Engine (Port 8001)
+VLLM_PID_FILE="$PROJECT_DIR/.pids/vllm.pid"
+VLLM_RUNNING=false
+
+if [ -f "$VLLM_PID_FILE" ] && kill -0 "$(cat "$VLLM_PID_FILE")" 2>/dev/null; then
+    VLLM_RUNNING=true
+elif lsof -ti :8001 &>/dev/null; then
+    VLLM_RUNNING=true
+fi
+
+RUN_VLLM=false
+if grep -q "^LLM_PROVIDER=vllm" "$PROJECT_DIR/backend/.env" 2>/dev/null; then
+    RUN_VLLM=true
+fi
+
+if [ "$RUN_VLLM" = true ]; then
+    if [ "$VLLM_RUNNING" = true ]; then
+        echo -e "${GREEN}[✓] vLLM engine is already running on port 8001.${NC}"
+    else
+        VLLM_BIN="/home/divergent/miniconda3/bin/vllm"
+        if [ -x "$VLLM_BIN" ]; then
+            echo -e "${YELLOW}[*] Starting vLLM engine on http://127.0.0.1:8001 (GPU acceleration)...${NC}"
+            VLLM_LOG="$PROJECT_DIR/.logs/vllm.log"
+            echo "===== vllm start $(date '+%Y-%m-%d %H:%M:%S') =====" >> "$VLLM_LOG"
+            (
+                export PYTHONOPTIMIZE=1
+                export HF_HUB_OFFLINE=1
+                export VLLM_NO_USAGE_STATS=1
+                nohup "$VLLM_BIN" serve Qwen/Qwen3-8B \
+                    --host 127.0.0.1 \
+                    --port 8001 \
+                    --gpu-memory-utilization 0.15 \
+                    --max-model-len 8192 \
+                    --enforce-eager >> "$VLLM_LOG" 2>&1 &
+                echo $! > "$VLLM_PID_FILE"
+            )
+            echo -e "${GREEN}[✓] vLLM service started in background (PID: $(cat "$VLLM_PID_FILE")).${NC}"
+        else
+            echo -e "${YELLOW}[!] vLLM binary not found at $VLLM_BIN. Backend will use Ollama fallback.${NC}"
+        fi
+    fi
+else
+    CHAT_MODEL="$(grep -E '^AI_CHAT_MODEL=' "$PROJECT_DIR/backend/.env" 2>/dev/null | cut -d= -f2- | tr -d '"'"'"' ')"
+    CHAT_MODEL="${CHAT_MODEL:-gpt-oss:120b}"
+    echo -e "${GREEN}[✓] AI Chat configured to use Ollama with ${CHAT_MODEL} (vLLM idle).${NC}"
+fi
+
+# 2b. Ollama GPU guard: make sure the chat model is fully on the GPU (not split onto the CPU by a full page cache).
+# Runs in the background (a cold load takes 20-45 s) and only when Ollama answers.
+if ! grep -q "^LLM_PROVIDER=vllm" "$PROJECT_DIR/backend/.env" 2>/dev/null; then
+    OLLAMA_URL="$(grep -E '^OLLAMA_BASE_URL=' "$PROJECT_DIR/backend/.env" 2>/dev/null | cut -d= -f2- | tr -d '"'"'"' ')"
+    OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
+    OLLAMA_UP=false
+    for _ in 1 2 3 4 5; do
+        if curl -fs -m 2 "$OLLAMA_URL/api/version" >/dev/null 2>&1; then OLLAMA_UP=true; break; fi
+        sleep 1
+    done
+    if [ "$OLLAMA_UP" = true ] && [ -x "$PROJECT_DIR/backend/.venv/bin/python" ]; then
+        echo -e "${YELLOW}[*] Checking the chat model is fully on the GPU (background)...${NC}"
+        (
+            cd "$PROJECT_DIR/backend"
+            nohup .venv/bin/python scripts/ollama_gpu_guard.py >> "$PROJECT_DIR/.logs/gpu_guard.log" 2>&1 &
+        )
+        echo -e "${GREEN}[✓] GPU guard running; result in .logs/gpu_guard.log${NC}"
+    else
+        echo -e "${YELLOW}[!] Ollama not reachable at $OLLAMA_URL; skipping GPU guard.${NC}"
+    fi
+fi
+
+# 2c. HSN master: backend/data is git-ignored, so (re)build it when missing or still on the pre-hierarchy schema.
+HSN_DB="$PROJECT_DIR/backend/data/hsn_master.db"
+if [ -x "$PROJECT_DIR/backend/.venv/bin/python" ] && [ -f "$PROJECT_DIR/HSN_SAC.xlsx" ] && \
+   ! "$PROJECT_DIR/backend/.venv/bin/python" -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); sys.exit(0 if any(r[1]=='is_group' for r in c.execute('pragma table_info(hsn_codes)')) else 1)" "$HSN_DB" 2>/dev/null; then
+    echo -e "${YELLOW}[*] Building the HSN master database (missing or old schema)...${NC}"
+    (cd "$PROJECT_DIR/backend" && .venv/bin/python scripts/build_hsn_database.py > "$PROJECT_DIR/.logs/hsn_build.log" 2>&1) \
+        && echo -e "${GREEN}[✓] HSN master built.${NC}" \
+        || echo -e "${RED}[!] HSN build failed; see .logs/hsn_build.log${NC}"
+fi
+
+# 3. Backend Service (Port 8011)
 BACKEND_PID_FILE="$PROJECT_DIR/.pids/backend.pid"
 BACKEND_RUNNING=false
 
@@ -69,7 +148,11 @@ else
 
     (
         cd "$PROJECT_DIR/backend"
-        nohup "$VENV_UVICORN" app:app --reload --port 8011 >> "$BACKEND_LOG" 2>&1 &
+        # X-Forwarded-For is honoured only from the addresses in FORWARDED_ALLOW_IPS (comma
+        # separated reverse-proxy IPs). Empty (default) trusts nobody, so a client cannot
+        # spoof its address to dodge the rate limits.
+        nohup "$VENV_UVICORN" app:app --reload --port 8011 \
+            --forwarded-allow-ips "${FORWARDED_ALLOW_IPS:-}" >> "$BACKEND_LOG" 2>&1 &
         echo $! > "$BACKEND_PID_FILE"
     )
     echo -e "${GREEN}[✓] Backend service started (PID: $(cat "$BACKEND_PID_FILE")).${NC}"
@@ -111,6 +194,7 @@ echo -e "${GREEN}        Services Started & Ready to Use!            ${NC}"
 echo -e "${BLUE}====================================================${NC}"
 echo -e "  Frontend URL:     ${GREEN}http://localhost:5175${NC}"
 echo -e "  Backend API:      ${GREEN}http://127.0.0.1:8011${NC}"
+echo -e "  vLLM Engine:      ${GREEN}http://127.0.0.1:8001/v1${NC}"
 echo -e "  API Docs (Swagger):${GREEN}http://127.0.0.1:8011/docs${NC}"
 echo -e "  API Health Check: ${GREEN}http://127.0.0.1:8011/api/v1/health${NC}"
 echo -e "  Backend Log:      $PROJECT_DIR/.logs/backend.log"

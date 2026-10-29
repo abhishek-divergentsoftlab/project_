@@ -4,9 +4,10 @@ import uuid
 from datetime import datetime
 from typing import Any, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
 from models.enums import KYCStatus, RFQRole
+from schemas.rfq import public_product_details
 from schemas.common import DeadlineOut, Location, Money, Quantity
 
 
@@ -53,6 +54,10 @@ class CatalogItemOut(BaseModel):
     counterparty: CatalogCounterpartyOut
     distance_km: Optional[float] = None
     is_saved: bool = False
+
+    @field_serializer("product_details")
+    def _hide_internal_details(self, value: dict[str, Any]) -> dict[str, Any]:
+        return public_product_details(value)
 
 
 class CatalogListOut(BaseModel):

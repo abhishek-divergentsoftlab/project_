@@ -32,6 +32,18 @@ _DIMENSION_ORDER = (
 )
 
 
+def _internal(key: Any) -> bool:
+    """Reserved bookkeeping keys ("_canon", "_negated") are never rendered, tagged or embedded."""
+    return str(key).startswith("_")
+
+
+def canonical_product(details: dict[str, Any]) -> str | None:
+    """The canonical English trade term the AI canonicalizer stored for the product (``_canon.product``)."""
+    canon = details.get("_canon")
+    term = canon.get("product") if isinstance(canon, dict) else None
+    return term.strip() if isinstance(term, str) and term.strip() else None
+
+
 def _humanise_key(key: str) -> str:
     return key.replace("_", " ").replace("-", " ").strip().title()
 
@@ -117,6 +129,9 @@ def build_search_text(rfq: RFQ) -> str:
 
     name = _product_name(details)
     lines.append(f"Product: {name}" if name else f"Product: {rfq.title}")
+    canonical = canonical_product(details)
+    if canonical and canonical.lower() not in (name or "").lower():
+        lines.append(f"Also known as: {canonical}")
 
     if rfq.quantity_value is not None:
         unit = rfq.quantity_unit or "units"
@@ -142,7 +157,7 @@ def build_search_text(rfq: RFQ) -> str:
     attributes = [
         (key, value)
         for key, value in sorted(details.items())
-        if key not in _NAME_KEYS and not key.endswith(_MUST_MATCH_SUFFIX)
+        if key not in _NAME_KEYS and not key.endswith(_MUST_MATCH_SUFFIX) and not _internal(key)
         and value is not None and value != ""
     ]
     if attributes:
@@ -171,9 +186,12 @@ def build_match_text(rfq: RFQ) -> str:
     """
     details = rfq.product_details or {}
     parts: list[str] = [rfq.category, _product_name(details) or "", rfq.title]
+    canonical = canonical_product(details)
+    if canonical and canonical.lower() not in " ".join(parts).lower():
+        parts.append(canonical)
 
     for key, value in sorted(details.items()):
-        if key in _NAME_KEYS or key.endswith(_MUST_MATCH_SUFFIX) or value is None or value == "":
+        if key in _NAME_KEYS or key.endswith(_MUST_MATCH_SUFFIX) or _internal(key) or value is None or value == "":
             continue
         if isinstance(value, bool):
             parts.append(_humanise_key(key) if value else f"not {_humanise_key(key)}")
@@ -203,10 +221,13 @@ def build_search_tags(rfq: RFQ) -> list[str]:
     name = _product_name(details)
     if name:
         add(name)
+    canonical = canonical_product(details)
+    if canonical:
+        add(canonical)
     add(rfq.category)
 
     for key, value in sorted(details.items()):
-        if key in _NAME_KEYS or key.endswith(_MUST_MATCH_SUFFIX) or value is None or value == "":
+        if key in _NAME_KEYS or key.endswith(_MUST_MATCH_SUFFIX) or _internal(key) or value is None or value == "":
             continue
         if isinstance(value, bool):
             add(_humanise_key(key) if value else f"not {_humanise_key(key)}")

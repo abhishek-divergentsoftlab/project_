@@ -12,15 +12,22 @@ Includes advanced normalization against character spacing, leetspeak, invisible 
 and punctuation-based filter evasions.
 """
 
+import json
+import logging
 import re
+import time
 import unicodedata
 import uuid
+from pathlib import Path
 from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.moderation import ModerationLog
 from schemas.moderation import ModerationCheckResult
+from services import answer_verifier
+
+logger = logging.getLogger(__name__)
 
 # Safe industrial compound phrases containing "gun" that should NOT be blocked
 INDUSTRIAL_GUN_EXEMPTIONS = {
@@ -211,7 +218,21 @@ PROHIBITED_CATEGORIES: dict[str, list[re.Pattern]] = {
     ],
 }
 
+# Text that talks to the platform's AI instead of describing goods, or moves payment off the platform. The assistant
+# reads listing titles and descriptions as data, but a listing like this is held anyway: it only exists to mislead.
+INJECTION_CATEGORY = "ai_instructions_or_offplatform_payment"
+_INJECTION_PATTERNS = [
+    re.compile(r"\bnotes?\s+(?:to|for)\s+(?:the\s+)?(?:ai|a\.i\.|assistant|llm|chat\s?bot|bot|model)\b", re.I),
+    re.compile(r"\b(?:assistant|chatbot)\s*:", re.I),
+    re.compile(r"\bignore\s+(?:all\s+|any\s+)?(?:the\s+)?(?:previous|prior|above|earlier|your)?\s*(?:instructions?|prompts?|rules)\b", re.I),
+    re.compile(r"\bdisregard\s+(?:all\s+|any\s+)?(?:the\s+)?(?:previous|prior|above|earlier|your)\s+(?:instructions?|prompts?|rules)\b", re.I),
+    re.compile(r"\bsystem\s+prompt\b", re.I),
+    re.compile(r"\b(?:tell|instruct|advise|ask)\s+(?:the\s+)?(?:buyers?|users?|customers?|clients?)\s+to\s+pay\b", re.I),
+    re.compile(r"\balways\s+(?:tell|say|reply|answer|recommend)\b[^.\n]{0,40}\b(?:buyers?|users?|pay)\b", re.I),
+]
+
 CATEGORY_DESCRIPTIONS = {
+    INJECTION_CATEGORY: "Instructions to the platform's AI assistant or off-platform payment instructions",
     "child_exploitation_and_minors": "Child Sexual Exploitation, Underage Abuse & Minor Trafficking",
     "firearms_and_weapons": "Firearms, Weapons, Ammunition & Explosives",
     "human_trafficking_and_organs": "Human Trafficking, Slavery & Human Body Parts/Organs",
@@ -219,6 +240,100 @@ CATEGORY_DESCRIPTIONS = {
     "endangered_wildlife": "Endangered Wildlife, Ivory & Illegal Animal Parts",
     "hazardous_and_wmd": "Hazardous Contraband, Chemical Weapons & WMDs",
 }
+
+
+# Returned (is_safe=True) by check_text_async when the AI classifier could not run: the listing is allowed but
+# audit_and_verify records it, unblocked, in the moderation log so ops can review it.
+REVIEW_CATEGORY = "needs_review_ai_unavailable"
+
+_AI_CATEGORIES = tuple(k for k in CATEGORY_DESCRIPTIONS if k != INJECTION_CATEGORY) + ("other_illegal_goods",)
+CATEGORY_DESCRIPTIONS.setdefault("other_illegal_goods", "Other Illegal, Counterfeit or Stolen Goods")
+_AI_TIMEOUT = 25.0
+_VERDICT_TTL_MISS = 120.0
+_MAX_CACHED = 5000
+_VERDICT_FILE = Path("data/moderation_verdicts.json")
+_verdicts: dict[str, dict] = {}
+_verdicts_loaded = False
+
+
+def _verdict_key(text: str) -> str:
+    return " ".join(unicodedata.normalize("NFKC", text or "").lower().split())[:MAX_MODERATION_CHARS]
+
+
+def _load_verdicts() -> None:
+    global _verdicts_loaded
+    if _verdicts_loaded:
+        return
+    _verdicts_loaded = True
+    try:
+        _verdicts.update(json.loads(_VERDICT_FILE.read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        pass
+
+
+def _save_verdicts() -> None:
+    try:
+        _VERDICT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _VERDICT_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(_verdicts, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(_VERDICT_FILE)
+    except OSError as exc:
+        logger.debug("moderation verdict cache not saved: %s", exc)
+
+
+def _moderation_prompt(text: str) -> str:
+    return (
+        "You are the safety reviewer of a B2B trade marketplace (industrial, agricultural, consumer and "
+        "commercial goods; users in India and worldwide). Decide whether this listing text offers or requests "
+        "goods or services that are ILLEGAL or banned to trade: narcotics and controlled substances "
+        "(cannabis, ganja, marijuana, charas, opium, heroin, cocaine, MDMA, ...), firearms, ammunition, "
+        "explosives and weapon parts, human trafficking or human organs, child exploitation, endangered wildlife "
+        "or ivory, chemical/biological/nuclear weapons material, counterfeit currency or documents, stolen goods.\n"
+        "Legal commodities are ALLOWED even when the word looks alarming (glue gun, gun metal grey paint, "
+        "industrial hemp fibre, kitchen knife, pesticide, bleach, licensed pharmaceuticals, tobacco leaf, "
+        "fireworks packaging). When it is genuinely ambiguous, answer allowed.\n"
+        f"Allowed prohibited-categories: {json.dumps(list(_AI_CATEGORIES))}\n"
+        f"Listing text: {json.dumps(text[:1500], ensure_ascii=False)}\n"
+        'Reply as JSON: {"verdict": "allowed" | "prohibited", "category": "<category or empty>", '
+        '"flagged": "<the offending words or empty>", "reason": "<one short sentence>"}'
+    )
+
+
+async def _ai_verdict(text: str) -> Optional[dict]:
+    """The model's verdict for ``text`` (cached by normalized text), or None when the AI is unavailable."""
+    from services import llm_client
+
+    key = _verdict_key(text)
+    if not key:
+        return {"verdict": "allowed"}
+    _load_verdicts()
+    hit = _verdicts.get(key)
+    if hit is not None:
+        return hit
+    schema = {
+        "type": "object",
+        "properties": {
+            "verdict": {"type": "string", "enum": ["allowed", "prohibited"]},
+            "category": {"type": "string"},
+            "flagged": {"type": "string"},
+            "reason": {"type": "string"},
+        },
+        "required": ["verdict"],
+    }
+    data = await llm_client.generate_json(_moderation_prompt(text), schema, timeout=_AI_TIMEOUT)
+    if not isinstance(data, dict) or data.get("verdict") not in ("allowed", "prohibited"):
+        return None
+    verdict = {
+        "verdict": data["verdict"],
+        "category": str(data.get("category") or "")[:64],
+        "flagged": str(data.get("flagged") or "")[:80],
+        "reason": str(data.get("reason") or "")[:200],
+    }
+    if len(_verdicts) > _MAX_CACHED:
+        _verdicts.clear()
+    _verdicts[key] = verdict
+    _save_verdicts()
+    return verdict
 
 
 class AIContentModerator:
@@ -309,12 +424,74 @@ class AIContentModerator:
                 flagged_terms=flagged_terms,
             )
 
+        held = cls._injection_or_offplatform(variants[0])
+        if held:
+            return ModerationCheckResult(
+                is_safe=False,
+                category=INJECTION_CATEGORY,
+                reason=(
+                    "Listing held by AI Safety Moderation: the text addresses the AI assistant or contains "
+                    f"off-platform payment details ({', '.join(held[:3])}). Remove it and describe the goods only; "
+                    "payments on this platform go through escrow."
+                ),
+                flagged_terms=held,
+            )
+
         return ModerationCheckResult(
             is_safe=True,
             category=None,
             reason=None,
             flagged_terms=[],
         )
+
+    @classmethod
+    async def check_text_async(cls, text: str) -> ModerationCheckResult:
+        """Regex pre-filter, then one cached AI classification of the listing text.
+
+        A regex hit blocks at once (no model call). Otherwise the model decides allowed/prohibited. When the
+        model is unavailable the text is allowed but returned with ``category == REVIEW_CATEGORY`` so the
+        audit path logs it for ops review instead of pretending it was checked.
+        """
+        fast = cls.check_text(text)
+        if not fast.is_safe:
+            return fast
+        clean = (text or "")[:MAX_MODERATION_CHARS]
+        if not any(ch.isalnum() for ch in clean):
+            return fast
+        verdict = await _ai_verdict(clean)
+        if verdict is None:
+            return ModerationCheckResult(
+                is_safe=True,
+                category=REVIEW_CATEGORY,
+                reason="AI moderation was unavailable; passed the keyword filter and is queued for review",
+                flagged_terms=[],
+            )
+        if verdict["verdict"] == "prohibited":
+            category = verdict.get("category") if verdict.get("category") in _AI_CATEGORIES else "other_illegal_goods"
+            terms = [verdict["flagged"]] if verdict.get("flagged") else []
+            desc = CATEGORY_DESCRIPTIONS.get(category, category)
+            why = f" ({verdict['reason']})" if verdict.get("reason") else ""
+            return ModerationCheckResult(
+                is_safe=False,
+                category=category,
+                reason=(
+                    f"Listing blocked by AI Safety Moderation: content appears to offer prohibited items under "
+                    f"'{desc}'{why}. Trading of these items is illegal and banned on this platform."
+                ),
+                flagged_terms=terms,
+            )
+        return fast
+
+    @classmethod
+    def _injection_or_offplatform(cls, text: str) -> list[str]:
+        """What in ``text`` talks to the AI or asks for payment outside the platform (empty when clean)."""
+        found: list[str] = []
+        for rx in _INJECTION_PATTERNS:
+            m = rx.search(text)
+            if m:
+                found.append(m.group(0).strip()[:40])
+        found += answer_verifier.unsafe_payment_issues(text, include_advance=False)
+        return list(dict.fromkeys(found))
 
     @classmethod
     async def audit_and_verify(
@@ -328,9 +505,21 @@ class AIContentModerator:
     ) -> ModerationCheckResult:
         """Full check that logs any violations to the moderation audit table."""
         full_content = f"{title}\n{description or ''}\n{category or ''}"
-        result = cls.check_text(full_content)
+        result = await cls.check_text_async(full_content)
 
-        if not result.is_safe:
+        if result.category == REVIEW_CATEGORY:
+            db.add(
+                ModerationLog(
+                    user_id=user_id,
+                    action=action,
+                    category=REVIEW_CATEGORY[:64],
+                    flagged_terms="ai_unavailable",
+                    snippet=(title[:100] + " | " + (description or "")[:100]).strip(),
+                    blocked=False,
+                )
+            )
+            await db.commit()
+        elif not result.is_safe:
             log_entry = ModerationLog(
                 user_id=user_id,
                 action=action,

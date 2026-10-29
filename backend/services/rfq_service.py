@@ -17,13 +17,14 @@ from typing import Optional, Sequence
 from sqlalchemy import Select, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.config import settings
 from models.enums import RFQStatus
 from models.rfq import RFQ
 from models.user import User
 from schemas.common import DeadlineOut, Location, Money, Quantity
-from schemas.rfq import RFQCreate, RFQOut, RFQUpdate
+from schemas.rfq import RFQCreate, RFQOut, RFQUpdate, title_key
 from services import hsn_service, locations, qdrant_index, spec_catalog
-from services.categories import normalize_category
+from services.categories import CategoryError, normalize_category, resolve_category  # noqa: F401
 from services.embeddings import embed_one
 from services.moderation_service import AIContentModerator
 from services.rfq_indexing import build_match_text, refresh_index_fields
@@ -54,26 +55,34 @@ DUPLICATE_WINDOW = timedelta(hours=24)
 
 
 def normalise_title(title: Optional[str]) -> str:
-    """Case/whitespace-insensitive title key shared by the duplicate guard and the data tools."""
-    return " ".join((title or "").lower().split())
+    """NFKC / format-character-stripped, case-folded title key shared by the duplicate guard and the data tools."""
+    return title_key(title)
 
 
 async def find_duplicate_rfq(db: AsyncSession, user: User, payload: RFQCreate) -> Optional["RFQ"]:
-    """An ACTIVE RFQ of this user with the same role, title, quantity and price made in the last 24h."""
-    if payload.status != RFQStatus.ACTIVE:
+    """A listing of this user with the same role, status, title, quantity and price made in the last 24h.
+
+    Drafts are guarded too (draft vs draft, active vs active). Titles are
+    compared normalised and case-folded in Python, so an extra zero-width
+    character, odd spacing or a different case does not slip past.
+    """
+    if payload.status not in (RFQStatus.ACTIVE, RFQStatus.DRAFT):
         return None
     qty = payload.quantity.value if payload.quantity else None
     price = payload.price_target.amount if payload.price_target else None
     stmt = select(RFQ).where(
         RFQ.user_id == user.id,
-        RFQ.status == RFQStatus.ACTIVE,
+        RFQ.status == payload.status,
         RFQ.role == payload.role,
-        func.lower(func.regexp_replace(func.trim(RFQ.title), r"\s+", " ", "g")) == normalise_title(payload.title),
         RFQ.created_at >= datetime.now(UTC) - DUPLICATE_WINDOW,
         RFQ.quantity_value.is_(None) if qty is None else RFQ.quantity_value == qty,
         RFQ.price_amount.is_(None) if price is None else RFQ.price_amount == price,
-    ).order_by(RFQ.created_at.desc()).limit(1)
-    return (await db.execute(stmt)).scalars().first()
+    ).order_by(RFQ.created_at.desc())
+    wanted = normalise_title(payload.title)
+    for candidate in (await db.execute(stmt)).scalars().all():
+        if normalise_title(candidate.title) == wanted:
+            return candidate
+    return None
 
 
 class RFQStateError(RFQError):
@@ -88,6 +97,30 @@ ALLOWED_TRANSITIONS: dict[RFQStatus, frozenset[RFQStatus]] = {
     RFQStatus.EXPIRED: frozenset(),
     RFQStatus.CLOSED: frozenset(),
 }
+
+# Fields that cannot change once a quote on the RFQ is ACCEPTED or later
+# (status/close, deadline extension, description and minimum order stay editable).
+FROZEN_AFTER_AWARD = frozenset({"title", "product_details", "quantity", "price_target", "location"})
+FROZEN_LABELS = {
+    "title": "the title",
+    "product_details": "the specifications",
+    "quantity": "the quantity and unit",
+    "price_target": "the price",
+    "location": "the location",
+}
+
+
+async def has_awarded_quote(db: AsyncSession, rfq_id: uuid.UUID) -> bool:
+    from models.quotation import Quotation
+    from services.quotation_service import AWARDED_STATUSES
+
+    found = await db.scalar(
+        select(Quotation.id)
+        .where(Quotation.rfq_id == rfq_id, Quotation.status.in_(AWARDED_STATUSES))
+        .limit(1)
+    )
+    return found is not None
+
 
 # States whose content can no longer be edited.
 IMMUTABLE_STATUSES = frozenset({RFQStatus.CLOSED, RFQStatus.EXPIRED})
@@ -110,8 +143,15 @@ def effective_status(rfq: RFQ, now: Optional[datetime] = None) -> RFQStatus:
     return rfq.status
 
 
-async def index_rfq(db: AsyncSession, rfq: RFQ) -> bool:
+INLINE_INDEX_TIMEOUT = 5.0
+
+
+async def index_rfq(db: AsyncSession, rfq: RFQ, *, timeout: Optional[float] = None) -> bool:
     """Embed one RFQ and push it to Qdrant. Best effort, never fatal.
+
+    With ``timeout`` (the request path) a slow embedding/index step is abandoned
+    after that many seconds and the row is left STALE for the scheduler's retry
+    job, so a slow model never holds a request open.
 
     A failure leaves ``embedding_status`` as STALE/FAILED with the reason, which
     is exactly what ``scripts/index_vectors.py`` looks for, so the row is picked
@@ -124,15 +164,28 @@ async def index_rfq(db: AsyncSession, rfq: RFQ) -> bool:
     if not text:
         return False
 
-    vector = await embed_one(text)
+    async def _embed_and_upsert() -> tuple[Optional[list[float]], bool]:
+        vec = await embed_one(text)
+        if vec is None:
+            return None, False
+        return vec, await qdrant_index.upsert([(rfq.id, vec, qdrant_index.build_payload(rfq))])
+
+    try:
+        vector, upserted = await asyncio.wait_for(_embed_and_upsert(), timeout)
+    except asyncio.TimeoutError:
+        logger.warning("indexing RFQ %s timed out after %ss; left STALE for the retry job", rfq.id, timeout)
+        rfq.embedding_status = EmbeddingStatus.STALE
+        rfq.embedding_error = "indexing timed out; will be retried"
+        await db.commit()
+        await db.refresh(rfq)
+        return False
+
     if vector is None:
         rfq.embedding_status = EmbeddingStatus.FAILED
         rfq.embedding_error = "embedding model unavailable"
         ok = False
     else:
-        ok = await qdrant_index.upsert(
-            [(rfq.id, vector, qdrant_index.build_payload(rfq))]
-        )
+        ok = upserted
         if ok:
             rfq.embedding_status = EmbeddingStatus.INDEXED
             rfq.embedded_at = datetime.now(UTC)
@@ -219,26 +272,140 @@ def _geocode(rfq: RFQ) -> None:
 
 
 logger = logging.getLogger(__name__)
-HSN_AI_TIMEOUT = 3.0
+# A 3 s budget never succeeds on the shared model runner (queueing alone exceeds it).
+HSN_AI_TIMEOUT = float(getattr(settings, "HSN_AI_TIMEOUT_SECONDS", 8.0))
+GEOCODE_AI_TIMEOUT = 12.0
 
 
-async def _ensure_hsn(rfq: RFQ) -> None:
-    """Best-effort: store an AI-classified HSN on a listing that has none.
+async def _geocode_ai(rfq: RFQ) -> None:
+    """Best-effort: place an unknown town (a mandi, a district) via the AI place lexicon.
 
-    Never raises and never blocks longer than a short timeout; on any failure
-    nothing is stored. The result is marked ``hsn_source = "ai"``.
+    The static ``_geocode`` only knows the cities in the gazetteer. Fills blanks
+    only, and under the same stated-country guard, so supplied data is never overridden.
+    Never raises.
     """
+    if rfq.latitude is not None and rfq.longitude is not None:
+        return
+    text = rfq.location_city or rfq.location_state
+    if not text:
+        return
     try:
-        pd = rfq.product_details or {}
-        # A user-supplied HSN is never overwritten; an earlier AI one is refreshed.
-        if hsn_service.stored_hsn(pd) and pd.get("hsn_source") != "ai":
-            return
-        text = " ".join(p for p in (rfq.title, rfq.description) if p)[:200]
-        hsn = await asyncio.wait_for(hsn_service.classify_hsn_with_ai(text), timeout=HSN_AI_TIMEOUT)
-        if hsn:
-            rfq.product_details = {**(rfq.product_details or {}), "hsn_code": hsn, "hsn_source": "ai"}
+        loc = await asyncio.wait_for(locations.resolve_location(text), timeout=GEOCODE_AI_TIMEOUT)
     except Exception as exc:  # includes timeout
-        logger.debug("HSN auto-classification skipped: %s", exc)
+        logger.debug("AI geocoding skipped: %s", exc)
+        return
+    # Only a town or city gets coordinates. A state's or country's centre would claim
+    # a precision the listing does not have; those are matched by administrative area.
+    if loc is None or not loc.is_city:
+        return
+    stated = (rfq.location_country or "").strip().lower()
+    if stated and locations.normalise_country(stated) != locations.normalise_country(loc.country):
+        return
+    rfq.latitude = locations.as_decimal(loc.latitude)
+    rfq.longitude = locations.as_decimal(loc.longitude)
+    if not rfq.location_state and loc.state:
+        rfq.location_state = loc.state
+    if not rfq.location_country:
+        rfq.location_country = loc.country
+
+
+HSN_PENDING_KEY = "_hsn_pending"
+
+
+def _mark_hsn_pending(rfq: RFQ, *, refresh_ai: bool = False) -> None:
+    """Flag a listing for background HSN classification instead of waiting for the model on the request path.
+
+    A user-supplied HSN is never overwritten. An earlier AI HSN is only re-classified when ``refresh_ai`` (the
+    title/description changed). ``complete_hsn_pending`` (scheduler job) does the work.
+    """
+    pd = dict(rfq.product_details or {})
+    stored = hsn_service.stored_hsn(pd)
+    if stored and not (refresh_ai and pd.get("hsn_source") == "ai"):
+        return
+    if stored and pd.get("hsn_source") != "ai":
+        return
+    pd[HSN_PENDING_KEY] = True
+    rfq.product_details = pd
+
+
+_hsn_kick: Optional["asyncio.Task[None]"] = None
+
+
+def _kick_hsn_job() -> None:
+    """Start the pending-HSN job now (one at a time) so a new listing gets its code in seconds, not at the next
+    scheduler tick; the scheduler stays the safety net. Off under pytest (it would open a real session)."""
+    global _hsn_kick
+    import sys
+
+    if "pytest" in sys.modules or (_hsn_kick is not None and not _hsn_kick.done()):
+        return
+
+    async def _run() -> None:
+        from db.session import SessionLocal
+
+        try:
+            async with SessionLocal() as session:
+                await complete_hsn_pending(session, limit=3)
+        except Exception:  # noqa: BLE001 - the scheduler retries
+            logger.debug("immediate HSN completion failed", exc_info=True)
+
+    try:
+        _hsn_kick = asyncio.get_running_loop().create_task(_run())
+    except RuntimeError:
+        pass
+
+
+async def complete_hsn_pending(db: AsyncSession, *, limit: int = 5, commit: bool = True) -> int:
+    """Classify the HSN of listings marked ``_hsn_pending`` (oldest first). Returns how many were resolved.
+
+    A definite answer (a code, or the model finding none) clears the mark; a timeout or model error keeps it for the
+    next run. A new code refreshes the index fields and flags the embedding STALE.
+    """
+    from models.enums import EmbeddingStatus
+
+    ids = (
+        await db.scalars(
+            select(RFQ.id).where(RFQ.product_details.has_key(HSN_PENDING_KEY)).order_by(RFQ.updated_at).limit(limit)
+        )
+    ).all()
+    done = 0
+    for rfq_id in ids:
+        try:
+            rfq = await db.get(RFQ, rfq_id)
+            if rfq is None or not isinstance(rfq.product_details, dict):
+                continue
+            pd = dict(rfq.product_details)
+            if hsn_service.stored_hsn(pd) and pd.get("hsn_source") != "ai":
+                pd.pop(HSN_PENDING_KEY, None)  # the user supplied one meanwhile
+                rfq.product_details = pd
+            else:
+                text = " ".join(p for p in (rfq.title, rfq.description) if p)[:200]
+                hsn = await asyncio.wait_for(hsn_service.classify_hsn_with_ai(text), timeout=HSN_AI_TIMEOUT)
+                pd.pop(HSN_PENDING_KEY, None)
+                if hsn:
+                    pd.update({"hsn_code": hsn, "hsn_source": "ai"})
+                rfq.product_details = pd
+                if hsn:
+                    refresh_index_fields(rfq)
+                    rfq.embedding_status = EmbeddingStatus.STALE
+            done += 1
+            if commit:
+                await db.commit()
+            else:
+                await db.flush()
+        except Exception as exc:  # noqa: BLE001 - one bad row must not stop the batch; it keeps its mark
+            logger.warning("HSN classification retry failed for rfq %s: %s", rfq_id, exc)
+            if commit:
+                await db.rollback()
+    return done
+
+
+async def _resolve_category(category: str, title: str, description: Optional[str]) -> str:
+    """Canonical category or ``RFQError`` (422) listing the allowed values; unknown words are never stored."""
+    try:
+        return await resolve_category(category, title, description)
+    except CategoryError as exc:
+        raise RFQError(str(exc)) from exc
 
 
 async def create_rfq(db: AsyncSession, user: User, payload: RFQCreate) -> RFQ:
@@ -263,25 +430,25 @@ async def create_rfq(db: AsyncSession, user: User, payload: RFQCreate) -> RFQ:
     if not mod_check.is_safe:
         raise RFQError(mod_check.reason or "Listing contains prohibited items")
 
+    category = await _resolve_category(payload.category, payload.title, payload.description)
     rfq = RFQ(
         user_id=user.id,
         role=payload.role,
         status=payload.status,
-        category=normalize_category(payload.category),
+        category=category,
         title=payload.title,
         description=payload.description,
-        product_details=await spec_catalog.normalize_for_rfq(
-            db, payload.product_details, payload.title, normalize_category(payload.category)
-        ),
+        product_details=await spec_catalog.normalize_for_rfq(db, payload.product_details, payload.title, category),
     )
     _apply_common_fields(rfq, payload)
+    await _geocode_ai(rfq)
 
     # A listing outlives its delivery deadline by nothing; without one it gets
     # a default TTL so the index does not fill with abandoned rows.
     rfq.expires_at = rfq.deadline_at or datetime.now(UTC) + timedelta(days=DEFAULT_TTL_DAYS)
 
+    _mark_hsn_pending(rfq)
     refresh_index_fields(rfq)
-    await _ensure_hsn(rfq)
 
     db.add(rfq)
     await db.commit()
@@ -290,7 +457,9 @@ async def create_rfq(db: AsyncSession, user: User, payload: RFQCreate) -> RFQ:
     # Indexed inline so a new RFQ is findable immediately. This belongs in a
     # background job once there is a queue; until then, failure is tracked on
     # the row rather than raised at the user.
-    await index_rfq(db, rfq)
+    await index_rfq(db, rfq, timeout=INLINE_INDEX_TIMEOUT)
+    if HSN_PENDING_KEY in (rfq.product_details or {}):
+        _kick_hsn_job()
     return rfq
 
 
@@ -323,6 +492,16 @@ async def update_rfq(db: AsyncSession, rfq: RFQ, payload: RFQUpdate) -> RFQ:
     if rfq.status in IMMUTABLE_STATUSES:
         raise RFQStateError(f"a {rfq.status.value} RFQ can no longer be edited")
 
+    # Once an order exists on this RFQ the contract fields are frozen: the PO,
+    # invoice and escrow were agreed against them.
+    frozen = FROZEN_AFTER_AWARD & set(provided)
+    if frozen and await has_awarded_quote(db, rfq.id):
+        raise RFQStateError(
+            "an order has already been accepted on this RFQ, so "
+            + ", ".join(sorted(FROZEN_LABELS[k] for k in frozen))
+            + " can no longer be changed; close the RFQ or post a new one"
+        )
+
     # AI Safety & Prohibited Items Moderation on update.
     if any(k in provided for k in ("title", "description", "category", "product_details")):
         new_title = provided.get("title", rfq.title)
@@ -342,7 +521,7 @@ async def update_rfq(db: AsyncSession, rfq: RFQ, payload: RFQUpdate) -> RFQ:
     if "title" in provided and provided["title"] is not None:
         rfq.title = provided["title"]
     if "category" in provided and provided["category"] is not None:
-        rfq.category = normalize_category(provided["category"])
+        rfq.category = await _resolve_category(provided["category"], rfq.title, rfq.description)
     if "description" in provided:
         rfq.description = provided["description"]
 
@@ -350,19 +529,28 @@ async def update_rfq(db: AsyncSession, rfq: RFQ, payload: RFQUpdate) -> RFQ:
         rfq.product_details = await spec_catalog.normalize_for_rfq(db, payload.product_details, rfq.title, rfq.category)
 
     _apply_common_fields(rfq, payload)
+    await _geocode_ai(rfq)
 
-    if "deadline" in provided and payload.deadline is not None:
-        rfq.expires_at = rfq.deadline_at
+    if "deadline" in provided:
+        if payload.deadline is not None:
+            rfq.expires_at = rfq.deadline_at
+        else:
+            # An explicit null removes the deadline: back to the default lifetime.
+            rfq.deadline_at = None
+            rfq.deadline_raw = None
+            rfq.expires_at = datetime.now(UTC) + timedelta(days=DEFAULT_TTL_DAYS)
 
     # Any edit can change what the embedding should encode, so it is always
     # recomputed rather than guessed at field by field.
+    _mark_hsn_pending(rfq, refresh_ai=bool({"title", "description"} & set(provided)))
     refresh_index_fields(rfq)
-    await _ensure_hsn(rfq)
 
     await db.commit()
     await db.refresh(rfq)
 
-    await index_rfq(db, rfq)
+    await index_rfq(db, rfq, timeout=INLINE_INDEX_TIMEOUT)
+    if HSN_PENDING_KEY in (rfq.product_details or {}):
+        _kick_hsn_job()
     return rfq
 
 
@@ -391,7 +579,9 @@ async def publish_rfq(db: AsyncSession, rfq: RFQ) -> RFQ:
     refresh_index_fields(rfq)
     await db.commit()
     await db.refresh(rfq)
-    await index_rfq(db, rfq)
+    await index_rfq(db, rfq, timeout=INLINE_INDEX_TIMEOUT)
+    if HSN_PENDING_KEY in (rfq.product_details or {}):
+        _kick_hsn_job()
     return rfq
 
 
@@ -407,6 +597,9 @@ async def close_rfq(db: AsyncSession, rfq: RFQ) -> RFQ:
         raise RFQStateError(f"a {rfq.status.value} RFQ cannot be closed")
 
     rfq.status = RFQStatus.CLOSED
+    from services.quotation_service import expire_pending_for_rfqs
+
+    await expire_pending_for_rfqs(db, [rfq.id])
     await db.commit()
     await db.refresh(rfq)
     await qdrant_index.delete([rfq.id])
@@ -483,6 +676,9 @@ async def expire_due_rfqs(
         stmt = stmt.where(RFQ.id.in_(ids))
     expired_ids = list((await db.execute(stmt)).scalars().all())
     if expired_ids:
+        from services.quotation_service import expire_pending_for_rfqs
+
+        await expire_pending_for_rfqs(db, expired_ids)
         await db.commit()
         # synchronize_session already set status on loaded rows; refresh the
         # few explicitly targeted ones so server-side updated_at is current.

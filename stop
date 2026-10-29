@@ -67,6 +67,21 @@ fi
 pkill -f "$PROJECT_DIR/backend/.venv" 2>/dev/null || true
 echo -e "${GREEN}[✓] Backend stopped.${NC}"
 
+# 3. Stop vLLM Inference Engine
+echo -e "${YELLOW}[*] Stopping vLLM service...${NC}"
+VLLM_PID_FILE="$PROJECT_DIR/.pids/vllm.pid"
+if [ -f "$VLLM_PID_FILE" ]; then
+    VPID=$(cat "$VLLM_PID_FILE")
+    kill -TERM "$VPID" 2>/dev/null || true
+    rm -f "$VLLM_PID_FILE"
+fi
+VLLM_PORT_PIDS=$(lsof -ti :8001 2>/dev/null || true)
+if [ -n "$VLLM_PORT_PIDS" ]; then
+    kill -9 $VLLM_PORT_PIDS 2>/dev/null || true
+fi
+pkill -f "vllm.*serve" 2>/dev/null || true
+echo -e "${GREEN}[✓] vLLM engine stopped.${NC}"
+
 # 3. Stop Docker Compose Backing Services
 if command -v docker &>/dev/null && [ -f "$PROJECT_DIR/docker-compose.yml" ]; then
     echo -e "${YELLOW}[*] Stopping Docker backing services (PostgreSQL, Qdrant, Redis)...${NC}"

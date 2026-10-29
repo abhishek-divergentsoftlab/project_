@@ -10,16 +10,175 @@ side has to compromise: the API stays readable, the columns stay indexable.
 # field name shadow the type, so Pydantic saw ``Optional[None]`` and rejected
 # every absolute date.
 import datetime as dt
+import html
+import re
 from decimal import Decimal
 from typing import Any, Optional, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
 
 UTC = dt.UTC
 
 # Numeric(18,4) holds at most 14 integer digits. Anything larger overflowed in
 # Postgres and surfaced as a 500; the bound turns it into a 422 with headroom.
 MAX_NUMERIC_VALUE = Decimal("1e13")
+
+# ---------------------------------------------------------------------------------------------
+# Units and free-text hygiene shared by every request body
+# ---------------------------------------------------------------------------------------------
+
+# Preferred spelling per physical dimension: an alias (kilo, tons, MT, ltr...) resolves to the first
+# entry here that has the same conversion factor in the same table.
+_PREFERRED_SYMBOLS = (
+    "tonne", "quintal", "kg", "g", "lb", "oz",
+    "m", "km", "cm", "mm", "in", "ft", "yd",
+    "l", "ml", "kl", "m3", "gallon", "barrel",
+    "w", "kw", "mw", "hp", "v", "kv", "mv", "ah", "mah",
+)
+_COUNT_GROUPS = {
+    "pcs": {"pc", "pcs", "piece", "pieces", "unit", "units", "no", "nos", "number", "numbers", "each", "ea", "item", "items"},
+    "dozen": {"dozen", "dozens", "doz", "dz"},
+    "pair": {"pair", "pairs"},
+    "set": {"set", "sets"},
+}
+# Count / packaging / trade units the conversion tables do not list but a listing legitimately uses.
+_EXTRA_UNITS = frozenset(
+    """container containers teu fcl lcl truck trucks truckload truckloads lorry trip trips load loads lot lots kit kits
+    bottle bottles can cans tin tins jar jars tube tubes tub tubs packet packets strip strips tablet tablets capsule
+    capsules vial vials ampoule ampoules sachet sachets bucket buckets pail pails cylinder cylinders tank tanks tray
+    trays bunch bunches head heads cone cones spool spools coil coils reel reels skein hank ream reams roll rolls
+    sheet sheets bundle bundles bag bags box boxes carton cartons crate crates drum drums pallet pallets sack sacks
+    bale bales barrel barrels bora boras bori boris katta kattas pack packs case cases
+    sqft sq.ft sq ft sqm sq m sqmt sq mt square foot square feet square meter square metre square meters square metres
+    cum cbm cft cubic foot cubic feet m2 acre acres hectare hectares ha bigha bighas gunta guntha
+    wp kwp mwp gwp kva mva kwh mwh amp amps ampere amperes hour hours hr hrs day days week weeks month months year years
+    job jobs license licenses licence licences user users seat seats service services license
+    mg milligram milligrams litre liter meter metre""".split()
+)
+
+
+def _unit_tables() -> list[dict[str, Decimal]]:
+    from services import unit_converter as uc
+
+    return [
+        uc.MASS_CONVERSION_TO_KG, uc.LENGTH_CONVERSION_TO_METER, uc.VOLUME_CONVERSION_TO_LITER,
+        uc.POWER_CONVERSION_TO_WATT, uc.VOLTAGE_CONVERSION_TO_VOLT, uc.CAPACITY_CONVERSION_TO_AH,
+    ]
+
+
+def _learned_units() -> set[str]:
+    try:
+        from services import learned_vocabulary
+
+        return {str(u).strip().lower() for u in learned_vocabulary.known_units()}
+    except Exception:  # noqa: BLE001 - optional vocabulary
+        return set()
+
+
+def known_unit_names() -> list[str]:
+    from services import unit_converter as uc
+
+    names: set[str] = set(_PREFERRED_SYMBOLS) | set(_COUNT_GROUPS) | set(_EXTRA_UNITS)
+    for table in _unit_tables():
+        names |= set(table)
+    names |= set(uc.COUNT_CONVERSION_TO_PIECES) | set(uc.PACKAGING_UNITS) | _learned_units()
+    return sorted(names)
+
+
+_NUM_PREFIX_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*(.+)$")
+
+
+_AREA_RE = re.compile(
+    r"^(?:sq\.?\s*|square\s+)(ft|feet|foot|m|mt|meters?|metres?|yd|yards?|cm|mm|km|in|inch|inches)\.?$"
+    r"|^sq\.?(ft|m|mt|yd|cm|mm|km)$"
+)
+
+
+def canonical_unit(raw: Optional[str]) -> Optional[str]:
+    """The canonical spelling of a unit, or None when it is not a unit we know.
+
+    kilo/kgs -> kg, tons/MT/metric tons -> tonne, ltr -> l, pieces/nos -> pcs, "Rs/kg" -> kg. A numeric
+    pack size ("50 kg", "1000 pcs") is kept as "<n> <unit>". Units we cannot resolve are not guessed.
+    """
+    from services import unit_converter as uc
+
+    if raw is None:
+        return None
+    area = _AREA_RE.match(re.sub(r"^(?:per|/|rs\.?/?|₹/?)\s*", "", str(raw).strip().lower()))
+    if area:
+        base = area.group(1) or area.group(2)
+        return "sq " + {"feet": "ft", "foot": "ft", "meter": "m", "metre": "m", "mt": "m", "meters": "m",
+                        "metres": "m", "inch": "in", "inches": "in", "yard": "yd", "yards": "yd"}.get(base, base)
+    cleaned = uc.clean_unit(raw)
+    if not cleaned:
+        return None
+    cleaned = cleaned.replace("sq.", "sq ").replace("  ", " ")
+    for table in _unit_tables():
+        if cleaned in table:
+            factor = table[cleaned]
+            for sym in _PREFERRED_SYMBOLS:
+                if sym in table and table[sym] == factor:
+                    # only merge spellings that are not themselves the pack-size forms
+                    return sym if not cleaned[:1].isdigit() else cleaned
+            return cleaned
+    for sym, group in _COUNT_GROUPS.items():
+        if cleaned in group:
+            return sym
+    if cleaned in uc.COUNT_CONVERSION_TO_PIECES or cleaned in uc.PACKAGING_UNITS or cleaned in _EXTRA_UNITS:
+        return cleaned
+    if cleaned in _learned_units():
+        return cleaned
+    m = _NUM_PREFIX_RE.match(cleaned)
+    if m and not cleaned.startswith("per"):
+        inner = canonical_unit(m.group(2))
+        if inner:
+            return f"{m.group(1)} {inner}"
+    return None
+
+
+def unit_suggestion(raw: str) -> Optional[str]:
+    import difflib
+
+    base = (raw or "").strip().lower()
+    hit = difflib.get_close_matches(base, known_unit_names(), n=1, cutoff=0.75)
+    return hit[0] if hit else None
+
+
+def require_unit(raw: str) -> str:
+    unit = canonical_unit(raw)
+    if unit is None:
+        hint = unit_suggestion(raw)
+        msg = f"unknown unit '{str(raw)[:32]}'"
+        msg += f"; did you mean '{hint}'?" if hint else "; use a unit such as kg, tonne, pcs, m, l, box, bag, set"
+        raise ValueError(msg)
+    return unit
+
+
+_SCRIPT_BLOCK_RE = re.compile(r"<\s*(script|style)\b[^>]*>.*?<\s*/\s*\1\s*>", re.I | re.S)
+_WS_RE = re.compile(r"[ \t\r\f\v]+")
+
+
+def strip_markup(value: str) -> str:
+    """Remove HTML tags / script blocks and unescape entities from user text; keeps plain text and newlines.
+
+    A lone "<" or ">" in prose ("size < 5 mm", "a > b") survives: only tag-shaped sequences go.
+    """
+    text = html.unescape(value)
+    text = _SCRIPT_BLOCK_RE.sub(" ", text)
+    text = re.sub(r"<\s*/?\s*[a-zA-Z!?][^>]*>?", " ", text)
+    lines = [_WS_RE.sub(" ", ln).strip() for ln in text.split("\n")]
+    return "\n".join(lines).strip()
+
+
+def clean_user_text(value: Any) -> Any:
+    """strip_markup applied recursively to every string inside a str / list / dict."""
+    if isinstance(value, str):
+        return strip_markup(value)
+    if isinstance(value, dict):
+        return {k: clean_user_text(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [clean_user_text(v) for v in value]
+    return value
 
 
 def find_nul(value: Any) -> bool:
@@ -80,6 +239,11 @@ class Quantity(NoNulModel):
     )
     unit: str = Field(min_length=1, max_length=32, description="pcs, kg, tonnes, cartons...")
 
+    @field_validator("unit", mode="before")
+    @classmethod
+    def _known_unit(cls, value: Any) -> Any:
+        return require_unit(value) if isinstance(value, str) else value
+
     @classmethod
     def from_stored(cls, value: Any, unit: Optional[str]) -> "Quantity":
         """Response object from DB columns; never 500s on legacy out-of-range rows."""
@@ -104,13 +268,20 @@ def supported_currencies() -> set[str]:
 class Money(NoNulModel):
     model_config = ConfigDict(extra="forbid")
 
-    amount: Decimal = Field(ge=0, le=MAX_NUMERIC_VALUE, allow_inf_nan=False)
+    amount: Decimal = Field(gt=0, le=MAX_NUMERIC_VALUE, allow_inf_nan=False)
     currency: str = Field(default="INR", max_length=64)
     per_unit: Optional[str] = Field(
         default=None,
         max_length=32,
         description="The unit the price is quoted per -- 'kg' in 'Rs 200/kg'.",
     )
+
+    @field_validator("per_unit", mode="before")
+    @classmethod
+    def _known_per_unit(cls, value: Any) -> Any:
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return None
+        return require_unit(value) if isinstance(value, str) else value
 
     @model_validator(mode="before")
     @classmethod
@@ -168,6 +339,14 @@ class Location(NoNulModel):
     raw: Optional[str] = Field(
         default=None, max_length=300, description="What the user typed, kept for re-geocoding."
     )
+
+    @field_validator("city", "state", "country", "raw", mode="before")
+    @classmethod
+    def _blank_to_none(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            value = strip_markup(value)
+            return value or None
+        return value
 
     @field_serializer("latitude", "longitude")
     def _serialise_coord(self, value: Optional[Decimal]) -> int | float | None:

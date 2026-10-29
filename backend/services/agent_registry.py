@@ -161,3 +161,13 @@ def list_agents() -> list[AgentDefinition]:
     """Return all available agents, general assistant first."""
     return list(_AGENTS.values())
 
+
+
+def agent_info(agent: AgentDefinition) -> dict[str, str]:
+    """The ``routed_agent`` payload the frontend renders."""
+    return {
+        "id": agent.id,
+        "name": agent.name,
+        "icon": agent.icon,
+        "short_description": agent.short_description,
+    }

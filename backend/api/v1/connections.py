@@ -3,9 +3,10 @@
 import uuid
 from typing import Annotated, Optional
 
-from fastapi import APIRouter, File, Form, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, Query, UploadFile, status
 
 from api.deps import CurrentUser, DbSession
+from core.rate_limit import RateLimit
 from models.enums import ConnectionStatus
 from schemas.connection import (
     ConnectionCreate,
@@ -110,16 +111,19 @@ async def send_message(
     "/{connection_id}/messages/live-capture",
     response_model=ConnectionMessageOut,
     status_code=status.HTTP_201_CREATED,
+    # Every photo runs a vision-model moderation call on the shared GPU.
+    dependencies=[Depends(RateLimit("live-capture", "RATE_LIMIT_LIVE_CAPTURE", per="user"))],
 )
 async def send_live_capture(
     connection_id: uuid.UUID,
     image: UploadFile = File(...),
-    caption: Optional[str] = Form(None),
+    caption: Optional[str] = Form(None, max_length=4000),
     current_user: CurrentUser = None,
     db: DbSession = None,
 ) -> ConnectionMessageOut:
     """Capture photo directly from camera/webcam and post to deal room chat."""
-    file_bytes = await image.read()
+    # One byte past the limit is enough for the service to reject it; never buffer more.
+    file_bytes = await image.read(10 * 1024 * 1024 + 1)
     content_type = image.content_type or "image/jpeg"
     message = await connection_service.send_live_capture_message(
         db=db,

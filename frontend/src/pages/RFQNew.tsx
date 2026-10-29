@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 
 import { errorMessage } from "@/api/client";
@@ -120,7 +120,7 @@ function toAttributeRows(details: ProductDetails): Attribute[] {
   }
 
   const rows: Attribute[] = Object.entries(details)
-    .filter(([key]) => key !== "name" && !key.endsWith(MUST_MATCH_SUFFIX))
+    .filter(([key]) => key !== "name" && !key.startsWith("_") && !key.endsWith(MUST_MATCH_SUFFIX))
     .map(([key, value]) => ({
       key,
       // Nested specs -- {"value": 20000, "unit": "mAh"} -- are shown as JSON
@@ -198,21 +198,9 @@ function buildProductDetails(name: string, attributes: Attribute[], hsnCode?: st
   return details;
 }
 
-export function RFQNew() {
-  const { user } = useAuth();
-  const { toast } = useFeedback();
-  const navigate = useNavigate();
-  // Present only on /rfqs/:rfqId/edit.
-  const { rfqId } = useParams<{ rfqId: string }>();
-  const editing = Boolean(rfqId);
-
-  // A "both" account has to choose a side per RFQ; a single-sided account
-  // cannot post on the other side, so the field is fixed for them.
-  const canChooseRole = user?.role === "both";
-  const defaultRole: RFQRole = user?.role === "seller" ? "seller" : "buyer";
-
-  const [form, setForm] = useState({
-    role: defaultRole,
+function blankForm(role: RFQRole) {
+  return {
+    role,
     hsnCode: "",
     category: "",
     title: "",
@@ -232,13 +220,99 @@ export function RFQNew() {
     longitude: null as number | null,
     deadlineDays: "",
     publishNow: true,
-  });
+  };
+}
+
+type FormState = ReturnType<typeof blankForm>;
+interface StoredDraft {
+  form: Partial<FormState>;
+  attributes: Attribute[];
+}
+
+// sessionStorage can be missing, full or blocked: every access is guarded and the form works without it.
+function readStoredDraft(key: string): StoredDraft | null {
+  try {
+    const raw = window.sessionStorage.getItem(key);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<StoredDraft> | null;
+    if (!parsed || typeof parsed !== "object" || typeof parsed.form !== "object" || parsed.form === null) return null;
+    return {
+      form: parsed.form,
+      attributes: Array.isArray(parsed.attributes) ? parsed.attributes : [],
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredDraft(key: string, draft: StoredDraft | null) {
+  try {
+    if (draft) window.sessionStorage.setItem(key, JSON.stringify(draft));
+    else window.sessionStorage.removeItem(key);
+  } catch {
+    /* storage unavailable: autosave is a convenience only */
+  }
+}
+
+export function RFQNew() {
+  const { user } = useAuth();
+  const { toast } = useFeedback();
+  const navigate = useNavigate();
+  // Present only on /rfqs/:rfqId/edit.
+  const { rfqId } = useParams<{ rfqId: string }>();
+  const editing = Boolean(rfqId);
+
+  // A "both" account has to choose a side per RFQ; a single-sided account
+  // cannot post on the other side, so the field is fixed for them.
+  const canChooseRole = user?.role === "both";
+  const defaultRole: RFQRole = user?.role === "seller" ? "seller" : "buyer";
+
+  // The half-filled new-RFQ form survives a refresh or an expired session: it is
+  // autosaved to sessionStorage per user and cleared on a successful submit.
+  const draftKey = !editing && user?.id ? `rfq-new-draft:${user.id}` : null;
+  const savedDraft = useRef<StoredDraft | null | undefined>(undefined);
+  if (savedDraft.current === undefined) savedDraft.current = draftKey ? readStoredDraft(draftKey) : null;
+  const skipAutosave = useRef(false);
+  const [draftRestored, setDraftRestored] = useState(savedDraft.current !== null);
+
+  const [form, setForm] = useState(() => ({
+    ...blankForm(defaultRole),
+    ...(savedDraft.current?.form ?? {}),
+    ...(canChooseRole || !savedDraft.current ? {} : { role: defaultRole }),
+  }));
   const [showMapPicker, setShowMapPicker] = useState(false);
-  const [attributes, setAttributes] = useState<Attribute[]>([emptyAttribute()]);
+  const [attributes, setAttributes] = useState<Attribute[]>(() =>
+    savedDraft.current?.attributes.length ? savedDraft.current.attributes : [emptyAttribute()],
+  );
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [loading, setLoading] = useState(editing);
   const [existing, setExisting] = useState<RFQ | null>(null);
+
+  useEffect(() => {
+    if (!draftKey) return;
+    const timer = setTimeout(() => {
+      if (skipAutosave.current) return;
+      const blank =
+        !form.title.trim() &&
+        !form.description.trim() &&
+        !form.category &&
+        !form.productName.trim() &&
+        !form.quantityValue &&
+        !form.priceAmount &&
+        !form.city.trim() &&
+        attributes.every((row) => !row.value.trim() && !row.key.trim());
+      writeStoredDraft(draftKey, blank ? null : { form, attributes });
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [draftKey, form, attributes]);
+
+  function discardDraft() {
+    if (draftKey) writeStoredDraft(draftKey, null);
+    setForm(blankForm(defaultRole));
+    setAttributes([emptyAttribute()]);
+    setDraftRestored(false);
+  }
 
   const prefill = useCallback((rfq: RFQ) => {
     const rawHsn = rfq.product_details.hsn_code;
@@ -275,6 +349,7 @@ export function RFQNew() {
   }, []);
 
   function handleHsnSelect(selection: HsnSelection) {
+    hsnApi.confirm(selection.searchText || form.productName || form.title, selection.hsnCode);
     setForm((current) => ({
       ...current,
       hsnCode: selection.hsnCode,
@@ -356,12 +431,24 @@ export function RFQNew() {
   }, [form.productName]);
 
   function handleApplyAiSuggestion(sug: HsnSuggestion) {
+    hsnApi.confirm(form.productName, sug.code);
     setForm((current) => ({
       ...current,
       hsnCode: sug.code,
       category: sug.category,
     }));
     setSuggestionDismissed(true);
+  }
+
+  function handlePickAlternative(code: string) {
+    hsnApi.confirm(form.productName, code);
+    void hsnApi
+      .getByCode(code)
+      .then((it) => {
+        setForm((current) => ({ ...current, hsnCode: it.code, category: it.category }));
+        setSuggestionDismissed(true);
+      })
+      .catch(() => undefined);
   }
 
   const orderEstimate = useMemo(() => {
@@ -575,6 +662,8 @@ export function RFQNew() {
         }
       } else {
         await rfqApi.create(payload);
+        skipAutosave.current = true;
+        if (draftKey) writeStoredDraft(draftKey, null);
         toast(payload.status === "active" ? "RFQ published." : "Draft saved.");
       }
       navigate("/rfqs", { replace: true });
@@ -611,6 +700,14 @@ export function RFQNew() {
 
       <form className="panel form-panel" onSubmit={handleSubmit}>
         {error && <p className="error">{error}</p>}
+        {draftRestored && !editing && (
+          <p className="alert alert-info" role="status">
+            Draft restored from your last visit.{" "}
+            <button type="button" className="link-button" onClick={discardDraft}>
+              Discard
+            </button>
+          </p>
+        )}
 
         <div className="form-section">
           <div className="form-section-head">
@@ -632,7 +729,7 @@ export function RFQNew() {
                   disabled={(!canChooseRole || editing) && form.role !== value}
                   onClick={() => update("role", value)}
                 >
-                  {value === "buyer" ? "Buying" : "Selling"}
+                  {value === "buyer" ? "🛒 Buying (Need Quotes)" : "🏷️ Selling (Offering Goods)"}
                 </button>
               ))}
             </div>
@@ -704,7 +801,7 @@ export function RFQNew() {
               <div className="hsn-ai-suggestion-header">
                 <div className="hsn-ai-badge">
                   <IconSparkles size={14} className="hsn-sparkle-icon" />
-                  <span>AI Classification Recommendation</span>
+                  <span>{aiSuggestion.confidence === "high" && !aiSuggestion.needs_confirmation ? "AI Classification" : "Suggested \u2014 please confirm"}</span>
                 </div>
                 <button
                   type="button"
@@ -723,6 +820,17 @@ export function RFQNew() {
                 <div className="hsn-ai-meta">
                   Suggested Category: <span className="hsn-cat-pill">{aiSuggestion.category}</span> &bull; Chapter {aiSuggestion.chapter} ({aiSuggestion.chapter_name})
                 </div>
+                {aiSuggestion.path && <div className="hsn-ai-meta">{aiSuggestion.path}</div>}
+                {aiSuggestion.alternatives && aiSuggestion.alternatives.length > 0 && (
+                  <div className="hsn-ai-meta">
+                    Or choose:{" "}
+                    {aiSuggestion.alternatives.map((alt) => (
+                      <button key={alt.code} type="button" className="hsn-apply-ai-btn" onClick={() => handlePickAlternative(alt.code)}>
+                        {alt.code} &middot; {alt.title}
+                      </button>
+                    ))}
+                  </div>
+                )}
                 {aiSuggestion.reason && (
                   <p className="hsn-ai-reason">💡 {aiSuggestion.reason}</p>
                 )}

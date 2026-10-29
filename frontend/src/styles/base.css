@@ -744,6 +744,7 @@ button.link-button:hover:not(:disabled) {
 
 .badge-expired,
 .badge-closed,
+.badge-kyc-flagged,
 .badge-kyc-unverified {
   background: var(--bg-subtle);
   color: var(--muted);

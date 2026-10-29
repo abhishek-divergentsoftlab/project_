@@ -22,6 +22,8 @@ export interface HsnSelection {
   category: string;
   fullName: string;
   path: string[];
+  /** The text the user searched for when picking (used for the /hsn/confirm vote). */
+  searchText?: string;
 }
 
 interface HsnTreeSelectorProps {
@@ -299,6 +301,7 @@ export function HsnTreeSelector({
             {item.context && <span className="hsn-context-pill">{item.context}</span>}
             {item.recommended && <span className="hsn-recommended-badge">Recommended</span>}
           </span>
+          {item.path && <span className="hsn-result-path">{item.path}</span>}
           <span className="hsn-result-sub">
             Level {item.level} · Chapter {item.chapter}
             {item.heading && item.heading !== item.chapter ? ` · Heading ${item.heading}` : ""}
@@ -461,6 +464,7 @@ export function HsnTreeSelector({
       category: item.category,
       fullName: `HSN ${item.code}: ${productName}`,
       path,
+      searchText: searchQuery.trim() || undefined,
     };
 
     setSelectedItem({ ...selection, description: item.description });
@@ -586,13 +590,18 @@ export function HsnTreeSelector({
                 <div className="hsn-ai-search-banner">
                   <div className="hsn-ai-banner-header">
                     <IconSparkles size={14} className="hsn-sparkle-icon" />
-                    <span>AI Brand Classification Match for &ldquo;{searchQuery}&rdquo;:</span>
+                    <span>
+                      {aiSearchSuggestion.confidence === "high" && !aiSearchSuggestion.needs_confirmation
+                        ? <>Classification match for &ldquo;{searchQuery}&rdquo;:</>
+                        : <>Suggested &mdash; please confirm for &ldquo;{searchQuery}&rdquo;:</>}
+                    </span>
                   </div>
                   <div className="hsn-ai-banner-content">
                     <span className="hsn-ai-banner-code">HSN {aiSearchSuggestion.code}</span> &bull;{" "}
                     <strong>{aiSearchSuggestion.formatted_title}</strong>
                     <span className="hsn-banner-cat">({aiSearchSuggestion.category} &bull; Ch. {aiSearchSuggestion.chapter})</span>
                   </div>
+                  {aiSearchSuggestion.path && <div className="hsn-banner-reason">{aiSearchSuggestion.path}</div>}
                   {aiSearchSuggestion.reason && (
                     <div className="hsn-banner-reason">💡 {aiSearchSuggestion.reason}</div>
                   )}
@@ -620,6 +629,23 @@ export function HsnTreeSelector({
                   >
                     Select HSN {aiSearchSuggestion.code}
                   </button>
+                  {aiSearchSuggestion.alternatives && aiSearchSuggestion.alternatives.length > 0 && (
+                    <div className="hsn-banner-alternatives">
+                      <span className="hsn-banner-reason">Other possibilities:</span>
+                      {aiSearchSuggestion.alternatives.map((alt) => (
+                        <button
+                          key={alt.code}
+                          type="button"
+                          className="button secondary small-btn"
+                          onClick={() => {
+                            void hsnApi.getByCode(alt.code).then((it) => handleSelect(it)).catch(() => undefined);
+                          }}
+                        >
+                          {alt.code} &middot; {alt.title}
+                        </button>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
 

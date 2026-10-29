@@ -1,13 +1,13 @@
 """Shared FastAPI dependencies."""
 
-import uuid
 from typing import Annotated
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from core.security import TokenError, decode_token
+from core.config import settings
+from core.security import TokenError
 from db.session import get_db
 from models.user import User
 from services import auth_service
@@ -33,20 +33,26 @@ async def get_current_user(
         raise _UNAUTHORIZED
 
     try:
-        # Demands type=access: a refresh token presented here is rejected.
-        payload = decode_token(credentials.credentials, expected_type="access")
-        user_id = uuid.UUID(payload["sub"])
-    except (TokenError, ValueError, KeyError) as exc:
+        # Demands type=access (a refresh token is rejected), then checks revocation,
+        # token_version and that the account is still active.
+        user, _ = await auth_service.user_from_access_token(db, credentials.credentials)
+    except TokenError as exc:
         raise _UNAUTHORIZED from exc
-
-    user = await auth_service.get_user(db, user_id)
-    if user is None or not user.is_active:
-        raise _UNAUTHORIZED
 
     return user
 
 
 CurrentUser = Annotated[User, Depends(get_current_user)]
+
+
+async def get_operator_user(user: CurrentUser) -> User:
+    # 404 rather than 403: the /ops surface is not advertised to other users.
+    if user.email.lower() not in settings.OPERATOR_EMAILS:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Not Found")
+    return user
+
+
+OperatorUser = Annotated[User, Depends(get_operator_user)]
 
 
 async def get_optional_current_user(
@@ -58,12 +64,8 @@ async def get_optional_current_user(
     if credentials is None:
         return None
     try:
-        payload = decode_token(credentials.credentials, expected_type="access")
-        user_id = uuid.UUID(payload["sub"])
-    except (TokenError, ValueError, KeyError):
-        return None
-    user = await auth_service.get_user(db, user_id)
-    if user is None or not user.is_active:
+        user, _ = await auth_service.user_from_access_token(db, credentials.credentials)
+    except TokenError:
         return None
     return user
 

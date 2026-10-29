@@ -4,6 +4,7 @@ import { errorMessage } from "@/api/client";
 import { certifications, kyc, reviews as reviewsApi, users } from "@/api/endpoints";
 import {
   IconClock,
+  IconDownload,
   IconExternalLink,
   IconFileText,
   IconMapPin,
@@ -73,7 +74,8 @@ function getInitials(name?: string | null, email?: string | null): string {
 
 function kycLabel(status: string): string {
   if (status === "verified") return "Verified";
-  if (status === "pending") return "Pending review";
+  if (status === "pending") return "Verification pending";
+  if (status === "flagged") return "Under review";
   return "Unverified";
 }
 
@@ -458,7 +460,7 @@ export function Profile() {
             <span className={`badge badge-kyc-${kycStatus}`}>
               {kycStatus === "verified" ? (
                 <IconShield size={12} />
-              ) : kycStatus === "pending" ? (
+              ) : kycStatus === "pending" || kycStatus === "flagged" ? (
                 <IconClock size={12} />
               ) : null}
               {kycLabel(kycStatus)}
@@ -971,7 +973,7 @@ export function Profile() {
                         ? "Verified"
                         : cert.verification_status === "rejected"
                           ? "Rejected"
-                          : "In review"}
+                          : "Self-declared, not verified"}
                     </span>
                     <div className="cert-row-actions">
                       {cert.document_url ? (
@@ -1239,12 +1241,25 @@ export function Profile() {
             {previewModalCert && (
               <div className="cert-preview-content">
                 {previewModalCert.document_url ? (
-                  previewModalCert.document_url.toLowerCase().endsWith(".pdf") ? (
-                    <iframe
-                      src={previewModalCert.document_url}
-                      title={previewModalCert.name}
-                      className="cert-preview-frame"
-                    />
+                  /\.pdf($|[?#])/i.test(previewModalCert.document_url) ? (
+                    // The media server sends PDFs as attachments in a sandbox, so they cannot be embedded: offer a download.
+                    <div className="empty-state">
+                      <span className="empty-state-icon">
+                        <IconFileText size={18} />
+                      </span>
+                      <strong>PDF document</strong>
+                      <p>PDF certificates open as a download rather than inside the page.</p>
+                      <a
+                        href={previewModalCert.document_url}
+                        download
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="button primary"
+                      >
+                        <IconDownload size={14} />
+                        Download PDF
+                      </a>
+                    </div>
                   ) : (
                     <img
                       src={previewModalCert.document_url}

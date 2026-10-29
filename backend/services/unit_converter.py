@@ -19,6 +19,8 @@ import re
 from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
 
+from services import spec_codes
+
 # Standard conversion multiplier to Kilograms (kg)
 MASS_CONVERSION_TO_KG: dict[str, Decimal] = {
     # Metric Tonnes / Tons / MT
@@ -180,6 +182,85 @@ CAPACITY_CONVERSION_TO_AH: dict[str, Decimal] = {
 
 # Count units, as multiples of one piece. "2 dozen" is 24 pieces, so a buyer
 # asking for 24 pcs and a seller offering 2 dozen are the same order.
+# Further real dimensions (reference data). Compound units are written without spaces, "^" or superscripts:
+# "g/m²", "g/m^2", "gm/sqm" all arrive as "g/m2" (see ``_compound_key``).
+# Areal density -> g/m2 (GSM): fabric, paper, film, non-wovens, geotextile.
+AREAL_DENSITY_TO_GSM: dict[str, Decimal] = {
+    "gsm": Decimal("1"), "g/m2": Decimal("1"), "gm/m2": Decimal("1"), "g/sqm": Decimal("1"), "gm/sqm": Decimal("1"),
+    "gram/m2": Decimal("1"), "grams/m2": Decimal("1"),
+    "kg/m2": Decimal("1000"), "mg/cm2": Decimal("10"), "g/cm2": Decimal("10000"),
+    "oz/yd2": Decimal("33.9057"), "oz/sqyd": Decimal("33.9057"), "oz/sqyard": Decimal("33.9057"),
+    "ozyd2": Decimal("33.9057"), "oz/ft2": Decimal("305.152"), "lb/ft2": Decimal("4882.43"), "lb/m2": Decimal("453.592"),
+}
+# Linear density (yarn, filament) -> tex (g per 1000 m). Denier = g per 9000 m.
+LINEAR_DENSITY_TO_TEX: dict[str, Decimal] = {
+    "tex": Decimal("1"), "dtex": Decimal("0.1"), "den": Decimal("0.111111"), "denier": Decimal("0.111111"),
+    "mtex": Decimal("0.001"), "ktex": Decimal("1000"),
+}
+# Area -> m2
+AREA_TO_M2: dict[str, Decimal] = {
+    "m2": Decimal("1"), "sqm": Decimal("1"), "sq m": Decimal("1"), "sqmtr": Decimal("1"), "cm2": Decimal("0.0001"),
+    "sqcm": Decimal("0.0001"), "mm2": Decimal("0.000001"), "sqmm": Decimal("0.000001"), "km2": Decimal("1000000"),
+    "ft2": Decimal("0.092903"), "sqft": Decimal("0.092903"), "sq ft": Decimal("0.092903"), "sqfeet": Decimal("0.092903"),
+    "yd2": Decimal("0.836127"), "sqyd": Decimal("0.836127"), "in2": Decimal("0.00064516"), "sqin": Decimal("0.00064516"),
+    "acre": Decimal("4046.86"), "acres": Decimal("4046.86"), "hectare": Decimal("10000"), "hectares": Decimal("10000"),
+    "ha": Decimal("10000"),
+}
+# Bulk density -> kg/m3
+DENSITY_TO_KG_M3: dict[str, Decimal] = {
+    "kg/m3": Decimal("1"), "g/cm3": Decimal("1000"), "g/cc": Decimal("1000"), "g/ml": Decimal("1000"),
+    "kg/l": Decimal("1000"), "g/l": Decimal("1"), "t/m3": Decimal("1000"), "lb/ft3": Decimal("16.0185"),
+}
+# Pressure / stress (tensile strength, vessel rating) -> pascal
+PRESSURE_TO_PA: dict[str, Decimal] = {
+    "pa": Decimal("1"), "kpa": Decimal("1000"), "mpa": Decimal("1000000"), "gpa": Decimal("1000000000"),
+    "bar": Decimal("100000"), "mbar": Decimal("100"), "psi": Decimal("6894.76"), "atm": Decimal("101325"),
+    "kgf/cm2": Decimal("98066.5"), "n/mm2": Decimal("1000000"), "kgf": Decimal("98066.5"),
+}
+# Time -> days (shelf life, lead time)
+TIME_TO_DAYS: dict[str, Decimal] = {
+    "day": Decimal("1"), "days": Decimal("1"), "d": Decimal("1"), "week": Decimal("7"), "weeks": Decimal("7"),
+    "wk": Decimal("7"), "month": Decimal("30"), "months": Decimal("30"), "mo": Decimal("30"), "year": Decimal("365"),
+    "years": Decimal("365"), "yr": Decimal("365"), "yrs": Decimal("365"), "hour": Decimal("0.0416667"),
+    "hours": Decimal("0.0416667"), "hr": Decimal("0.0416667"), "hrs": Decimal("0.0416667"),
+}
+# Frequency -> Hz
+FREQUENCY_TO_HZ: dict[str, Decimal] = {
+    "hz": Decimal("1"), "khz": Decimal("1000"), "mhz": Decimal("1000000"), "ghz": Decimal("1000000000"),
+}
+# Other: each table -> (dimension name, SI/base unit label)
+EXTRA_DIMENSIONS: tuple[tuple[dict[str, Decimal], str, str], ...] = (
+    (AREAL_DENSITY_TO_GSM, "areal_density", "g/m2"),
+    (LINEAR_DENSITY_TO_TEX, "linear_density", "tex"),
+    (AREA_TO_M2, "area", "m2"),
+    (DENSITY_TO_KG_M3, "density", "kg/m3"),
+    (PRESSURE_TO_PA, "pressure", "pa"),
+    (FREQUENCY_TO_HZ, "frequency", "hz"),
+    (TIME_TO_DAYS, "time", "day"),
+)
+
+_COMPOUND_SUP = str.maketrans({"²": "2", "³": "3", "µ": "u", "μ": "u"})
+
+
+def _compound_key(unit: str) -> str:
+    """"G / M²" -> "g/m2"; "gm/sq.m" -> "gm/sqm"; "oz per sq yd" -> "oz/sqyd"."""
+    u = str(unit).strip().lower().translate(_COMPOUND_SUP)
+    u = re.sub(r"\bper\b", "/", u)
+    u = u.replace("^", "").replace(".", "")
+    u = re.sub(r"\s*/\s*", "/", u)
+    u = re.sub(r"\bsq\s+", "sq", u)
+    u = re.sub(r"(?<=/)(?:1)(?=[a-z])", "", u)
+    return u.strip()
+
+
+def dimension_of_unit(unit: Optional[str]) -> Optional[str]:
+    """Physical dimension name of a unit ("g/m2" -> "areal_density", "mm" -> "length"), or None when unknown."""
+    if not unit:
+        return None
+    probe = to_base_si(Decimal(1), str(unit))
+    return probe[2] if probe else None
+
+
 COUNT_CONVERSION_TO_PIECES: dict[str, Decimal] = {
     "pc": Decimal("1"),
     "pcs": Decimal("1"),
@@ -663,7 +744,7 @@ def compute_effective_mass_kg(
 
 
 _MEASUREMENT_RE = re.compile(
-    r"^\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*([a-zA-Zμµ°/]+(?:\^[0-9]+)?)\s*$",
+    r"^\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*([a-zA-Zμµ°]+(?:\s*/\s*[a-zA-Z]+\.?)?(?:\^?[0-9²³]+)?)\s*$",
     re.IGNORECASE,
 )
 
@@ -683,7 +764,7 @@ def parse_measurement(val_or_str: Any) -> Optional[tuple[Decimal, str]]:
         return None
     if isinstance(val_or_str, (int, float, Decimal)):
         return None
-    s = str(val_or_str).strip()
+    s = spec_codes.normalize_size_text(str(val_or_str).strip()).strip()  # 1/2", 15 NB -> "0.5 in"
     match = _MEASUREMENT_RE.match(s)
     if match:
         try:
@@ -728,6 +809,15 @@ def to_base_si(value: Decimal, unit: str) -> Optional[tuple[Decimal, str, str]]:
     if cleaned in CAPACITY_CONVERSION_TO_AH:
         return value * CAPACITY_CONVERSION_TO_AH[cleaned], "ah", "capacity"
 
+    # 8. Areal / linear density, area, bulk density, pressure, frequency, time
+    compound = _compound_key(unit)
+    for table, dimension, base_label in EXTRA_DIMENSIONS:
+        factor = table.get(compound)
+        if factor is None:
+            factor = table.get(cleaned)
+        if factor is not None:
+            return value * factor, base_label, dimension
+
     return None
 
 
@@ -768,11 +858,29 @@ def compare_measurements(
     if dim1 != dim2:
         return 0.0
 
-    if val_si1 == val_si2:
-        return 1.0
+    return numeric_closeness(val_si1, val_si2)
 
-    largest = max(abs(val_si1), abs(val_si2))
+
+NUMERIC_TOLERANCE = Decimal("0.05")
+
+
+def numeric_closeness(a: Any, b: Any) -> float:
+    """1.0 within 5 % of each other, then a steep decay: 10 % apart 0.7, 20 % 0.4, a third or more apart 0.
+
+    A real numeric conflict (gsm 120 where 180 was asked) must score below "not stated" (0.5), so the decay reaches
+    zero long before the values are far apart.
+    """
+    try:
+        x, y = Decimal(str(a)), Decimal(str(b))
+    except (InvalidOperation, ValueError, TypeError):
+        return 0.0
+    if x == y:
+        return 1.0
+    largest = max(abs(x), abs(y))
     if largest == 0:
         return 1.0
-    return max(0.0, 1.0 - float(abs(val_si1 - val_si2) / largest))
+    rel = abs(x - y) / largest
+    if rel <= NUMERIC_TOLERANCE:
+        return 1.0
+    return max(0.0, 1.0 - 3.0 * float(rel))
 

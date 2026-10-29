@@ -5,11 +5,11 @@ from decimal import Decimal
 from typing import Literal, Optional
 import uuid
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-# Funding is simulated (there is no payment gateway yet), but it must at least
-# name a real payment rail and carry the payer's reference (UTR, card auth id,
-# LC number...) so the vault is never "secured" by an arbitrary string.
+# There is no payment gateway yet: the buyer REPORTS a deposit (rail + payer
+# reference: UTR, card auth id, LC number...) and an operator confirms it. A
+# reported deposit never counts as funded.
 PaymentMethod = Literal["bank_transfer", "upi", "card", "letter_of_credit"]
 
 DisputeCategory = Literal[
@@ -57,6 +57,10 @@ class DealDisputeOut(BaseModel):
     suggested_resolution: Optional[str] = None
     resolution_notes: Optional[str] = None
     resolved_at: Optional[datetime] = None
+    # Two-step mutual settlement: who proposed it and the proposed split.
+    settlement_proposed_by_id: Optional[uuid.UUID] = None
+    settlement_release_percent: Optional[Decimal] = None
+    settlement_proposed_at: Optional[datetime] = None
     created_at: datetime
 
 
@@ -73,7 +77,13 @@ class EscrowAccountOut(BaseModel):
     funded_amount: Decimal
     released_amount: Decimal
     refunded_amount: Decimal
+    # pending_deposit | deposit_reported | funded | partially_released | completed | disputed | refunded
     status: str
+    deposit_method: Optional[str] = None
+    deposit_reference: Optional[str] = None
+    deposit_reported_at: Optional[datetime] = None
+    deposit_confirmed_at: Optional[datetime] = None
+    deposit_rejection_reason: Optional[str] = None
     milestones: list[EscrowMilestoneOut] = []
     disputes: list[DealDisputeOut] = []
     created_at: datetime
@@ -121,3 +131,20 @@ class DealDisputeResolvePayload(BaseModel):
     # up money -- and mutual_settlement by either.
     resolution: DisputeResolution = Field(..., description="release_funds, refund_buyer, mutual_settlement")
     resolution_notes: str = Field(..., min_length=5, max_length=2000, description="Settlement explanation agreed by counterparties")
+    # mutual_settlement only: share (0-100) of the remaining vault balance paid to the seller;
+    # the rest is refunded. Omit to resume the deal unchanged.
+    release_percent: Optional[Decimal] = Field(default=None, ge=0, le=100, decimal_places=2)
+
+    @model_validator(mode="after")
+    def _percent_only_for_settlement(self) -> "DealDisputeResolvePayload":
+        if self.release_percent is not None and self.resolution != "mutual_settlement":
+            raise ValueError("release_percent applies only to mutual_settlement")
+        return self
+
+
+class EscrowDepositRejectPayload(BaseModel):
+    reason: str = Field(..., min_length=3, max_length=500, description="Why the reported payment was not confirmed")
+
+
+class EscrowDepositConfirmPayload(BaseModel):
+    note: Optional[str] = Field(default=None, max_length=500)

@@ -1,10 +1,11 @@
 import json
 import uuid
 from typing import Any, Optional
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 
 from api.deps import CurrentUser, DbSession
+from core.rate_limit import RateLimit
 from schemas.ai_chat import (
     AgentInfo,
     AIChatRequest,
@@ -16,6 +17,9 @@ from services import ai_chat_service
 from services.agent_registry import get_agent, list_agents
 
 router = APIRouter(prefix="/ai-chat", tags=["ai-chat"])
+
+# Every chat turn queues on the single shared GPU: one bucket for message and stream.
+_chat_limit = Depends(RateLimit("ai-chat", "RATE_LIMIT_AI_CHAT", per="user"))
 
 
 @router.get(
@@ -108,6 +112,7 @@ async def list_available_agents() -> list[AgentInfo]:
 
 @router.post(
     "/message",
+    dependencies=[_chat_limit],
     response_model=AIChatResponse,
     status_code=status.HTTP_200_OK,
     summary="Chat with the Business AI Assistant (GPT-OSS 20B)",
@@ -155,6 +160,7 @@ async def chat_message(
 
 @router.post(
     "/stream",
+    dependencies=[_chat_limit],
     summary="Stream chat with Business AI Assistant (GPT-OSS 20B)",
 )
 async def chat_stream(

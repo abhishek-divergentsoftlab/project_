@@ -103,11 +103,11 @@ export function CounterpartyChatPane({
 
     const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
     const host = window.location.host;
-    const wsUrl = `${proto}//${host}/api/v1/ws/connections/${activeConnectionId}?token=${encodeURIComponent(token)}`;
+    const wsUrl = `${proto}//${host}/api/v1/ws/connections/${activeConnectionId}`;
 
     let socket: WebSocket;
     try {
-      socket = new WebSocket(wsUrl);
+      socket = new WebSocket(wsUrl, ["bearer", token]);
       wsRef.current = socket;
     } catch (err) {
       console.error("WebSocket connection failed to initialize:", err);

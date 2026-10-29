@@ -20,9 +20,9 @@ if TYPE_CHECKING:
 class EscrowAccount(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     __tablename__ = "escrow_accounts"
     __table_args__ = (
-        # One vault per deal room (unique since migration 33f0b331948b).
-        Index("ix_escrow_accounts_connection_id", "connection_id", unique=True),
-        Index("ix_escrow_accounts_quotation_id", "quotation_id"),
+        # One vault per ORDER (quotation); a deal room may hold several over time.
+        Index("ix_escrow_accounts_connection_id", "connection_id"),
+        Index("ix_escrow_accounts_quotation_id", "quotation_id", unique=True),
         Index("ix_escrow_accounts_buyer_id", "buyer_id"),
         Index("ix_escrow_accounts_seller_id", "seller_id"),
         Index("ix_escrow_accounts_status", "status"),
@@ -47,8 +47,14 @@ class EscrowAccount(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     released_amount: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False, default=Decimal("0.00"))
     refunded_amount: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False, default=Decimal("0.00"))
 
-    # status: pending_deposit, funded, partially_released, completed, disputed, refunded
+    # status: pending_deposit, deposit_reported, funded, partially_released, completed, disputed, refunded
+    # deposit_reported = the buyer says they paid; only an operator moves it to funded.
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending_deposit")
+    deposit_method: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    deposit_reference: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    deposit_reported_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    deposit_confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    deposit_rejection_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     connection: Mapped["Connection"] = relationship()
     quotation: Mapped["Quotation"] = relationship()
@@ -114,12 +120,20 @@ class DealDispute(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     reason: Mapped[str] = mapped_column(Text, nullable=False)
     severity: Mapped[str] = mapped_column(String(32), nullable=False, default="medium")
 
-    # status: open, under_review, resolved_release, resolved_refund, cancelled
+    # status: open, under_review, resolved_release, resolved_refund, resolved_mutual_settlement, cancelled
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="open")
     suggested_resolution: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     resolution_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # Two-step mutual settlement: one party proposes, the OTHER accepts.
+    settlement_proposed_by_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    # Share (0-100) of the remaining vault balance to pay the seller; None = resume the deal as is.
+    settlement_release_percent: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 2), nullable=True)
+    settlement_proposed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
     connection: Mapped["Connection"] = relationship()
     escrow_account: Mapped[Optional["EscrowAccount"]] = relationship(back_populates="disputes")
-    raised_by: Mapped["User"] = relationship()
+    raised_by: Mapped["User"] = relationship(foreign_keys=[raised_by_id])

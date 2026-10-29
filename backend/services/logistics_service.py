@@ -580,8 +580,10 @@ async def create_shipment_dispatch(
             "Cannot dispatch order without an accepted quotation on this deal",
         )
 
-    # Only the seller (the issuer of the quotation) may dispatch
-    if user_id != latest_quote.sender_id:
+    # Only the real seller may dispatch. After a buyer's counter-offer the quote's
+    # sender is the BUYER, so the role comes from the listing, not the quote.
+    _buyer_id, seller_id = await resolve_buyer_seller(db, conn, latest_quote.rfq_id)
+    if user_id != seller_id:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             "Only the seller can dispatch an order",
@@ -660,25 +662,17 @@ async def create_shipment_dispatch(
     latest_quote.status = QuotationStatus.DISPATCHED
     latest_quote.updated_at = now
 
-    # Optionally trigger Phase 4 Escrow Milestone 2 ("Dispatch & B/L") release request
+    # Optionally ask for the 40% dispatch tranche. Acts only on an existing,
+    # funded vault of this order; dispatch never opens a vault.
     if payload.trigger_escrow_milestone:
         try:
-            from services.escrow_service import get_or_create_escrow_for_connection, request_milestone_release
-            from schemas.escrow import MilestoneReleaseRequestPayload
-            esc = await get_or_create_escrow_for_connection(db, connection_id, user_id)
-            if esc and esc.status in ("funded", "partially_released") and esc.milestones:
-                # Milestone with order_index 1 is the 40% dispatch tranche
-                dispatch_milestone = next((m for m in esc.milestones if m.order_index == 1), None)
-                if dispatch_milestone and dispatch_milestone.status == "funded":
-                    await request_milestone_release(
-                        db,
-                        connection_id,
-                        dispatch_milestone.id,
-                        user_id,
-                        MilestoneReleaseRequestPayload(
-                            proof_note=f"Dispatched via {payload.carrier_name} under tracking {tracking}."
-                        ),
-                    )
+            from services.escrow_service import request_dispatch_milestone_release
+            await request_dispatch_milestone_release(
+                db,
+                connection_id,
+                user_id,
+                f"Dispatched via {payload.carrier_name} under tracking {tracking}.",
+            )
         except Exception as exc:
             logger.warning("Could not auto-trigger escrow dispatch milestone: %s", exc)
 
@@ -796,12 +790,18 @@ async def append_shipment_event(
 
     if shipment.status == "delivered":
         shipment.delivered_at = now
-        # Update quote status if linked
+        # The order only moves FORWARD, and only on the BUYER's delivery event
+        # (a seller-posted "delivered" is a carrier note; the seller marks the
+        # order delivered and the buyer confirms it through the quote flow).
+        # A completed / received order is never pulled back to delivered.
         if shipment.quotation_id:
-            quote = await db.get(Quotation, shipment.quotation_id)
-            if quote:
-                quote.status = QuotationStatus.DELIVERED
-                quote.updated_at = now
+            quote = await db.get(Quotation, shipment.quotation_id, populate_existing=True)
+            if quote and quote.status in (QuotationStatus.ACCEPTED, QuotationStatus.DISPATCHED):
+                conn = await db.get(Connection, shipment.connection_id)
+                buyer_id, _ = await resolve_buyer_seller(db, conn, quote.rfq_id)
+                if user_id == buyer_id:
+                    quote.status = QuotationStatus.DELIVERED
+                    quote.updated_at = now
 
     await db.commit()
     await db.refresh(shipment)

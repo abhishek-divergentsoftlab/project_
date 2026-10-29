@@ -231,6 +231,12 @@ function ChatAndDealMain({
   const [showMilestoneProofModal, setShowMilestoneProofModal] = useState<string | null>(null);
   const [milestoneProofNote, setMilestoneProofNote] = useState("");
   const [showDisputeModal, setShowDisputeModal] = useState(false);
+  const [openingEscrow, setOpeningEscrow] = useState(false);
+  // The buyer reports an external payment: rail + payer reference (UTR / transaction id).
+  const [fundMethod, setFundMethod] = useState<string>("bank_transfer");
+  const [fundReference, setFundReference] = useState("");
+  // Set after accepting a quote that awards more than the RFQ's quantity.
+  const [overAwardWarning, setOverAwardWarning] = useState<string | null>(null);
 
   // Logistics, Consignment & Multi-Modal Freight State
   const [shipment, setShipment] = useState<Shipment | null>(null);
@@ -302,6 +308,7 @@ function ChatAndDealMain({
     lead_time_days: string;
     incoterms: Incoterm;
     payment_terms: string;
+    gst_rate: string;
     notes: string;
   }>({
     unit_price: "",
@@ -311,6 +318,7 @@ function ChatAndDealMain({
     lead_time_days: "7",
     incoterms: "FOB",
     payment_terms: "Net 30",
+    gst_rate: "",
     notes: "",
   });
 
@@ -465,6 +473,12 @@ function ChatAndDealMain({
       translationApi
         .translateConnectionMessage(connectionId, msg.content, targetLang)
         .then((res) => {
+          if (res.fallback) {
+            // No translation was produced: do not show the original as one; count it as a failed attempt.
+            const key = failureKey(msg.id);
+            failures.set(key, (failures.get(key) ?? 0) + 1);
+            return;
+          }
           setTranslations((prev) => ({
             ...prev,
             [msg.id]: {
@@ -494,6 +508,10 @@ function ChatAndDealMain({
     setTranslatingIds((prev) => new Set(prev).add(msg.id));
     try {
       const res = await translationApi.translateConnectionMessage(connectionId, msg.content, targetLang);
+      if (res.fallback) {
+        setError("Translation unavailable — the message was not translated.");
+        return;
+      }
       setTranslations((prev) => ({
         ...prev,
         [msg.id]: {
@@ -519,7 +537,10 @@ function ChatAndDealMain({
     setTranslatingDraft(true);
     try {
       const res = await translationApi.translateText(text.trim(), targetLang);
-      if (res.translated_text) {
+      if (res.fallback) {
+        // The draft stays exactly as typed: nothing was translated, so there is nothing to send in its place.
+        setError("Translation unavailable — your message was not changed.");
+      } else if (res.translated_text) {
         setText(res.translated_text);
         setNotice(`Draft translated to ${targetLang.toUpperCase()}.`);
       }
@@ -606,8 +627,12 @@ function ChatAndDealMain({
         try {
           const escData = await escrowApi.getEscrow(connectionId);
           setEscrowAccount(escData);
-        } catch {
+        } catch (err) {
+          // 404 just means no vault has been opened yet; anything else is a real failure.
           setEscrowAccount(null);
+          if ((err as { response?: { status?: number } })?.response?.status !== 404) {
+            setError(errorMessage(err, "Could not load the escrow vault"));
+          }
         }
       } else {
         setEscrowAccount(null);
@@ -702,7 +727,7 @@ function ChatAndDealMain({
           } else if (payload.type === "review_submitted") {
             setNotice(`${counterpartyName} left a review.`);
           } else if (payload.type === "escrow_funded") {
-            setNotice("The buyer deposited the payment into escrow.");
+            setNotice("The platform confirmed the buyer's payment. The escrow is funded.");
           } else if (payload.type === "milestone_release_requested") {
             setNotice("The seller requested a milestone release.");
           } else if (payload.type === "milestone_released") {
@@ -743,8 +768,8 @@ function ChatAndDealMain({
       if (!token) return;
       lastToken = token;
       authRejected = false;
-      const wsUrl = `${proto}//${host}/api/v1/ws/connections/${connectionId}?token=${encodeURIComponent(token)}`;
-      const ws = new WebSocket(wsUrl);
+      const wsUrl = `${proto}//${host}/api/v1/ws/connections/${connectionId}`;
+      const ws = new WebSocket(wsUrl, ["bearer", token]);
       socket = ws;
       wsRef.current = ws;
       ws.onmessage = handleSocketMessage;
@@ -973,6 +998,14 @@ function ChatAndDealMain({
       const updated = await quoteApi.accept(connectionId, quoteId);
       setQuotes((current) => current.map((q) => (q.id === quoteId ? updated : q)));
       setNotice(`Quote accepted. Purchase order ${updated.purchase_order_reference} created.`);
+      if (updated.over_award) {
+        setOverAwardWarning(
+          `Over-award: accepted quotes now cover ${formatNumber(Number(updated.awarded_quantity ?? 0))} ${updated.quantity_unit} ` +
+            `against the ${formatNumber(Number(updated.rfq_quantity ?? 0))} ${updated.quantity_unit} requested in the RFQ.`,
+        );
+      } else {
+        setOverAwardWarning(null);
+      }
     } catch (err) {
       setError(errorMessage(err, "Could not accept quotation"));
     }
@@ -1048,6 +1081,7 @@ function ChatAndDealMain({
         lead_time_days: prefill.lead_time_days ? String(prefill.lead_time_days) : "7",
         incoterms: prefill.incoterms || "FOB",
         payment_terms: prefill.payment_terms || "Net 30",
+        gst_rate: prefill.gst_rate != null && prefill.gst_rate !== "" ? String(Number(prefill.gst_rate)) : "",
         notes: `Counter-offer to ${prefill.quote_number}`,
       });
     }
@@ -1073,6 +1107,7 @@ function ChatAndDealMain({
       lead_time_days: quoteForm.lead_time_days ? parseInt(quoteForm.lead_time_days, 10) : undefined,
       incoterms: quoteForm.incoterms,
       payment_terms: quoteForm.payment_terms,
+      ...(quoteForm.gst_rate !== "" ? { gst_rate: Number(quoteForm.gst_rate) } : {}),
       notes: quoteForm.notes || undefined,
     };
 
@@ -1196,16 +1231,39 @@ function ChatAndDealMain({
   }
 
   // Escrow Vault Handlers
-  async function handleFundEscrow() {
-    setFundingEscrow(true);
+  async function handleOpenEscrow() {
+    setOpeningEscrow(true);
     try {
-      const updated = await escrowApi.fundEscrow(connectionId, { payment_method: "mock_instant" });
-      setEscrowAccount(updated);
-      setShowFundModal(false);
-      setNotice(`${money(updated.currency, updated.funded_amount)} deposited into escrow.`);
+      const opened = await escrowApi.openEscrow(connectionId);
+      setEscrowAccount(opened);
       void reloadData();
     } catch (err) {
-      setError(`Escrow deposit failed: ${errorMessage(err)}`);
+      setError(errorMessage(err, "Could not set up escrow"));
+    } finally {
+      setOpeningEscrow(false);
+    }
+  }
+
+  // The buyer REPORTS a payment made outside the platform; the vault is only funded once the platform confirms it.
+  async function handleFundEscrow() {
+    const reference = fundReference.trim();
+    if (!reference) {
+      setError("Enter the payment reference (UTR or transaction id).");
+      return;
+    }
+    setFundingEscrow(true);
+    try {
+      const updated = await escrowApi.fundEscrow(connectionId, {
+        payment_method: fundMethod,
+        payment_reference: reference,
+      });
+      setEscrowAccount(updated);
+      setShowFundModal(false);
+      setFundReference("");
+      setNotice("Payment reported. The platform will confirm it before the escrow counts as funded.");
+      void reloadData();
+    } catch (err) {
+      setError(`Could not report the payment: ${errorMessage(err)}`);
     } finally {
       setFundingEscrow(false);
     }
@@ -1277,28 +1335,85 @@ function ChatAndDealMain({
     }
   }
 
-  async function handleResolveDisputeAction(disputeId: string, resolution: "release_funds" | "refund_buyer" | "mutual_settlement") {
+  async function handleResolveDisputeAction(
+    disputeId: string,
+    resolution: "release_funds" | "refund_buyer" | "mutual_settlement",
+    options: { accept?: boolean } = {},
+  ) {
     const labels = {
       release_funds: "release the held funds to the seller",
       refund_buyer: "refund the held funds to the buyer",
-      mutual_settlement: "record a mutual settlement and resume payments",
+      mutual_settlement: "propose a mutual settlement. The other party must accept it before anything changes",
     } as const;
-    const entered = await prompt({
-      title: "Resolve this dispute?",
-      message: `This will ${labels[resolution]}.`,
-      label: "Settlement notes",
-      placeholder: "What did both sides agree?",
-      multiline: true,
-      confirmLabel: "Resolve dispute",
-    });
-    if (entered === null) return;
-    const notes = entered || "Agreed settlement";
+    let notes = "Settlement accepted";
+    let releasePercent: number | undefined;
+    if (options.accept) {
+      const ok = await confirm({
+        title: "Accept this settlement?",
+        message: "The dispute closes on the proposed terms and the held funds move accordingly.",
+        confirmLabel: "Accept settlement",
+      });
+      if (!ok) return;
+    } else {
+      const entered = await prompt({
+        title: resolution === "mutual_settlement" ? "Propose a settlement" : "Resolve this dispute?",
+        message: `This will ${labels[resolution]}.`,
+        label: "Settlement notes",
+        placeholder: "What are you proposing or agreeing to?",
+        multiline: true,
+        confirmLabel: resolution === "mutual_settlement" ? "Send proposal" : "Resolve dispute",
+      });
+      if (entered === null) return;
+      notes = entered || "Agreed settlement";
+      if (resolution === "mutual_settlement") {
+        const pct = await prompt({
+          title: "Split of the remaining balance",
+          message: "Share of the remaining escrow balance paid to the seller. The rest is refunded to the buyer. Leave empty to resume the deal unchanged.",
+          label: "Release to seller (%)",
+          placeholder: "e.g. 60",
+          confirmLabel: "Continue",
+        });
+        if (pct === null) return;
+        if (pct.trim()) {
+          const value = Number(pct.trim());
+          if (!Number.isFinite(value) || value < 0 || value > 100) {
+            setError("Enter a percentage between 0 and 100.");
+            return;
+          }
+          releasePercent = value;
+        }
+      }
+    }
     try {
-      await escrowApi.resolveDispute(connectionId, disputeId, { resolution, resolution_notes: notes });
-      setNotice("Dispute resolved.");
+      await escrowApi.resolveDispute(connectionId, disputeId, {
+        resolution,
+        resolution_notes: notes,
+        ...(releasePercent !== undefined ? { release_percent: releasePercent } : {}),
+      });
+      setNotice(
+        resolution === "mutual_settlement" && !options.accept
+          ? "Settlement proposed. Waiting for the other party to accept."
+          : "Dispute resolved.",
+      );
       void reloadData();
     } catch (err) {
       setError(`Failed to resolve dispute: ${errorMessage(err)}`);
+    }
+  }
+
+  async function handleWithdrawDispute(disputeId: string) {
+    const ok = await confirm({
+      title: "Withdraw this dispute?",
+      message: "The dispute closes without a settlement and escrow releases can continue.",
+      confirmLabel: "Withdraw dispute",
+    });
+    if (!ok) return;
+    try {
+      await escrowApi.withdrawDispute(connectionId, disputeId);
+      setNotice("Dispute withdrawn.");
+      void reloadData();
+    } catch (err) {
+      setError(`Failed to withdraw dispute: ${errorMessage(err)}`);
     }
   }
 
@@ -1844,6 +1959,18 @@ function ChatAndDealMain({
             {/* TAB 1: QUOTES & NEGOTIATION */}
             {rightTab === "quotes" && (
               <>
+                {overAwardWarning && (
+                  <div
+                    className="alert alert-warning"
+                    role="alert"
+                    style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "var(--space-2)" }}
+                  >
+                    <span>{overAwardWarning}</span>
+                    <button type="button" className="ghost small-btn" onClick={() => setOverAwardWarning(null)}>
+                      Dismiss
+                    </button>
+                  </div>
+                )}
                 {open && latestQuote ? (
                   <div className={`active-quote-card status-${latestQuote.status}`}>
                     <div className="quote-badge-row">
@@ -1857,6 +1984,9 @@ function ChatAndDealMain({
                     <div className="quote-total-row">
                       <span className="quote-label">Total</span>
                       <strong className="quote-total">{money(latestQuote.currency, latestQuote.total_amount)}</strong>
+                      {latestQuote.converted && (
+                        <span className="muted small"> ≈ {money(latestQuote.converted.currency, latestQuote.converted.total_amount)} in RFQ currency</span>
+                      )}
                     </div>
 
                     <dl className="quote-details-grid">
@@ -1864,6 +1994,11 @@ function ChatAndDealMain({
                         <dt className="quote-label">Unit price</dt>
                         <dd>
                           {money(latestQuote.currency, latestQuote.unit_price)} / {latestQuote.quantity_unit}
+                          {latestQuote.converted && (
+                            <span className="muted small">
+                              {" "}≈ {money(latestQuote.converted.currency, latestQuote.converted.unit_price)} / {latestQuote.quantity_unit}
+                            </span>
+                          )}
                         </dd>
                       </div>
                       <div>
@@ -1879,6 +2014,14 @@ function ChatAndDealMain({
                       <div>
                         <dt className="quote-label">Payment</dt>
                         <dd>{latestQuote.payment_terms || "Standard"}</dd>
+                      </div>
+                      <div>
+                        <dt className="quote-label">GST</dt>
+                        <dd>
+                          {latestQuote.gst_rate != null && latestQuote.gst_rate !== ""
+                            ? `${Number(latestQuote.gst_rate)}%`
+                            : "as applicable"}
+                        </dd>
                       </div>
                       {latestQuote.lead_time_days ? (
                         <div>
@@ -2162,6 +2305,9 @@ function ChatAndDealMain({
                         <p>
                           {money(q.currency, q.unit_price)} × {formatNumber(q.quantity)} {q.quantity_unit} ={" "}
                           <strong>{money(q.currency, q.total_amount)}</strong>
+                          {q.converted && (
+                            <span className="muted small"> ≈ {money(q.converted.currency, q.converted.total_amount)}</span>
+                          )}
                         </p>
                         {q.notes && <p className="muted small">{q.notes}</p>}
                       </div>
@@ -2186,7 +2332,11 @@ function ChatAndDealMain({
                             : "pending"
                       }`}
                     >
-                      {escrowAccount.status === "pending_deposit" ? "Awaiting deposit" : humanize(escrowAccount.status)}
+                      {escrowAccount.status === "pending_deposit"
+                        ? "Awaiting deposit"
+                        : escrowAccount.status === "deposit_reported"
+                          ? "Payment reported"
+                          : humanize(escrowAccount.status)}
                     </span>
                   )}
                 </div>
@@ -2205,8 +2355,13 @@ function ChatAndDealMain({
                       <li>Funds are released on delivery</li>
                     </ol>
                     {latestQuote && ["accepted", "delivered", "received", "completed"].includes(latestQuote.status) ? (
-                      <button type="button" className="primary small-btn" onClick={() => void reloadData()}>
-                        Set up escrow
+                      <button
+                        type="button"
+                        className="primary small-btn"
+                        onClick={() => void handleOpenEscrow()}
+                        disabled={openingEscrow}
+                      >
+                        {openingEscrow ? "Setting up…" : "Set up escrow"}
                       </button>
                     ) : (
                       <button type="button" className="secondary small-btn" onClick={() => setRightTab("quotes")}>
@@ -2264,10 +2419,18 @@ function ChatAndDealMain({
                       {/* Deposit CTA if pending deposit */}
                       {escrowAccount.status === "pending_deposit" && (
                         <div className="escrow-deposit-cta">
+                          {escrowAccount.deposit_rejection_reason && (
+                            <div className="escrow-dispute-alert" role="alert">
+                              <strong>The reported payment was not confirmed.</strong>
+                              <p>Reason: {escrowAccount.deposit_rejection_reason}</p>
+                              {isBuyer && <p>Check the details and report the payment again.</p>}
+                            </div>
+                          )}
                           {isBuyer ? (
                             <>
                               <p className="deposit-cta-text">
-                                Deposit the payment so the seller can start production with payment guaranteed.
+                                Pay {money(escrowAccount.currency, escrowAccount.total_amount)} to the escrow account, then
+                                report the payment reference. The seller is told to start only after the platform confirms it.
                               </p>
                               <button
                                 type="button"
@@ -2276,15 +2439,34 @@ function ChatAndDealMain({
                                 disabled={fundingEscrow}
                               >
                                 <IconLock size={15} />
-                                {fundingEscrow ? "Processing…" : `Deposit ${money(escrowAccount.currency, escrowAccount.total_amount)}`}
+                                {escrowAccount.deposit_rejection_reason ? "Report payment again" : "Report payment"}
                               </button>
                             </>
                           ) : (
                             <p className="deposit-cta-muted">
-                              <IconClock size={14} /> Waiting for the buyer to deposit{" "}
+                              <IconClock size={14} /> Waiting for the buyer to pay{" "}
                               {money(escrowAccount.currency, escrowAccount.total_amount)}.
                             </p>
                           )}
+                        </div>
+                      )}
+
+                      {/* Reported, not yet confirmed: never presented as secured */}
+                      {escrowAccount.status === "deposit_reported" && (
+                        <div className="escrow-deposit-cta" role="status" style={{ background: "rgba(234, 179, 8, 0.12)", border: "1px solid rgba(234, 179, 8, 0.4)", borderRadius: "8px", padding: "10px 14px" }}>
+                          <p className="deposit-cta-muted" style={{ color: "#ca8a04", margin: 0, display: "flex", gap: "8px", alignItems: "flex-start" }}>
+                            <IconClock size={16} style={{ marginTop: "2px", flexShrink: 0 }} />
+                            <span>
+                              <strong style={{ display: "block", color: "#a16207", marginBottom: "2px" }}>
+                                ⚠️ Payment Claimed — Awaiting Verification
+                              </strong>
+                              Buyer reported transfer (ref {escrowAccount.deposit_reference ?? "n/a"}
+                              {escrowAccount.deposit_method ? `, ${humanize(escrowAccount.deposit_method)}` : ""}).
+                              <span style={{ display: "block", marginTop: "4px", fontSize: "12px", color: "#b45309", fontWeight: 500 }}>
+                                <strong>SUPPLIER ADVISORY:</strong> Funds are NOT in escrow yet. Do NOT dispatch goods until status updates to "Funded".
+                              </span>
+                            </span>
+                          </p>
                         </div>
                       )}
                     </div>
@@ -2402,9 +2584,11 @@ function ChatAndDealMain({
                           <IconAlert size={14} /> Open a dispute
                         </button>
                       )}
-                      <p className="escrow-bottom-guarantee">
-                        Funds stay in escrow until each milestone is released.
-                      </p>
+                      {["funded", "partially_released", "disputed"].includes(escrowAccount.status) && (
+                        <p className="escrow-bottom-guarantee">
+                          Funds stay in escrow until each milestone is released.
+                        </p>
+                      )}
                     </div>
                   </div>
                 )}
@@ -2804,12 +2988,14 @@ function ChatAndDealMain({
                               <span className="issue-cat-tag">{dispute.category}</span>
                             </div>
                             <span
-                              className={`badge ${dispute.status.startsWith("resolved") ? "badge-accepted" : "badge-rejected"}`}
+                              className={`badge ${dispute.status.startsWith("resolved") ? "badge-accepted" : dispute.status === "cancelled" ? "badge-draft" : "badge-rejected"}`}
                             >
                               {dispute.status.startsWith("resolved") ? (
                                 <>
                                   <IconCheck size={12} /> {humanize(dispute.status.replace("resolved_", ""))}
                                 </>
+                              ) : dispute.status === "cancelled" ? (
+                                "Withdrawn"
                               ) : (
                                 "Payments paused"
                               )}
@@ -2836,31 +3022,83 @@ function ChatAndDealMain({
 
                             {dispute.status === "open" && (
                               <div className="issue-resolve-actions">
+                                {dispute.settlement_proposed_by_id && (
+                                  <p className="muted small" role="status">
+                                    {dispute.settlement_proposed_by_id === myId
+                                      ? "Settlement proposed by you — waiting for the other party."
+                                      : `Settlement proposed by ${counterpartyName}.`}
+                                    {dispute.settlement_release_percent != null
+                                      ? ` Seller receives ${formatNumber(Number(dispute.settlement_release_percent))}% of the remaining balance, the buyer is refunded the rest.`
+                                      : " The deal resumes as agreed."}
+                                  </p>
+                                )}
                                 <span className="quote-label">Resolve by</span>
-                                <button
-                                  type="button"
-                                  className="secondary small-btn"
-                                  onClick={() => void handleResolveDisputeAction(dispute.id, "release_funds")}
-                                  title="Release the held funds to the seller"
-                                >
-                                  Release to seller
-                                </button>
-                                <button
-                                  type="button"
-                                  className="secondary small-btn"
-                                  onClick={() => void handleResolveDisputeAction(dispute.id, "refund_buyer")}
-                                  title="Refund the held funds to the buyer"
-                                >
-                                  Refund buyer
-                                </button>
-                                <button
-                                  type="button"
-                                  className="secondary small-btn"
-                                  onClick={() => void handleResolveDisputeAction(dispute.id, "mutual_settlement")}
-                                  title="Record an agreed settlement and resume payments"
-                                >
-                                  Settle mutually
-                                </button>
+                                {isBuyer && (
+                                  <button
+                                    type="button"
+                                    className="secondary small-btn"
+                                    onClick={() => void handleResolveDisputeAction(dispute.id, "release_funds")}
+                                    title="Release the held funds to the seller"
+                                  >
+                                    Release to seller
+                                  </button>
+                                )}
+                                {!isBuyer && (
+                                  <button
+                                    type="button"
+                                    className="secondary small-btn"
+                                    onClick={() => void handleResolveDisputeAction(dispute.id, "refund_buyer")}
+                                    title="Refund the held funds to the buyer"
+                                  >
+                                    Refund buyer
+                                  </button>
+                                )}
+                                {dispute.settlement_proposed_by_id && dispute.settlement_proposed_by_id !== myId ? (
+                                  <>
+                                    <button
+                                      type="button"
+                                      className="primary small-btn"
+                                      onClick={() => void handleResolveDisputeAction(dispute.id, "mutual_settlement", { accept: true })}
+                                    >
+                                      Accept settlement
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="secondary small-btn"
+                                      onClick={() => void handleResolveDisputeAction(dispute.id, "mutual_settlement")}
+                                      title="Propose a different split instead"
+                                    >
+                                      Counter-propose
+                                    </button>
+                                  </>
+                                ) : !dispute.settlement_proposed_by_id ? (
+                                  <button
+                                    type="button"
+                                    className="secondary small-btn"
+                                    onClick={() => void handleResolveDisputeAction(dispute.id, "mutual_settlement")}
+                                    title="Propose a settlement; the other party must accept it"
+                                  >
+                                    Propose settlement
+                                  </button>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    className="secondary small-btn"
+                                    onClick={() => void handleResolveDisputeAction(dispute.id, "mutual_settlement")}
+                                    title="Replace your proposal with new terms"
+                                  >
+                                    Revise proposal
+                                  </button>
+                                )}
+                                {dispute.raised_by_id === myId && (
+                                  <button
+                                    type="button"
+                                    className="ghost small-btn danger-btn"
+                                    onClick={() => void handleWithdrawDispute(dispute.id)}
+                                  >
+                                    Withdraw dispute
+                                  </button>
+                                )}
                               </div>
                             )}
                           </div>
@@ -3090,6 +3328,20 @@ function ChatAndDealMain({
                   value={quoteForm.payment_terms}
                   onChange={(e) => setQuoteForm({ ...quoteForm, payment_terms: e.target.value })}
                 />
+              </div>
+
+              <div>
+                <label htmlFor="quote-gst">GST % <span className="optional">Optional</span></label>
+                <select
+                  id="quote-gst"
+                  value={quoteForm.gst_rate}
+                  onChange={(e) => setQuoteForm({ ...quoteForm, gst_rate: e.target.value })}
+                >
+                  <option value="">As applicable / not specified</option>
+                  {["0", "0.1", "0.25", "1.5", "3", "5", "12", "18", "28"].map((r) => (
+                    <option key={r} value={r}>{r}%</option>
+                  ))}
+                </select>
               </div>
 
               <div>
@@ -3495,12 +3747,18 @@ function ChatAndDealMain({
         </div>
       )}
 
-      {/* 6. Escrow Deposit Modal */}
+      {/* 6. Escrow Payment Report Modal */}
       {showFundModal && escrowAccount && (
         <div className="modal-overlay">
-          <div className="modal-card">
+          <form
+            className="modal-card"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void handleFundEscrow();
+            }}
+          >
             <div className="modal-header">
-              <h3>Deposit into escrow</h3>
+              <h3>Report your escrow payment</h3>
               <button
                 type="button"
                 className="close-btn"
@@ -3512,14 +3770,37 @@ function ChatAndDealMain({
             <div className="modal-body">
               <div className="escrow-modal-summary">
                 <p>
-                  Deposit <strong>{money(escrowAccount.currency, escrowAccount.total_amount)}</strong>. It stays
-                  in escrow and is released to the seller milestone by milestone.
+                  Pay <strong>{money(escrowAccount.currency, escrowAccount.total_amount)}</strong> to the escrow
+                  account, then enter how you paid and the reference. This is a report: the platform confirms the
+                  payment arrived before the escrow counts as funded.
                 </p>
-                <ul className="escrow-modal-points">
-                  <li>The seller is guaranteed payment once each milestone is met.</li>
-                  <li>You're protected if the goods don't arrive as agreed.</li>
-                  <li>Either side can open a dispute to pause payments.</li>
-                </ul>
+              </div>
+              <div>
+                <label htmlFor="escrow-pay-method">Payment method</label>
+                <select
+                  id="escrow-pay-method"
+                  className="form-input"
+                  value={fundMethod}
+                  onChange={(e) => setFundMethod(e.target.value)}
+                >
+                  <option value="bank_transfer">Bank transfer (NEFT / RTGS / wire)</option>
+                  <option value="upi">UPI</option>
+                  <option value="card">Card</option>
+                  <option value="letter_of_credit">Letter of credit</option>
+                </select>
+              </div>
+              <div>
+                <label htmlFor="escrow-pay-ref">Payment reference</label>
+                <input
+                  id="escrow-pay-ref"
+                  type="text"
+                  className="form-input"
+                  placeholder="UTR or transaction id"
+                  maxLength={120}
+                  value={fundReference}
+                  onChange={(e) => setFundReference(e.target.value)}
+                  required
+                />
               </div>
             </div>
             <div className="modal-actions">
@@ -3531,16 +3812,11 @@ function ChatAndDealMain({
               >
                 Cancel
               </button>
-              <button
-                type="button"
-                className="primary"
-                onClick={() => void handleFundEscrow()}
-                disabled={fundingEscrow}
-              >
-                {fundingEscrow ? "Depositing…" : `Deposit ${money(escrowAccount.currency, escrowAccount.total_amount)}`}
+              <button type="submit" className="primary" disabled={fundingEscrow || !fundReference.trim()}>
+                {fundingEscrow ? "Reporting…" : "Report payment"}
               </button>
             </div>
-          </div>
+          </form>
         </div>
       )}
 

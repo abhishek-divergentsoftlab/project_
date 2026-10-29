@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -7,7 +8,7 @@ from decimal import Decimal
 from typing import Optional, Sequence
 
 from fastapi import HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -16,7 +17,9 @@ from models.enums import ConnectionStatus, QuotationStatus, RFQRole, RFQStatus
 from models.quotation import Quotation
 from models.rfq import RFQ
 from models.user import User
-from schemas.quotation import QuotationCreate, QuotationOut
+from schemas.quotation import ConvertedAmount, QuotationCreate, QuotationOut
+from services import currency as currency_service
+from services import unit_converter
 from services.websocket_manager import ws_manager
 
 logger = logging.getLogger(__name__)
@@ -27,6 +30,16 @@ ACTIVE_ORDER_STATUSES = (
     QuotationStatus.ACCEPTED,
     QuotationStatus.DISPATCHED,
     QuotationStatus.DELIVERED,
+)
+
+
+# Quantity already committed to a seller: accepted or any later stage.
+AWARDED_STATUSES = (
+    QuotationStatus.ACCEPTED,
+    QuotationStatus.DISPATCHED,
+    QuotationStatus.DELIVERED,
+    QuotationStatus.RECEIVED,
+    QuotationStatus.COMPLETED,
 )
 
 
@@ -91,8 +104,39 @@ async def _ensure_rfq_open(db: AsyncSession, rfq_id: uuid.UUID) -> RFQ:
     return rfq
 
 
-def to_out(quote: Quotation, viewer_id: uuid.UUID) -> QuotationOut:
+def rfq_unit_of(rfq: Optional[RFQ]) -> Optional[str]:
+    if rfq is None:
+        return None
+    return rfq.quantity_unit or rfq.price_per_unit or None
+
+
+def _converted(quote: Quotation, rfq_currency: Optional[str]) -> Optional[ConvertedAmount]:
+    """The quote restated in the RFQ's currency, or None (same currency / no rate)."""
+    if not rfq_currency or quote.currency == rfq_currency:
+        return None
+    total = currency_service.convert(quote.total_amount, quote.currency, rfq_currency)
+    price = currency_service.convert(quote.unit_price, quote.currency, rfq_currency)
+    rate = currency_service.convert(Decimal(1), quote.currency, rfq_currency)
+    if total is None or price is None or rate is None:
+        return None
+    q4 = Decimal("0.0001")
+    return ConvertedAmount(
+        currency=rfq_currency,
+        unit_price=price.quantize(q4),
+        total_amount=total.quantize(q4),
+        rate=rate.quantize(Decimal("0.000001")),
+    )
+
+
+def to_out(
+    quote: Quotation, viewer_id: uuid.UUID, rfq: Optional[RFQ] = None, **extra
+) -> QuotationOut:
+    rfq_currency = rfq.price_currency if rfq is not None else None
     return QuotationOut(
+        rfq_currency=rfq_currency,
+        rfq_unit=rfq_unit_of(rfq),
+        converted=_converted(quote, rfq_currency),
+        **extra,
         id=quote.id,
         connection_id=quote.connection_id,
         sender_id=quote.sender_id,
@@ -106,6 +150,7 @@ def to_out(quote: Quotation, viewer_id: uuid.UUID) -> QuotationOut:
         quantity=quote.quantity,
         quantity_unit=quote.quantity_unit,
         total_amount=quote.total_amount,
+        gst_rate=quote.gst_rate,
         lead_time_days=quote.lead_time_days,
         incoterms=quote.incoterms,
         payment_terms=quote.payment_terms,
@@ -118,6 +163,114 @@ def to_out(quote: Quotation, viewer_id: uuid.UUID) -> QuotationOut:
     )
 
 
+async def out_for(
+    db: AsyncSession, quote: Quotation, viewer_id: uuid.UUID, **extra
+) -> QuotationOut:
+    """``to_out`` with the listing loaded, so currency conversion is included."""
+    rfq = await db.get(RFQ, quote.rfq_id)
+    return to_out(quote, viewer_id, rfq, **extra)
+
+
+def _dimension(unit: Optional[str]) -> Optional[str]:
+    for name, check in (
+        ("mass", unit_converter.is_mass_unit),
+        ("volume", unit_converter.is_volume_unit),
+        ("length", unit_converter.is_length_unit),
+        ("count", unit_converter.is_count_unit),
+    ):
+        if check(unit):
+            return name
+    return None
+
+
+def _check_unit_compatible(quote_unit: str, rfq_unit: Optional[str]) -> None:
+    """422 when a quote is priced in a different kind of unit than the listing (kg vs pcs)."""
+    if not rfq_unit:
+        return
+    a, b = _dimension(quote_unit), _dimension(rfq_unit)
+    if a is not None and b is not None and a != b:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"The listing is in '{rfq_unit}' ({b}) but this quotation is in '{quote_unit}' ({a}); "
+            f"quote in '{rfq_unit}' or another {b} unit",
+        )
+
+
+def build_rfq_snapshot(rfq: RFQ) -> dict:
+    """What the contract documents must keep showing, frozen at acceptance."""
+    details = json.loads(json.dumps(rfq.product_details or {}, default=str))
+    hsn = details.get("hsn_code") or details.get("hsn")
+    return {
+        "title": rfq.title,
+        "category": rfq.category,
+        "description": rfq.description,
+        "product_details": details,
+        "quantity": str(rfq.quantity_value) if rfq.quantity_value is not None else None,
+        "unit": rfq.quantity_unit,
+        "price_amount": str(rfq.price_amount) if rfq.price_amount is not None else None,
+        "price_currency": rfq.price_currency,
+        "price_per_unit": rfq.price_per_unit,
+        "location_city": rfq.location_city,
+        "location_state": rfq.location_state,
+        "location_country": rfq.location_country,
+        "location_raw": rfq.location_raw,
+        "hsn": str(hsn) if hsn else None,
+        "snapshot_at": datetime.now(UTC).isoformat(),
+    }
+
+
+async def awarded_totals(db: AsyncSession, rfq: RFQ) -> tuple[Decimal, Optional[Decimal]]:
+    """(quantity awarded across accepted-or-later quotes, in the RFQ's unit; RFQ quantity)."""
+    rfq_unit = rfq_unit_of(rfq)
+    rows = (
+        await db.execute(
+            select(Quotation.quantity, Quotation.quantity_unit).where(
+                Quotation.rfq_id == rfq.id, Quotation.status.in_(AWARDED_STATUSES)
+            )
+        )
+    ).all()
+    total = Decimal(0)
+    for qty, unit in rows:
+        qty = Decimal(str(qty))
+        if rfq_unit and unit and unit != rfq_unit:
+            converted = unit_converter.convert(qty, unit, rfq_unit)
+            if converted is not None:
+                qty = converted
+        total += qty
+    rfq_qty = Decimal(str(rfq.quantity_value)) if rfq.quantity_value is not None else None
+    return total, rfq_qty
+
+
+async def expire_pending_for_rfqs(db: AsyncSession, rfq_ids: Sequence[uuid.UUID]) -> int:
+    """Mark PENDING quotes on these RFQs EXPIRED (RFQ closed / expired). Caller commits."""
+    ids = list(rfq_ids)
+    if not ids:
+        return 0
+    res = await db.execute(
+        update(Quotation)
+        .where(Quotation.rfq_id.in_(ids), Quotation.status == QuotationStatus.PENDING)
+        .values(status=QuotationStatus.EXPIRED)
+        .execution_options(synchronize_session=False)
+    )
+    return res.rowcount or 0
+
+
+async def expire_due_quotes(db: AsyncSession) -> int:
+    """Mark PENDING quotes past ``valid_until`` EXPIRED (scheduler job). Idempotent."""
+    res = await db.execute(
+        update(Quotation)
+        .where(
+            Quotation.status == QuotationStatus.PENDING,
+            Quotation.valid_until.is_not(None),
+            Quotation.valid_until < datetime.now(UTC),
+        )
+        .values(status=QuotationStatus.EXPIRED)
+        .execution_options(synchronize_session=False)
+    )
+    await db.commit()
+    return res.rowcount or 0
+
+
 async def create_quotation(
     db: AsyncSession,
     connection_id: uuid.UUID,
@@ -125,8 +278,14 @@ async def create_quotation(
     payload: QuotationCreate,
 ) -> Quotation:
     conn = await _get_accepted_connection(db, connection_id, user_id, lock=True)
-    await _ensure_rfq_open(db, conn.rfq_id)
+    rfq = await _ensure_rfq_open(db, conn.rfq_id)
     await _ensure_no_live_order(db, connection_id)
+
+    # Currency and unit default to the listing's; a unit of another dimension is refused.
+    rfq_unit = rfq_unit_of(rfq)
+    quote_currency = payload.currency or rfq.price_currency or "INR"
+    quote_unit = payload.quantity_unit or rfq_unit or "pcs"
+    _check_unit_compatible(quote_unit, rfq_unit)
 
     receiver_id = conn.receiver_id if conn.sender_id == user_id else conn.sender_id
 
@@ -160,10 +319,11 @@ async def create_quotation(
         version=next_version,
         status=QuotationStatus.PENDING,
         unit_price=payload.unit_price,
-        currency=payload.currency,
+        currency=quote_currency,
         quantity=payload.quantity,
-        quantity_unit=payload.quantity_unit,
+        quantity_unit=quote_unit,
         total_amount=total_amount,
+        gst_rate=payload.gst_rate,
         lead_time_days=payload.lead_time_days,
         incoterms=payload.incoterms,
         payment_terms=payload.payment_terms,
@@ -176,7 +336,7 @@ async def create_quotation(
     await db.refresh(quote)
 
     # Real-time event push to deal room
-    out = to_out(quote, user_id)
+    out = to_out(quote, user_id, rfq)
     await ws_manager.broadcast(
         connection_id,
         "quote_created",
@@ -224,7 +384,9 @@ async def list_quotations(
 
 async def accept_quotation(
     db: AsyncSession, connection_id: uuid.UUID, quote_id: uuid.UUID, user_id: uuid.UUID
-) -> Quotation:
+) -> tuple[Quotation, dict]:
+    """Accept a pending quotation. Returns the quote and the award summary
+    (``over_award``, ``awarded_quantity``, ``rfq_quantity``) for the response."""
     await _get_accepted_connection(db, connection_id, user_id, lock=True)
 
     quote = await db.get(Quotation, quote_id, populate_existing=True)
@@ -244,20 +406,45 @@ async def accept_quotation(
             f"Cannot accept quotation in {quote.status.value} status",
         )
 
+    # A closed or expired listing can no longer award orders.
+    rfq = await _ensure_rfq_open(db, quote.rfq_id)
+
     now = datetime.now(UTC)
     if quote.valid_until and quote.valid_until < now:
         quote.status = QuotationStatus.EXPIRED
         await db.commit()
         raise HTTPException(status.HTTP_409_CONFLICT, "This quotation has expired")
 
-    quote.status = QuotationStatus.ACCEPTED
     po_ref = f"PO-{now.strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
-    quote.purchase_order_reference = po_ref
+    # Conditional transition: whoever flips the row out of 'pending' first wins;
+    # a concurrent reject/accept that lost the race gets a 409.
+    res = await db.execute(
+        update(Quotation)
+        .where(Quotation.id == quote.id, Quotation.status == QuotationStatus.PENDING)
+        .values(
+            status=QuotationStatus.ACCEPTED,
+            purchase_order_reference=po_ref,
+            rfq_snapshot=build_rfq_snapshot(rfq),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if res.rowcount != 1:
+        await db.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, "This quotation was just actioned by the other party")
 
+    awarded, rfq_qty = await awarded_totals(db, rfq)
+    over_award = rfq_qty is not None and awarded > rfq_qty
     await db.commit()
     await db.refresh(quote)
+    if over_award:
+        logger.warning("RFQ %s over-awarded: %s awarded of %s", rfq.id, awarded, rfq_qty)
+    award = {
+        "over_award": over_award,
+        "awarded_quantity": awarded,
+        "rfq_quantity": rfq_qty,
+    }
 
-    out = to_out(quote, user_id)
+    out = to_out(quote, user_id, rfq, **award)
     await ws_manager.broadcast(
         connection_id,
         "quote_accepted",
@@ -285,15 +472,16 @@ async def accept_quotation(
         logger.warning("Quotation-accepted notification failed (non-fatal)", exc_info=True)
         await db.rollback()
 
-    return quote
+    return quote, award
 
 
 async def reject_quotation(
     db: AsyncSession, connection_id: uuid.UUID, quote_id: uuid.UUID, user_id: uuid.UUID, reason: str | None = None
 ) -> Quotation:
-    await _get_accepted_connection(db, connection_id, user_id)
+    # Same connection lock as accept, so the two serialize; re-read after the lock.
+    await _get_accepted_connection(db, connection_id, user_id, lock=True)
 
-    quote = await db.get(Quotation, quote_id)
+    quote = await db.get(Quotation, quote_id, populate_existing=True)
     if quote is None or quote.connection_id != connection_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Quotation not found")
 
@@ -308,14 +496,23 @@ async def reject_quotation(
             f"Cannot decline quotation in {quote.status.value} status",
         )
 
-    quote.status = QuotationStatus.REJECTED
+    values: dict = {"status": QuotationStatus.REJECTED}
     if reason:
-        quote.notes = f"{quote.notes or ''}\n[Decline Reason]: {reason}".strip()
+        values["notes"] = f"{quote.notes or ''}\n[Decline Reason]: {reason}".strip()
+    res = await db.execute(
+        update(Quotation)
+        .where(Quotation.id == quote.id, Quotation.status == QuotationStatus.PENDING)
+        .values(**values)
+        .execution_options(synchronize_session=False)
+    )
+    if res.rowcount != 1:
+        await db.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, "This quotation was just actioned by the other party")
 
     await db.commit()
     await db.refresh(quote)
 
-    out = to_out(quote, user_id)
+    out = await out_for(db, quote, user_id)
     await ws_manager.broadcast(
         connection_id,
         "quote_rejected",

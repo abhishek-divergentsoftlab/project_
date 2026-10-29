@@ -3,10 +3,10 @@
 import uuid
 from datetime import datetime
 from decimal import Decimal
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from sqlalchemy import DateTime, Enum, ForeignKey, Index, Integer, Numeric, String, Text
-from sqlalchemy.dialects.postgresql import UUID as PGUUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -57,6 +57,8 @@ class Quotation(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     quantity: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
     quantity_unit: Mapped[str] = mapped_column(String(32), nullable=False, default="pcs")
     total_amount: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
+    # GST slab in percent (e.g. 18); null = not stated ("as applicable" on documents).
+    gst_rate: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 2), nullable=True)
 
     lead_time_days: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     incoterms: Mapped[Optional[Incoterm]] = mapped_column(
@@ -73,6 +75,11 @@ class Quotation(Base, UUIDPrimaryKeyMixin, TimestampMixin):
 
     # Generated upon acceptance
     purchase_order_reference: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
+    # The listing as it stood when the quote was accepted (title, specs,
+    # quantity, destination, HSN). The PO and invoice render from this, so a
+    # later edit of the RFQ cannot rewrite the contract. NULL on legacy rows.
+    rfq_snapshot: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB, nullable=True)
 
     connection: Mapped["Connection"] = relationship("Connection", lazy="noload")
     sender: Mapped["User"] = relationship("User", foreign_keys=[sender_id], lazy="noload")

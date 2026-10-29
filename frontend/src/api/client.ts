@@ -23,14 +23,25 @@ export const tokenStore = {
   },
 };
 
+/** No request may hang forever; AI-backed calls queue on a shared GPU, so this is generous. */
+export const REQUEST_TIMEOUT_MS = 120_000;
+/** AI chat turns can legitimately run up to the backend's own 180 s model timeout. */
+const AI_CHAT_TIMEOUT_MS = 240_000;
+export const TIMEOUT_MESSAGE = "The server took too long to respond. Please try again.";
+
 export const api = axios.create({
   baseURL: import.meta.env.VITE_API_BASE_URL || "/api/v1",
   headers: { "Content-Type": "application/json" },
+  timeout: REQUEST_TIMEOUT_MS,
 });
 
 api.interceptors.request.use((config) => {
   const token = tokenStore.access();
   if (token) config.headers.Authorization = `Bearer ${token}`;
+  // Only raise the default for chat; an explicit per-call timeout always wins.
+  if (config.timeout === REQUEST_TIMEOUT_MS && config.url?.includes("/ai-chat/")) {
+    config.timeout = AI_CHAT_TIMEOUT_MS;
+  }
   return config;
 });
 
@@ -52,7 +63,7 @@ async function refreshAccessToken(): Promise<string> {
   const { data } = await axios.post<TokenPair>(
     `${api.defaults.baseURL}/auth/refresh`,
     { refresh_token: refreshToken },
-    { headers: { "Content-Type": "application/json" } },
+    { headers: { "Content-Type": "application/json" }, timeout: REQUEST_TIMEOUT_MS },
   );
   tokenStore.save(data);
   return data.access_token;
@@ -96,6 +107,10 @@ api.interceptors.response.use(
 /** Pulls FastAPI's error shape into a single displayable string. */
 export function errorMessage(error: unknown, fallback = "Something went wrong"): string {
   if (axios.isAxiosError(error)) {
+    // No response and a timeout code: axios' own message ("timeout of 120000ms exceeded") is not for users.
+    if (!error.response && (error.code === "ECONNABORTED" || error.code === "ETIMEDOUT")) {
+      return TIMEOUT_MESSAGE;
+    }
     const detail = error.response?.data?.detail;
     if (typeof detail === "string") return detail;
     // 409 duplicate: {message, existing_rfq_id}.

@@ -13,12 +13,13 @@ listing table into a scrapeable lead list.
 
 import uuid
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_serializer
 
 from models.enums import ConnectionStatus, RFQRole
 from schemas.common import DeadlineOut, Location, Money, Quantity
+from schemas.rfq import public_product_details
 
 
 class MatchScore(BaseModel):
@@ -47,6 +48,12 @@ class MatchScore(BaseModel):
     quantity: Optional[float] = None
     location: Optional[float] = None
     deadline: Optional[float] = None
+    explanation: Optional[str] = Field(
+        default=None, description="Concise human-readable explanation of match score."
+    )
+    dimension_explanations: Optional[dict[str, str]] = Field(
+        default=None, description="Itemized dimension-level explanations."
+    )
 
 
 class Counterparty(BaseModel):
@@ -121,6 +128,10 @@ class MatchCandidate(BaseModel):
     product_details: dict[str, Any]
     search_tags: list[str]
 
+    @field_serializer("product_details")
+    def _hide_internal_details(self, value: dict[str, Any]) -> dict[str, Any]:
+        return public_product_details(value)
+
     # Great-circle km between the two listings, when both are geocoded. The
     # location score alone left "73%" unexplainable on the card.
     distance_km: Optional[float] = None
@@ -131,6 +142,8 @@ class MatchCandidate(BaseModel):
 
     # Itemized attribute matching transparency
     attribute_breakdown: Optional[list[AttributeMatchDetail]] = None
+    explanation: Optional[str] = None
+    dimension_explanations: Optional[dict[str, str]] = None
 
 
 
@@ -144,3 +157,7 @@ class MatchResponse(BaseModel):
     total: int = Field(description="Total viable candidates, not just this page.")
     limit: int
     offset: int
+    retrieval: Literal["vector", "sql"] = Field(
+        default="vector",
+        description='"sql" when smart (vector) matching was unavailable and keyword matching answered instead.',
+    )

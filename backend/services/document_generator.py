@@ -6,14 +6,15 @@ Generates print-ready vector PDF documents:
 """
 
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 import hashlib
+import hmac
 import io
 import logging
 import os
 import re
 import threading
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 import xml.sax.saxutils as saxutils
 
 from reportlab.lib import colors
@@ -170,6 +171,82 @@ def _esc(val: Optional[object]) -> str:
         run.append(ch)
     flush()
     return "".join(out)
+
+
+_CENT = Decimal("0.01")
+
+
+def _dec(value: object) -> Decimal:
+    return value if isinstance(value, Decimal) else Decimal(str(value))
+
+
+def _money(value: object) -> str:
+    """Format an amount straight from its Decimal: 2 places, ROUND_HALF_UP, no float."""
+    return f"{_dec(value).quantize(_CENT, rounding=ROUND_HALF_UP):,}"
+
+
+def _fingerprint(payload: str) -> str:
+    """Keyed fingerprint (HMAC-SHA256 under SECRET_KEY): only the platform can mint or recompute it."""
+    from core.config import settings
+
+    key = (settings.SECRET_KEY or "").encode()
+    return hmac.new(key, payload.encode(), hashlib.sha256).hexdigest()[:24].upper()
+
+
+_TAX_RATE_KEYS = ("gst_rate", "gst_percent", "gst_percentage", "gst", "tax_rate", "tax_percent")
+
+
+def _declared_tax_rate(quotation: Any, order: Any) -> Optional[Decimal]:
+    """The GST rate (as a fraction) the quotation data states, or None. Never a default."""
+    stated = getattr(quotation, "gst_rate", None)
+    if isinstance(stated, (Decimal, int, float)) and not isinstance(stated, bool) and 0 <= stated <= 28:
+        # The quotation column is always a percent (0.1 means 0.1%, not 10%).
+        return Decimal(str(stated)) / 100
+    sources = [getattr(quotation, k, None) for k in _TAX_RATE_KEYS[1:]]
+    details = getattr(order, "product_details", None) or {}
+    sources += [details.get(k) for k in _TAX_RATE_KEYS]
+    for raw in sources:
+        if raw is None or isinstance(raw, bool):
+            continue
+        try:
+            value = Decimal(str(raw).strip().rstrip("%").strip())
+        except (InvalidOperation, ValueError):
+            continue
+        if value < 0 or value > 100:
+            continue
+        return value / 100 if value >= 1 or str(raw).strip().endswith("%") else value
+    return None
+
+
+class _Order:
+    """The listing facts a contract document prints.
+
+    Rendered from the snapshot frozen on the quotation at acceptance; only a
+    legacy quotation without one falls back to the live RFQ.
+    """
+
+    def __init__(self, quotation: Quotation, rfq: Optional[RFQ]) -> None:
+        snap = getattr(quotation, "rfq_snapshot", None)
+        if snap:
+            self.title = snap.get("title")
+            self.category = snap.get("category")
+            self.product_details = snap.get("product_details") or {}
+            self.city = snap.get("location_city")
+            self.country = snap.get("location_country")
+            self.hsn = snap.get("hsn")
+            self.known = True
+        elif rfq is not None:
+            self.title = rfq.title
+            self.category = rfq.category
+            self.product_details = rfq.product_details or {}
+            self.city = rfq.location_city
+            self.country = rfq.location_country
+            self.hsn = (rfq.product_details or {}).get("hsn_code")
+            self.known = True
+        else:
+            self.title = self.category = self.city = self.country = self.hsn = None
+            self.product_details = {}
+            self.known = False
 
 
 def _doc_date(quotation: Quotation) -> datetime:
@@ -365,19 +442,20 @@ def generate_purchase_order_pdf(
     story.append(Spacer(1, 14))
 
     # 4. Itemized Product & Pricing Schedule
-    item_title = (rfq.title if rfq else None) or "Procurement Goods as per Quotation"
-    category = rfq.category if rfq else "Commercial Merchandise"
-    qty_val = float(quotation.quantity)
-    unit_price = float(quotation.unit_price)
-    total_amt = float(quotation.total_amount)
+    order = _Order(quotation, rfq)
+    item_title = order.title or "Procurement Goods as per Quotation"
+    category = order.category if order.known else "Commercial Merchandise"
+    qty_val = _dec(quotation.quantity)
+    unit_price = _dec(quotation.unit_price)
+    total_amt = _dec(quotation.total_amount)
     curr = _esc(quotation.currency)
 
     # Build technical attributes summary
     specs_summary = ""
-    if rfq and rfq.product_details:
+    if order.product_details:
         specs_list = [
             f"{_esc(str(k).replace('_', ' '))}: {_esc(v)}"
-            for k, v in rfq.product_details.items()
+            for k, v in order.product_details.items()
             if not k.endswith("__must_match") and k != "name"
         ]
         if specs_list:
@@ -396,9 +474,9 @@ def generate_purchase_order_pdf(
             Paragraph("1", body_style),
             Paragraph(f"<b>{_esc(item_title)}</b>{specs_summary}", body_style),
             Paragraph(_esc(category), body_style),
-            Paragraph(f"{qty_val:,.2f} {_esc(quotation.quantity_unit)}", body_style),
-            Paragraph(f"{curr} {unit_price:,.2f}", body_style),
-            Paragraph(f"<b>{curr} {total_amt:,.2f}</b>", body_bold),
+            Paragraph(f"{_money(qty_val)} {_esc(quotation.quantity_unit)}", body_style),
+            Paragraph(f"{curr} {_money(unit_price)}", body_style),
+            Paragraph(f"<b>{curr} {_money(total_amt)}</b>", body_bold),
         ],
     ]
 
@@ -417,9 +495,9 @@ def generate_purchase_order_pdf(
 
     # 5. Financial Summary Box
     summary_data = [
-        [Paragraph("Subtotal:", meta_label), Paragraph(f"<b>{curr} {total_amt:,.2f}</b>", body_bold)],
-        [Paragraph("Estimated Taxes / Duty:", meta_label), Paragraph(f"{curr} 0.00 (Exempt/Direct)", body_style)],
-        [Paragraph("<b>TOTAL CONTRACT VALUE:</b>", meta_label), Paragraph(f"<b><font size='10' color='#1e3a8a'>{curr} {total_amt:,.2f}</font></b>", body_bold)],
+        [Paragraph("Subtotal:", meta_label), Paragraph(f"<b>{curr} {_money(total_amt)}</b>", body_bold)],
+        [Paragraph("Taxes / Duty:", meta_label), Paragraph("As applicable (not included)", body_style)],
+        [Paragraph("<b>TOTAL CONTRACT VALUE:</b>", meta_label), Paragraph(f"<b><font size='10' color='#1e3a8a'>{curr} {_money(total_amt)}</font></b>", body_bold)],
     ]
     t_sum = Table(summary_data, colWidths=[2.2 * inch, 1.4 * inch])
     t_sum.setStyle(TableStyle([
@@ -451,7 +529,7 @@ def generate_purchase_order_pdf(
             ),
             Paragraph(
                 f"• <b>Quotation Validity</b>: {_esc(quotation.valid_until.strftime('%b %d, %Y') if quotation.valid_until else 'N/A')}<br/>"
-                f"• <b>Destination</b>: {_esc(rfq.location_city if rfq else 'Buyer Facility')}, {_esc(rfq.location_country if rfq else '')}<br/>"
+                f"• <b>Destination</b>: {_esc(order.city if order.known else 'Buyer Facility')}, {_esc(order.country if order.known else '')}<br/>"
                 f"• <b>Notes</b>: {_esc(quotation.notes or 'Goods subject to pre-dispatch physical inspection.')}",
                 body_style,
             ),
@@ -471,14 +549,14 @@ def generate_purchase_order_pdf(
     story.append(Spacer(1, 14))
 
     # 7. Tamper-Evident Verification Stamp
-    hash_payload = f"{po_ref}:{quotation.id}:{total_amt}:{buyer_info['gst']}:{seller_info['gst']}"
-    doc_hash = hashlib.sha256(hash_payload.encode()).hexdigest()[:24].upper()
+    hash_payload = f"{po_ref}:{quotation.id}:{_money(total_amt)}:{buyer_info['gst']}:{seller_info['gst']}"
+    doc_hash = _fingerprint(hash_payload)
 
     verify_data = [
         [
             Paragraph(
                 f"<b>DIGITAL AUDIT &amp; CONTRACT INTEGRITY VERIFICATION</b><br/>"
-                f"<font size='7' color='#64748b'>Certified on {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')} · Cryptographic Fingerprint: <b>{doc_hash}</b><br/>"
+                f"<font size='7' color='#64748b'>Certified on {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')} · Document fingerprint (HMAC): <b>{doc_hash}</b><br/>"
                 f"This document is electronically authenticated on the B2B Marketplace network. Dual-party verification records are stored permanently.</font>",
                 body_style,
             ),
@@ -605,7 +683,7 @@ def generate_commercial_invoice_pdf(
             payment_status = "ESCROW SECURED"
         gateway_line = (
             f"B2B-ESCROW-CLEARED-{str(quotation.id)[:8].upper()} "
-            f"(deposited {escrow.currency} {funded:,.2f}; released {released:,.2f}; refunded {refunded:,.2f})"
+            f"(deposited {escrow.currency} {_money(funded)}; released {_money(released)}; refunded {_money(refunded)})"
         )
     else:
         payment_status = "PAYMENT PENDING"
@@ -695,12 +773,15 @@ def generate_commercial_invoice_pdf(
     story.append(Spacer(1, 14))
 
     # 4. Line Items Table with Tax
-    item_title = (rfq.title if rfq else None) or "Industrial Procurement Goods"
-    qty_val = float(quotation.quantity)
-    unit_price = float(quotation.unit_price)
-    total_amt = float(quotation.total_amount)
+    order = _Order(quotation, rfq)
+    item_title = order.title or "Industrial Procurement Goods"
+    qty_val = _dec(quotation.quantity)
+    unit_price = _dec(quotation.unit_price)
+    total_amt = _dec(quotation.total_amount)
     curr = _esc(quotation.currency)
-    hsn_code = "8544.42" if "cable" in item_title.lower() else "1006.30" if "rice" in item_title.lower() else "4819.10"
+    # Never invent a classification: show the HSN only when the listing carries one.
+    hsn_code = str(order.hsn).strip() if order.hsn else ""
+    hsn_cell = hsn_code or "As applicable"
 
     items_data = [
         [
@@ -714,10 +795,10 @@ def generate_commercial_invoice_pdf(
         [
             Paragraph("1", body_style),
             Paragraph(f"<b>{_esc(item_title)}</b><br/><font color='#64748b' size='7.5'>Trade Quote: {_esc(quotation.quote_number)}</font>", body_style),
-            Paragraph(_esc(hsn_code), body_style),
-            Paragraph(f"{qty_val:,.2f} {_esc(quotation.quantity_unit)}", body_style),
-            Paragraph(f"{curr} {unit_price:,.2f}", body_style),
-            Paragraph(f"<b>{curr} {total_amt:,.2f}</b>", body_bold),
+            Paragraph(_esc(hsn_cell), body_style),
+            Paragraph(f"{_money(qty_val)} {_esc(quotation.quantity_unit)}", body_style),
+            Paragraph(f"{curr} {_money(unit_price)}", body_style),
+            Paragraph(f"<b>{curr} {_money(total_amt)}</b>", body_bold),
         ],
     ]
 
@@ -735,14 +816,23 @@ def generate_commercial_invoice_pdf(
     story.append(Spacer(1, 10))
 
     # 5. Calculation Summary
-    tax_rate = Decimal("0.18") if curr == "INR" else Decimal("0.00")
-    tax_amt = float(round(Decimal(str(total_amt)) * tax_rate, 2))
-    grand_total = total_amt + tax_amt
+    # A tax is only computed from a rate the quotation data carries; otherwise it is stated as "as applicable".
+    tax_rate = _declared_tax_rate(quotation, order)
+    if tax_rate is not None:
+        tax_amt = (total_amt * tax_rate).quantize(_CENT, rounding=ROUND_HALF_UP)
+        grand_total = total_amt.quantize(_CENT, rounding=ROUND_HALF_UP) + tax_amt
+        tax_row = [Paragraph(f"GST ({(tax_rate * 100).normalize():f}%):", meta_label), Paragraph(f"{curr} {_money(tax_amt)}", body_style)]
+        total_label = "<b>TOTAL PAYABLE:</b>"
+    else:
+        grand_total = total_amt.quantize(_CENT, rounding=ROUND_HALF_UP)
+        hsn_note = f" (HSN {_esc(hsn_code)})" if hsn_code else ""
+        tax_row = [Paragraph("GST:", meta_label), Paragraph(f"As applicable{hsn_note}", body_style)]
+        total_label = "<b>TOTAL (EXCL. TAXES):</b>"
 
     summary_data = [
-        [Paragraph("Taxable Value:", meta_label), Paragraph(f"<b>{curr} {total_amt:,.2f}</b>", body_bold)],
-        [Paragraph(f"Applicable Tax ({int(tax_rate*100)}%):", meta_label), Paragraph(f"{curr} {tax_amt:,.2f}", body_style)],
-        [Paragraph("<b>TOTAL PAYABLE:</b>", meta_label), Paragraph(f"<b><font size='10' color='#0f766e'>{curr} {grand_total:,.2f}</font></b>", body_bold)],
+        [Paragraph("Taxable Value:", meta_label), Paragraph(f"<b>{curr} {_money(total_amt)}</b>", body_bold)],
+        tax_row,
+        [Paragraph(total_label, meta_label), Paragraph(f"<b><font size='10' color='#0f766e'>{curr} {_money(grand_total)}</font></b>", body_bold)],
     ]
     t_sum = Table(summary_data, colWidths=[2.2 * inch, 1.4 * inch])
     t_sum.setStyle(TableStyle([
@@ -781,14 +871,14 @@ def generate_commercial_invoice_pdf(
     story.append(Spacer(1, 14))
 
     # 7. Verification Stamp
-    hash_payload = f"{inv_num}:{quotation.id}:{grand_total}:{seller_info['gst']}"
-    doc_hash = hashlib.sha256(hash_payload.encode()).hexdigest()[:24].upper()
+    hash_payload = f"{inv_num}:{quotation.id}:{_money(grand_total)}:{seller_info['gst']}"
+    doc_hash = _fingerprint(hash_payload)
 
     verify_data = [
         [
             Paragraph(
                 f"<b>TAX INVOICE AUTHENTICATION</b><br/>"
-                f"<font size='7' color='#64748b'>Digital Timestamp: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')} · Security Audit Seal: <b>{doc_hash}</b><br/>"
+                f"<font size='7' color='#64748b'>Digital Timestamp: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')} · Document fingerprint (HMAC): <b>{doc_hash}</b><br/>"
                 f"Generated electronically pursuant to B2B Marketplace compliance standards.</font>",
                 body_style,
             ),
@@ -959,7 +1049,7 @@ def generate_waybill_pdf(
     story.append(Paragraph("<b>3. CARGO SPECIFICATIONS &amp; CONSIGNMENT TALLY</b>", subtitle_style))
     story.append(Spacer(1, 4))
 
-    cbm_val = f"{float(shipment.volume_cbm):.3f} CBM" if shipment.volume_cbm else "—"
+    cbm_val = f"{_dec(shipment.volume_cbm).quantize(Decimal('0.001'), rounding=ROUND_HALF_UP)} CBM" if shipment.volume_cbm else "—"
     incoterm_val = (getattr(quotation.incoterms, "value", quotation.incoterms) if quotation and quotation.incoterms else "FOB")
 
     cargo_headers = [
@@ -973,7 +1063,7 @@ def generate_waybill_pdf(
     cargo_row = [
         Paragraph(f"{shipment.package_count}", body_style),
         Paragraph(_esc(shipment.package_type), body_style),
-        Paragraph(f"{float(shipment.weight_kg):,.2f} kg", body_style),
+        Paragraph(f"{_money(shipment.weight_kg)} kg", body_style),
         Paragraph(cbm_val, body_style),
         Paragraph(f"<b>{_esc(incoterm_val)}</b>", body_style),
         Paragraph("KEEP DRY · FRAGILE · HANDLE WITH CARE", body_style),
@@ -1049,13 +1139,13 @@ def generate_waybill_pdf(
 
     # 7. Verification Seal & Signatures
     hash_payload = f"{shipment.tracking_number}:{shipment.id}:{shipment.weight_kg}:{sender_info['gst']}"
-    doc_hash = hashlib.sha256(hash_payload.encode()).hexdigest()[:24].upper()
+    doc_hash = _fingerprint(hash_payload)
 
     verify_data = [
         [
             Paragraph(
                 f"<b>CONSIGNMENT WAYBILL AUTHENTICATION</b><br/>"
-                f"<font size='7' color='#64748b'>Digital Timestamp: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')} · Security Audit Seal: <b>{doc_hash}</b><br/>"
+                f"<font size='7' color='#64748b'>Digital Timestamp: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')} · Document fingerprint (HMAC): <b>{doc_hash}</b><br/>"
                 f"Cryptographically verified on Antigravity B2B Marketplace Platform.</font>",
                 body_style,
             ),

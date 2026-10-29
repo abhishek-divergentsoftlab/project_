@@ -48,14 +48,8 @@ async def update_account(
     payload: AccountUpdate, current_user: CurrentUser, db: DbSession
 ) -> UserOut:
     """Change which side of the market this account may post on."""
-    if payload.role in (UserRole.SELLER, UserRole.BOTH):
-        from models.enums import KYCStatus
-        kyc_status = current_user.profile.kyc_status if current_user.profile else None
-        if kyc_status != KYCStatus.VERIFIED:
-            raise HTTPException(
-                status.HTTP_400_BAD_REQUEST,
-                "Role switch to seller requires verified KYC status.",
-            )
+    # Same rule as signup: any account may take either side. Trust is conveyed by the KYC
+    # badge on the profile, not by gating the role.
     current_user.role = payload.role
     await db.commit()
     await db.refresh(current_user)
@@ -95,12 +89,14 @@ async def update_profile(
         key in changes and changes[key] != getattr(profile, key, None)
         for key in KYC_IDENTITY_FIELDS
     )
+    # Only a GSTIN already VERIFIED elsewhere blocks: a pending/flagged claim must not let a squatter
+    # lock the real owner out (the owner goes through /me/kyc/verify, which flags the dispute).
     new_gst = changes.get("gst_number")
     if (
         "gst_number" in changes
         and new_gst
         and new_gst != profile.gst_number
-        and await kyc_service.gst_claimed_by_other(db, new_gst, current_user.id)
+        and await kyc_service.gst_verified_by_other(db, new_gst, current_user.id)
     ):
         raise HTTPException(
             status.HTTP_409_CONFLICT,

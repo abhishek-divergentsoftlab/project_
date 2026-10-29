@@ -4,10 +4,11 @@ from datetime import UTC, datetime
 from decimal import Decimal
 import math
 import re
+import time
 from typing import Any, Optional, Sequence
 import uuid
 
-from sqlalchemy import Float, and_, case, cast, false, func, literal, not_, or_, select
+from sqlalchemy import Float, and_, case, cast, false, func, literal, not_, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -24,7 +25,7 @@ from schemas.marketplace import (
     CatalogListOut,
     CategoryCountOut,
 )
-from services import locations
+from services import locations, match_scoring, product_synonyms, spec_codes
 from services.categories import category_variants, normalize_category
 from services.match_scoring import haversine_km
 
@@ -86,6 +87,22 @@ def _category_condition(category: str) -> Any:
         func.lower(func.trim(RFQ.category)).in_(sorted(variants)),
         _contains_ci(RFQ.category, category),
         _contains_ci(RFQ.category, canonical),
+    )
+
+
+def _city_condition(city: str) -> Any:
+    """City filter on canonical names: "Bombay", "Bangalore", "New Delhi" and a 6-digit PIN resolve through the
+    gazetteer to one city, and every spelling stored for that city (Gurgaon / Gurugram) matches."""
+    loc = locations.resolve_pin(city) if locations.is_pin(city) else locations.exact_location(city)
+    if loc is None or not loc.is_city or not loc.city:
+        if locations.is_pin(city):
+            return false()
+        return _contains_ci(RFQ.location_city, city)
+    spellings = sorted(locations.city_spellings(loc.city))
+    return or_(
+        func.lower(func.trim(RFQ.location_city)).in_(spellings),
+        _contains_ci(RFQ.location_city, loc.city),
+        _contains_ci(RFQ.location_city, city) if not locations.is_pin(city) else false(),
     )
 
 
@@ -190,48 +207,316 @@ def radius_condition(ref_lat: float, ref_lon: float, radius_km: float) -> Any:
     return or_(*clauses)
 
 
-def build_search_conditions(q: str) -> list[Any]:
+_SEARCH_STOPWORDS = frozenset({"in", "at", "from", "for", "the", "a", "an", "to", "with", "and", "or", "of", "on", "by", "is"})
+# Trade phrases whose listings write the short form: "mild steel" is also "MS", "stainless steel" is also "SS 304".
+_PHRASE_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("mild steel", (r"\mmild[\s\-]+steel", r"\mms\M")),
+    ("stainless steel", (r"\mstainless", r"\m(?:ss|sus)(?:\M|[\s\-_./]*\d)")),
+)
+_CODE_RE = re.compile(r"^(ss|en|fe|cat)(\d+[a-z]?)$")
+
+
+def _word_pattern(word: str) -> str:
+    """One word as a POSIX word-start regex ('rice' is not found inside 'price')."""
+    code = _CODE_RE.match(word)
+    if code:  # canonical grade code: also finds "SS 304", "ss-304" in listing text
+        pattern = rf"\m{code.group(1)}[\s\-_./]*{code.group(2)}"
+        if code.group(1) == "ss" and re.fullmatch(r"[234]\d\d[lh]?", code.group(2)):
+            pattern += rf"|\m{code.group(2)}\M"  # "304 stainless steel sheet"
+        return pattern
+    escaped = re.escape(word).replace(r"\ ", r"\s+")
+    pattern = rf"\m{escaped}" if re.match(r"^\w", word) else escaped
+    return pattern + r"\M" if len(word) <= 2 else pattern
+
+
+def _damerau(a: str, b: str, limit: int) -> int:
+    """Edit distance (insert/delete/substitute/transpose) between two short words; ``limit + 1`` when over it."""
+    if abs(len(a) - len(b)) > limit:
+        return limit + 1
+    prev2: list[int] = []
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cost = 0 if ca == cb else 1
+            val = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+            if i > 1 and j > 1 and ca == b[j - 2] and a[i - 2] == cb:
+                val = min(val, prev2[j - 2] + 1)
+            cur.append(val)
+        prev2, prev = prev, cur
+    return prev[-1]
+
+
+def is_typo_of(word: str, target: str) -> bool:
+    """True only when ``word`` is a genuine misspelling of ``target``: same leading letter(s) and an edit distance
+    that is small relative to the length (1 edit up to 6 letters, 2 above). "haldi" is not "half-cell"."""
+    w, t = word.lower(), target.lower()
+    if w == t or len(w) < 4 or len(t) < 4 or not (w.isalpha() and t.isalpha()):
+        return False
+    if w[0] != t[0] or (min(len(w), len(t)) >= 6 and w[:2] != t[:2] and w[:2] != t[1::-1][:2]):
+        return False
+    limit = 1 if max(len(w), len(t)) <= 6 else 2
+    return _damerau(w, t, limit) <= limit
+
+
+def _usable_word(word: str) -> bool:
+    return bool(word) and len(word) <= 40 and not any(ch in word for ch in "<>{}\\;")
+
+
+def _term_alternatives(term: str, *, fuzzy: bool = False, vocab: Optional[Sequence[str]] = None) -> list[str]:
+    """Every spelling of one query word worth searching for: itself, singular, trade synonyms (chawal -> rice),
+    learned vocabulary and the AI lexicon (read-only) and, in the relaxed tier, a typo correction.
+
+    A correction is accepted only when it is a genuine misspelling (``is_typo_of``): of a known product name
+    (phonetic index) or, in the fuzzy tier, of a word that really occurs in listing titles (``vocab``).
+    """
+    t = term.lower()
+    words: set[str] = {t}
+    if t.isalpha() and len(t) > 3:
+        words.add(match_scoring.singularise(t))
+    known = product_synonyms.variants(t)
+    words |= known
+    if fuzzy and t.isalpha() and len(t) >= 4 and known == {t}:
+        near = product_synonyms.fuzzy_match(t)
+        if near:
+            names = product_synonyms.variants(near)
+            if any(is_typo_of(t, n) for n in names):
+                words |= names
+        if vocab:
+            words |= {w for w in vocab if is_typo_of(t, w)}
+    usable = sorted(w for w in words if _usable_word(w))
+    # "\\monion" already matches "onions" and "onion powder": a longer spelling starting with a kept shorter one only
+    # makes the regex weaker for the trigram index (12 alternatives took 600 ms, without the redundant ones 140 ms).
+    kept = [
+        w for w in usable
+        if not any(u != w and len(u) > 2 and w.startswith(u) and not _CODE_RE.match(u) for u in usable)
+    ]
+    return [_word_pattern(w) for w in kept]
+
+
+def _query_terms(q: str) -> tuple[list[str], list[list[str]]]:
+    """(plain terms, size groups) of a search phrase, after code/plural normalisation."""
+    q = clean_text_param(q) or ""
+    q, size_groups = spec_codes.extract_sizes(q)
+    q = spec_codes.canonical_codes(q)
+    q = re.sub(r"\b(steel|stainless)s\b", r"\1", q)
+    return q, size_groups
+
+
+def _search_groups(
+    q: str, *, relaxed: bool = False, vocab: Optional[Sequence[str]] = None
+) -> list[tuple[str, list[str]]]:
+    """The query as AND-ed (term, alternative regexes) groups; one alternative per group needs to match."""
+    text, size_groups = _query_terms(q)
+    groups: list[tuple[str, list[str]]] = []
+    for phrase, alts in _PHRASE_GROUPS:
+        if re.search(rf"\b{phrase}\b", text):
+            groups.append((phrase, list(alts)))
+            text = re.sub(rf"\b{phrase}\b", " ", text)
+    raw_terms = [
+        w.strip()
+        for w in re.split(r"[^\w\+\-\./]+", text.strip())
+        if w.strip() and w.lower() not in _SEARCH_STOPWORDS and (len(w.strip()) >= 2 or w.isalnum())
+    ]
+    if not raw_terms and not groups and not size_groups:
+        term = text.strip()
+        raw_terms = [term] if term else []
+    seen: set[str] = set()
+    for term in raw_terms:
+        if term.lower() not in seen:
+            seen.add(term.lower())
+            groups.append((term.lower(), _term_alternatives(term, fuzzy=relaxed, vocab=vocab)))
+    groups = groups[:MAX_QUERY_TOKENS]
+    if not relaxed:
+        groups += [("", alts) for alts in size_groups[:2]]
+    return groups
+
+
+def _literal_of(pattern: str) -> str:
+    """The plain text a ``_word_pattern`` regex stands for (for non-ASCII names, which are matched with LIKE)."""
+    return re.sub(r"\\([\\.^$*+?()\[\]{}|-])", r"\1", pattern.replace("\\m", "").replace("\\M", "")).replace("\\s+", " ")
+
+
+def _group_condition(term: str, alts: Sequence[str], script_ids: Optional[dict[str, Sequence[Any]]] = None) -> Any:
+    """One query word matches when any alternative is found in a searched column.
+
+    ASCII alternatives are one case-insensitive regex per column, which the trigram indexes serve (a bitmap OR of
+    index scans, ~10 ms). Names in other scripts (Devanagari, emoji) cannot use those indexes, and a single
+    non-indexable arm turned the whole OR into a sequential scan on the slow multibyte path (2.6 s for 10k rows), so
+    they are looked up beforehand (``_script_matches``) and joined in by primary key.
+    """
+    ascii_alts = [a for a in alts if a.isascii()]
+    other = [_literal_of(a) for a in alts if not a.isascii()]
+    columns = [RFQ.title, RFQ.category, RFQ.description, RFQ.location_city]
+    if term not in BOILERPLATE_SEARCH_WORDS:
+        columns.append(RFQ.search_text)
+    clauses: list[Any] = []
+    if ascii_alts:
+        pattern = "(?:" + "|".join(ascii_alts) + ")" if len(ascii_alts) > 1 else ascii_alts[0]
+        clauses += [col.op("~*")(pattern) for col in columns]
+    ids = {i for lit in other for i in (script_ids or {}).get(lit, ())}
+    if ids:
+        clauses.append(RFQ.id.in_(sorted(ids, key=str)))
+    return or_(*clauses) if clauses else false()
+
+
+# Title words that exist in the live listings, for typo correction. Refreshed every few minutes.
+_VOCAB_TTL_SECONDS = 300.0
+_vocab: tuple[float, frozenset[str]] = (0.0, frozenset())
+
+
+async def _title_vocabulary(db: AsyncSession) -> frozenset[str]:
+    global _vocab
+    stamp, words = _vocab
+    if words and time.monotonic() - stamp < _VOCAB_TTL_SECONDS:
+        return words
+    try:
+        rows = await db.execute(select(RFQ.title, RFQ.category).where(RFQ.status == RFQStatus.ACTIVE).distinct())
+        found: set[str] = set()
+        for title, category in rows:
+            found.update(re.findall(r"[a-z]{4,30}", f"{title} {category}".lower()))
+        words = frozenset(found)
+    except Exception:  # noqa: BLE001 - typo correction is best effort
+        return words
+    _vocab = (time.monotonic(), words)
+    return words
+
+
+def build_search_conditions(
+    q: str,
+    tier: str = "strict",
+    vocab: Optional[Sequence[str]] = None,
+    script_ids: Optional[dict[str, Sequence[Any]]] = None,
+) -> list[Any]:
     """Tokenize search phrase and produce word-boundary matching clauses.
 
     Prevents false-positive matches (such as 'rice' matching the substring 'price'
     in the standard 'Target price:' metadata block). The query is capped at
     ``MAX_QUERY_CHARS`` characters and ``MAX_QUERY_TOKENS`` tokens.
+
+    Every word is expanded before matching: grade codes collapse (``SS-304`` finds "SS 304"), trade synonyms,
+    Hindi names and the AI lexicon are added (``chawal`` finds rice), singular/plural are equivalent, and pipe
+    sizes match their inch / mm / NB spellings. Tier "relaxed" drops the size words and adds typo corrections of
+    known product names; tier "fuzzy" also corrects typos against words that occur in listing titles. A correction
+    must be a genuine misspelling (``is_typo_of``): similar-sounding unrelated words never match.
     """
-    q = clean_text_param(q) or ""
-    raw_terms = [
-        w.strip()
-        for w in re.split(r"[^\w\+\-\./]+", q.strip())
-        if w.strip()
-        and w.lower() not in ("in", "at", "from", "for", "the", "a", "an", "to", "with", "and", "or", "of", "on", "by", "is")
-        and (len(w.strip()) >= 2 or w.isalnum())
-    ]
-    if not raw_terms:
-        term = q.strip()
-        raw_terms = [term] if term else []
-    # Dedupe (case-insensitively) and cap the number of AND-ed token groups.
-    seen: set[str] = set()
-    unique_terms = []
-    for term in raw_terms:
-        if term.lower() not in seen:
-            seen.add(term.lower())
-            unique_terms.append(term)
-    raw_terms = unique_terms[:MAX_QUERY_TOKENS]
+    relaxed = tier in ("relaxed", "fuzzy")
+    conditions = []
+    for term, alts in _search_groups(q, relaxed=relaxed, vocab=vocab if tier == "fuzzy" else None):
+        conditions.append(_group_condition(term, alts, script_ids))
+    return conditions
 
-    token_conditions = []
-    for t in raw_terms:
-        escaped = re.escape(t)
-        pattern = rf"\m{escaped}" if re.match(r"^\w", t) else escaped
-        clauses = [
-            RFQ.title.op("~*")(pattern),
-            RFQ.category.op("~*")(pattern),
-            RFQ.description.op("~*")(pattern),
-            RFQ.location_city.op("~*")(pattern),
-        ]
-        if t.lower() not in BOILERPLATE_SEARCH_WORDS:
-            clauses.append(RFQ.search_text.op("~*")(pattern))
-        token_conditions.append(or_(*clauses))
 
-    return token_conditions
+_MAX_SCRIPT_IDS = 500
+_SCRIPT_TTL_SECONDS = 30.0
+_script_cache: dict[tuple[str, ...], tuple[float, dict[str, list[Any]]]] = {}
+
+
+async def _script_matches(db: AsyncSession, q: str) -> dict[str, list[Any]]:
+    """Listing ids that contain each non-ASCII alternative of the query's words (one scan, only when any exist)."""
+    lits: set[str] = set()
+    for tier in ("strict", "relaxed"):
+        for _term, alts in _search_groups(q, relaxed=tier == "relaxed"):
+            lits.update(_literal_of(a) for a in alts if not a.isascii())
+    lits.discard("")
+    if not lits:
+        return {}
+    ordered = sorted(lits)
+    key = tuple(ordered)
+    cached = _script_cache.get(key)
+    if cached and time.monotonic() - cached[0] < _SCRIPT_TTL_SECONDS:
+        return cached[1]
+    rows = await db.execute(
+        select(RFQ.id, RFQ.title, RFQ.search_text).where(
+            RFQ.status == RFQStatus.ACTIVE,
+            or_(*[func.strpos(func.concat(RFQ.title, " ", RFQ.search_text), lit) > 0 for lit in ordered]),
+        ).limit(_MAX_SCRIPT_IDS)
+    )
+    found: dict[str, list[Any]] = {lit: [] for lit in ordered}
+    for rid, title, search_text in rows:
+        blob = f"{title} {search_text or ''}"
+        for lit in ordered:
+            if lit in blob:
+                found[lit].append(rid)
+    if len(_script_cache) > 200:
+        _script_cache.clear()
+    _script_cache[key] = (time.monotonic(), found)
+    return found
+
+
+# Terms the model has been asked about during this process, so a no-result query asks once.
+_lexicon_asked: set[str] = set()
+LEXICON_WAIT_SECONDS = 14.0
+
+
+def _unknown_terms(q: str) -> list[str]:
+    """Query words nothing deterministic can place (not a known product name, alias or lexicon entry)."""
+    from services import ai_lexicon
+
+    text_q, _ = _query_terms(q)
+    out: list[str] = []
+    for w in re.split(r"[^\w\-]+", text_q):
+        lw = w.lower()
+        if len(lw) < 4 or not lw.isalpha() or lw in _SEARCH_STOPWORDS or lw in BOILERPLATE_SEARCH_WORDS or lw in out:
+            continue
+        if product_synonyms.variants(lw) == {lw} and ai_lexicon.term(lw) is None:
+            out.append(lw)
+    return out[:MAX_QUERY_TOKENS]
+
+
+async def _resolve_with_lexicon(q: str) -> bool:
+    """Ask the AI lexicon (batched, persistent) what the unplaced query words mean. True when it learned any."""
+    from services import ai_lexicon
+
+    terms = _unknown_terms(q)
+    if not terms:
+        return False
+    found = await ai_lexicon.resolve_terms(terms, timeout=LEXICON_WAIT_SECONDS)
+    return any(ai_lexicon.term(t) is not None for t in found) or any(ai_lexicon.term(t) is not None for t in terms)
+
+
+async def apply_search(db: AsyncSession, q: Optional[str], count: Any) -> tuple[list[Any], int]:
+    """(search conditions, total) for the first stage of ``q`` that finds anything.
+
+    Stages: strict word matching (with synonyms, plurals, learned names); then size words dropped and typos of
+    known products corrected; then typos corrected against real title words; then, for words nothing placed
+    ("haldi", "moongfali"), the AI lexicon translates them to English product names (cached persistently) and
+    strict/relaxed run again. Every stage after the first only runs on an empty result, and an empty result
+    after all of them is returned honestly as zero.
+    """
+    if not (q and q.strip()):
+        return [], await count([])
+    conds: list[Any] = []
+    total = 0
+
+    script_ids = await _script_matches(db, q)
+
+    tried: set[str] = set()
+
+    async def _try(tier: str, vocab: Optional[Sequence[str]] = None) -> bool:
+        nonlocal conds, total
+        conds = build_search_conditions(q, tier, vocab=vocab, script_ids=script_ids)
+        if not conds:
+            return False
+        # a stage that expands to the same SQL as one already tried (no sizes to drop, no typo to fix) cannot find more
+        signature = "|".join(str(c.compile(compile_kwargs={"literal_binds": True})) for c in conds)
+        if signature in tried:
+            return False
+        tried.add(signature)
+        total = await count(conds)
+        return bool(total)
+
+    if not build_search_conditions(q, "strict"):
+        return [], await count([])
+    if await _try("strict") or await _try("relaxed"):
+        return conds, total
+    if await _try("fuzzy", await _title_vocabulary(db)):
+        return conds, total
+    if await _resolve_with_lexicon(q):
+        script_ids = await _script_matches(db, q)
+        if await _try("strict") or await _try("relaxed"):
+            return conds, total
+    return conds, total
 
 
 async def get_catalog(
@@ -281,7 +566,7 @@ async def get_catalog(
         conditions.append(_category_condition(category))
 
     if city:
-        conditions.append(_contains_ci(RFQ.location_city, city))
+        conditions.append(_city_condition(city))
 
     if country:
         conditions.append(_contains_ci(RFQ.location_country, country))
@@ -296,11 +581,6 @@ async def get_catalog(
     max_bound = _finite_price(max_price)
     if max_bound is not None:
         conditions.append(RFQ.price_amount <= max_bound)
-
-    if q and q.strip():
-        search_conds = build_search_conditions(q)
-        if search_conds:
-            conditions.append(and_(*search_conds))
 
     # Viewer coordinates: the reference point for distance and radius.
     viewer_lat = getattr(viewer.profile, "latitude", None) if viewer.profile else None
@@ -324,36 +604,32 @@ async def get_catalog(
     )
 
     if verified_only:
-        conditions.append(
-            or_(
-                UserProfile.kyc_status == KYCStatus.VERIFIED,
-                UserProfile.trust_score >= 60,
-            )
+        conditions.append(UserProfile.kyc_status == KYCStatus.VERIFIED)
+
+    async def _count(extra: list[Any]) -> int:
+        count_query = (
+            select(func.count(RFQ.id))
+            .join(User, RFQ.user_id == User.id)
+            .outerjoin(UserProfile, User.id == UserProfile.user_id)
+            .where(and_(*conditions, *extra))
         )
+        return (await db.scalar(count_query)) or 0
 
-    base_query = base_query.where(and_(*conditions))
-
-    # Total count query
-    count_query = (
-        select(func.count(RFQ.id))
-        .join(User, RFQ.user_id == User.id)
-        .outerjoin(UserProfile, User.id == UserProfile.user_id)
-        .where(and_(*conditions))
-    )
-    total_result = await db.scalar(count_query)
-    total = total_result or 0
+    # Search words are expanded (codes, synonyms, plurals, sizes); only an empty result relaxes them.
+    search_conds, total = await apply_search(db, q, _count)
+    base_query = base_query.where(and_(*conditions, *search_conds))
 
     # Sorting
     if sort_by == "price_asc":
-        base_query = base_query.order_by(RFQ.price_amount.asc().nullslast(), RFQ.created_at.desc())
+        base_query = base_query.order_by(RFQ.price_amount.asc().nullslast(), RFQ.created_at.desc(), RFQ.id.desc())
     elif sort_by == "price_desc":
-        base_query = base_query.order_by(RFQ.price_amount.desc().nullslast(), RFQ.created_at.desc())
+        base_query = base_query.order_by(RFQ.price_amount.desc().nullslast(), RFQ.created_at.desc(), RFQ.id.desc())
     elif sort_by == "trust_desc":
         base_query = base_query.order_by(
-            UserProfile.trust_score.desc().nullslast(), RFQ.created_at.desc()
+            UserProfile.trust_score.desc().nullslast(), RFQ.created_at.desc(), RFQ.id.desc()
         )
     else:  # "newest"
-        base_query = base_query.order_by(RFQ.created_at.desc())
+        base_query = base_query.order_by(RFQ.created_at.desc(), RFQ.id.desc())
 
     # Pagination
     base_query = base_query.limit(limit).offset(offset)
@@ -552,7 +828,7 @@ async def get_categories_summary(
     currency = clean_text_param(currency, 64)
 
     if city:
-        conditions.append(_contains_ci(RFQ.location_city, city))
+        conditions.append(_city_condition(city))
 
     if country:
         conditions.append(_contains_ci(RFQ.location_country, country))
@@ -568,11 +844,6 @@ async def get_categories_summary(
     if max_bound is not None:
         conditions.append(RFQ.price_amount <= max_bound)
 
-    if q and q.strip():
-        search_conds = build_search_conditions(q)
-        if search_conds:
-            conditions.append(and_(*search_conds))
-
     query = select(
         norm_category.label("category"),
         func.count(RFQ.id).label("total_count"),
@@ -584,17 +855,21 @@ async def get_categories_summary(
         query = query.join(User, RFQ.user_id == User.id).outerjoin(
             UserProfile, User.id == UserProfile.user_id
         )
-        conditions.append(
-            or_(
-                UserProfile.kyc_status == KYCStatus.VERIFIED,
-                UserProfile.trust_score >= 60,
-            )
-        )
+        conditions.append(UserProfile.kyc_status == KYCStatus.VERIFIED)
 
+    async def _count(extra: list[Any]) -> int:
+        count_query = select(func.count(RFQ.id))
+        if verified_only:
+            count_query = count_query.join(User, RFQ.user_id == User.id).outerjoin(
+                UserProfile, User.id == UserProfile.user_id
+            )
+        return (await db.scalar(count_query.where(and_(*conditions, *extra)))) or 0
+
+    search_conds, _ = await apply_search(db, q, _count)
     query = (
-        query.where(and_(*conditions))
+        query.where(and_(*conditions, *search_conds))
         .group_by(norm_category)
-        .order_by(func.count(RFQ.id).desc())
+        .order_by(func.count(RFQ.id).desc(), norm_category.asc())
     )
 
     rows = (await db.execute(query)).all()

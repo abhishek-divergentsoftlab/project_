@@ -1,7 +1,5 @@
 """Moderation pre-flight check endpoint for client-side validation."""
 
-import asyncio
-
 from fastapi import APIRouter, Depends
 
 from api.deps import CurrentUser
@@ -23,4 +21,4 @@ async def check_content_safety(
     current_user: CurrentUser,
 ) -> ModerationCheckResult:
     full_text = f"{payload.title}\n{payload.description or ''}\n{payload.category or ''}"
-    return await asyncio.to_thread(AIContentModerator.check_text, full_text)
+    return await AIContentModerator.check_text_async(full_text)

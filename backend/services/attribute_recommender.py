@@ -16,6 +16,7 @@ import re
 from typing import Any, Optional
 
 from core.config import settings
+from services import llm_client
 
 logger = logging.getLogger(__name__)
 
@@ -96,34 +97,28 @@ async def _query_llm_for_attributes(
         )
 
         # Candidate models prioritizing high-capability models
-        configured_model = getattr(settings, "ATTRIBUTE_AI_MODEL", "")
-        candidates = [
-            configured_model,
-            "qwen3-coder:30b",
-            "qwen3-coder-gpu:30b",
-            "qwen3-coder-next:q4_K_M",
-            getattr(settings, "OLLAMA_MODEL", ""),
-            getattr(settings, "AI_CHAT_MODEL", ""),
-        ]
-        models_to_try = [m for m in dict.fromkeys(candidates) if m]
+        # Default to the chat model: loading any other model evicts it from Ollama.
+        models_to_try = [getattr(settings, "ATTRIBUTE_AI_MODEL", "") or settings.AI_CHAT_MODEL]
 
         async with httpx.AsyncClient(timeout=timeout) as client:
             for model_name in models_to_try:
                 try:
-                    resp = await client.post(
-                        f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/generate",
-                        json={
-                            "model": model_name,
-                            "prompt": prompt,
-                            "stream": False,
-                            "format": "json",
-                            "options": {
-                                "temperature": 0.15,
-                                "num_ctx": 4096,
+                    async with llm_client.generation_slot():
+                        resp = await client.post(
+                            f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/generate",
+                            json={
+                                "model": model_name,
+                                "prompt": prompt,
+                                "stream": False,
+                                "format": "json",
+                                "options": (
+                                    llm_client.shared_options(0.15)
+                                    if model_name == settings.AI_CHAT_MODEL
+                                    else {"temperature": 0.15}
+                                ),
+                                "keep_alive": llm_client.keep_alive(),
                             },
-                            "keep_alive": "30m",
-                        },
-                    )
+                        )
                     if resp.status_code != 200:
                         continue
 

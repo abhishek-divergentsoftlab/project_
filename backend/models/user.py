@@ -47,6 +47,11 @@ class User(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         default=UserStatus.PENDING_VERIFICATION,
     )
 
+    # Bumped to invalidate every token already issued (suspension, forced logout); embedded as `tv`.
+    token_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+
     email_verified_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -120,3 +125,23 @@ class UserProfile(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     matching_preferences: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True, default=None)
 
     user: Mapped["User"] = relationship(back_populates="profile")
+
+
+class RevokedToken(Base):
+    """A refresh/access token id that must no longer be accepted, or a whole token family.
+
+    Rows are kept until ``expires_at`` (the token's own expiry), after which the JWT is dead
+    anyway. ``reason``: ``rotated`` (a refresh token already exchanged; presenting it again is
+    reuse), ``logout`` (explicit revocation), ``family`` (jti is ``fam:<family_id>``: every
+    token carrying that ``fam`` claim is revoked).
+    """
+
+    __tablename__ = "revoked_tokens"
+
+    jti: Mapped[str] = mapped_column(String(80), primary_key=True)
+    family_id: Mapped[Optional[str]] = mapped_column(String(80), nullable=True, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    reason: Mapped[str] = mapped_column(String(20), nullable=False, default="logout", server_default="logout")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("now()")
+    )

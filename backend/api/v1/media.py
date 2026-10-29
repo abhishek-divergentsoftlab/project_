@@ -9,12 +9,11 @@ Access rules
 * ``certificates/`` stay public: they back the certificates shown on public
   seller profiles (``GET /certifications/user/{id}``) and are opened by the
   frontend in an ``<iframe>`` / ``<img>``, which cannot send a token.
-* Only a fixed set of image/PDF types is served inline; anything else is sent
+* Only a fixed set of image types is served inline; PDFs and anything else are sent
   as an ``attachment`` so a planted ``.html`` or ``.svg`` can never execute in
   the API's origin. Every response carries ``X-Content-Type-Options: nosniff``.
 """
 
-import uuid
 from pathlib import Path
 from typing import Annotated, Optional
 
@@ -26,7 +25,7 @@ from sqlalchemy import or_, select
 from api.deps import DbSession, bearer_scheme
 from core.config import settings
 from core.media_signing import MEDIA_URL_PREFIX, PRIVATE_MEDIA_DIRS, verify_media_signature
-from core.security import TokenError, decode_token
+from core.security import TokenError
 
 router = APIRouter(prefix="/media", tags=["media"])
 
@@ -45,17 +44,14 @@ async def _bearer_may_view(
     """True when the bearer token belongs to a party of the connection that holds this image."""
     if credentials is None:
         return False
-    try:
-        user_id = uuid.UUID(decode_token(credentials.credentials, expected_type="access")["sub"])
-    except (TokenError, ValueError, KeyError):
-        return False
-
     from models.connection import Connection, ConnectionMessage
-    from models.user import User
+    from services import auth_service
 
-    user = await db.get(User, user_id)
-    if user is None or not user.is_active:
+    try:
+        user, _ = await auth_service.user_from_access_token(db, credentials.credentials)
+    except TokenError:
         return False
+    user_id = user.id
 
     found = await db.scalar(
         select(ConnectionMessage.id)
@@ -87,7 +83,11 @@ async def get_media_file(
     except ValueError:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
 
-    headers = {"X-Content-Type-Options": "nosniff"}
+    # Whatever is uploaded (a PDF with scripts, a planted .html) must not run in the API's origin.
+    headers = {
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": "default-src 'none'; sandbox",
+    }
 
     top = relpath.split("/", 1)[0]
     if top in PRIVATE_MEDIA_DIRS:
@@ -108,10 +108,19 @@ async def get_media_file(
     ext = target_path.suffix.lower()
     media_type = INLINE_MEDIA_TYPES.get(ext)
     if media_type is None:
-        headers["Content-Security-Policy"] = "default-src 'none'; sandbox"
         return FileResponse(
             target_path,
             media_type="application/octet-stream",
+            filename=target_path.name,
+            content_disposition_type="attachment",
+            headers=headers,
+        )
+
+    if ext == ".pdf":
+        # PDFs can carry JavaScript: download them rather than render them in our origin.
+        return FileResponse(
+            target_path,
+            media_type=media_type,
             filename=target_path.name,
             content_disposition_type="attachment",
             headers=headers,

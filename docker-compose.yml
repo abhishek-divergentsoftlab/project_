@@ -11,12 +11,14 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: marketplace
-      POSTGRES_PASSWORD: marketplace
+      # A default password is tolerable ONLY because the port below is bound to loopback.
+      # Set POSTGRES_PASSWORD (and DATABASE_URL in backend/.env) before exposing it anywhere.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-marketplace}
       POSTGRES_DB: marketplace
     ports:
       # 5433 on the host: a system postgres already owns 5432 on this machine,
       # and this project must not collide with it.
-      - "5433:5432"
+      - "127.0.0.1:5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -31,8 +33,11 @@ services:
     image: qdrant/qdrant:latest
     restart: unless-stopped
     ports:
-      - "6333:6333"   # REST
-      - "6334:6334"   # gRPC
+      - "127.0.0.1:6333:6333"   # REST
+      - "127.0.0.1:6334:6334"   # gRPC
+    environment:
+      # Empty = no auth (loopback-only dev); set it together with backend QDRANT_API_KEY.
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:-}
     volumes:
       - qdrant_data:/qdrant/storage
 
@@ -40,13 +45,14 @@ services:
   redis:
     image: redis:8-alpine
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes"]
+    # Nothing in the backend connects to Redis yet; settings.REDIS_URL already carries this default.
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:-change-me-dev}"]
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
       retries: 10

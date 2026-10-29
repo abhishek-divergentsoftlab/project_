@@ -15,6 +15,7 @@ import unicodedata
 import httpx
 
 from core.config import settings
+from services import llm_client
 from schemas.translation import LanguageInfo, TranslationResponse
 
 logger = logging.getLogger(__name__)
@@ -351,15 +352,18 @@ async def translate_via_ollama(text: str, source_lang: str, target_lang: str) ->
     timeout = float(getattr(settings, "TRANSLATION_TIMEOUT_SECONDS", 10.0))
 
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(url, json=payload)
-            if resp.status_code == 200:
-                data = resp.json()
-                msg = data.get("message") or {}
-                content = (msg.get("content") or "").strip()
-                content = re.sub(r'^["\'`]+|["\'`]+$', '', content).strip()
-                if content:
-                    return content
+        # Shared generation slot: the GPU is shared, so translations queue with chat turns instead of piling on.
+        # LLMBusy/LLMError are Exceptions, so a busy or failing model falls through to the caller's fallback.
+        async with llm_client.generation_slot():
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(url, json=payload)
+        if resp.status_code == 200:
+            data = resp.json()
+            msg = data.get("message") or {}
+            content = (msg.get("content") or "").strip()
+            content = re.sub(r'^["\'`]+|["\'`]+$', '', content).strip()
+            if content:
+                return content
     except Exception as exc:  # noqa: BLE001
         logger.debug("Ollama translation unavailable (%s)", exc)
 
@@ -464,7 +468,7 @@ async def translate_text(
     2. Check B2B phrase dictionary (instant zero-latency)
     3. Try local Ollama LLM translation
     4. Only if TRANSLATION_EXTERNAL_FALLBACK is enabled: public Google endpoint
-    5. Fallback to dictionary or indicator
+    5. Fallback to the dictionary, else a structured failure (``fallback=True``, text unchanged)
     """
     clean_text = text.strip()
     target_lang = _normalize_lang_code(target_language)
@@ -545,16 +549,18 @@ async def translate_text(
             if not source_language and actual_detected_source:
                 source_lang = actual_detected_source
 
-    # 5. Last resort fallback
-    is_genuine_translation = True
+    # 5. Last resort: the dictionary. Otherwise the translation FAILED: say so, never return "[HI] original" as if it
+    #    were a translation (a user would send it). The text comes back unchanged, flagged ``fallback``.
+    failed = False
     if not translated:
         translated = translate_fallback(clean_text, source_lang, target_lang)
-        # If it returned a dummy bracketed string like "[ES] ...", don't mark as genuine
+        # translate_fallback marks an untranslated text with a bracketed language tag like "[ES] ..."
         if translated.startswith("[") and "]" in translated[:5]:
-            is_genuine_translation = False
+            failed = True
+            translated = clean_text
 
     # Store genuine translations in cache so future requests are instantaneous
-    if is_genuine_translation and translated:
+    if not failed and translated:
         set_cached_translation(clean_text, source_lang, target_lang, translated)
 
     return TranslationResponse(
@@ -563,4 +569,5 @@ async def translate_text(
         source_language=source_lang,
         target_language=target_lang,
         cached=False,
+        fallback=failed,
     )

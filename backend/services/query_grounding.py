@@ -49,6 +49,13 @@ class AIParse(BaseModel):
     location: Optional[str] = None
     deadline_days: Optional[int] = None
     unknown_terms: list[str] = Field(default_factory=list)
+    language: Optional[str] = None
+    product_is_generic: Optional[bool] = None
+    # The price is the order's TOTAL value ("budget 1.5 crore for 50k pcs"), not a per-unit price.
+    price_is_total: bool = False
+    # Every distinct goods item of the message with its own quantity, as the model read them: [{"product", "quantity_value",
+    # "quantity_unit"}]. More than one means several products in one message.
+    products: list[dict[str, Any]] = Field(default_factory=list)
 
 
 _EMPTY_STRINGS = frozenset({"", "null", "none", "n/a", "na", "unknown", "nil", "undefined"})
@@ -148,6 +155,129 @@ def _number_grounded(value: Any, message: str) -> bool:
     return False
 
 
+
+# --- price evidence ------------------------------------------------------------
+
+_CURRENCY_WORD_RE = (
+    r"₹|\$|€|£|¥|rs\.?|inr|usd|eur|gbp|aed|jpy|cny|rmb|cad|aud|sgd|chf|rupees?|rupaye|rupaya|rup+e+s*|dollars?|dol+ars?|euros?|"
+    r"pounds?|dirhams?|yen|yuan|bucks?|रुपये|रुपया|/-"
+)
+_PRICE_CUE_RE = re.compile(
+    r"\b(?:price|priced|rate|rates|budget|cost|costs|pay|paying|target|offer|offering|bhav|bhaav|daam|dam|quote|quoting|"
+    r"worth|valued|upto|up\s+to|max|maximum|ceiling|asking|expect|expecting|per\s+unit|each)\b|@|भाव|दाम|कीमत|रेट",
+    re.IGNORECASE,
+)
+_PER_AFTER_RE = re.compile(r"^\s*(?:/|per\b|par\b|pr\b|a\b|each\b|apiece\b|प्रति)", re.IGNORECASE)
+_TOTAL_CUE_RE = re.compile(
+    r"\b(?:total|overall|altogether|in\s+all|lump\s*sum|lumpsum|all\s+in|whole|entire|kul|poora|pura|sab\s+mila\s+ke)\b",
+    re.IGNORECASE,
+)
+_MULT_SUFFIX = r"(?:\s*(?:k|m|mn|lakhs?|lacs?|crores?|cr|thousand|million|hundred))?"
+_ANY_NUMBER_RE = re.compile(rf"(?<![\w.])\d[\d,]*(?:\.\d+)?{_MULT_SUFFIX}\b", re.IGNORECASE)
+_ATTACHED_NUMBER_RE = re.compile(rf"(?<![\w.])(\d[\d,]*(?:\.\d+)?)(?={_CURRENCY_WORD_RE}|[a-zA-Z])", re.IGNORECASE)
+
+
+def _value_of_span(span: str) -> Optional[Decimal]:
+    m = re.match(r"(\d[\d,]*(?:\.\d+)?)\s*([a-z]*)", span.strip().lower())
+    if not m:
+        return None
+    base = _to_decimal(m.group(1))
+    if base is None:
+        return None
+    mult = _MULTIPLIER_WORDS.get(m.group(2)) if m.group(2) else None
+    return base * mult if mult else base
+
+
+def number_spans(message: str, value: Any) -> list[tuple[int, int]]:
+    """Character spans of the message's numbers that read as ``value`` (digits, "5k", "1.5 crore")."""
+    target = _to_decimal(value)
+    spans: list[tuple[int, int]] = []
+    if target is None:
+        return spans
+    text = normalise_text(message)
+    for m in _ANY_NUMBER_RE.finditer(text):
+        got = _value_of_span(m.group(0))
+        if got is not None and got == target:
+            spans.append((m.start(), m.end()))
+    if not spans:
+        for m in _ATTACHED_NUMBER_RE.finditer(text):
+            base = _to_decimal(m.group(1))
+            if base is not None and base == target:
+                spans.append((m.start(1), m.end(1)))
+    return spans
+
+
+def price_supported(message: str, value: Any) -> bool:
+    """True when a span of the message supports ``value`` AS A PRICE: a currency next to it, a "per <unit>" / "/kg"
+    after it, or a price word (price, rate, budget, pay ...) in front of it. A bare number, or a number that is
+    followed by an order unit ("5 ton", "10 pcs"), is a quantity or a spec, never a price."""
+    text = normalise_text(message)
+    spans = number_spans(message, value)
+    if not spans:
+        # spelled-out numbers ("twelve rupees"): only a currency or price word anywhere supports it
+        return bool(re.search(_CURRENCY_WORD_RE, text) or _PRICE_CUE_RE.search(text))
+    unit_after = re.compile(
+        r"^\s*(?:[a-z]+\.?)\b", re.IGNORECASE
+    )
+    for start, end in spans:
+        before, after = text[max(0, start - 22):start], text[end:end + 14]
+        if re.search(rf"(?:{_CURRENCY_WORD_RE})\s*$", before.rstrip() + " ", re.IGNORECASE) and re.search(rf"(?:{_CURRENCY_WORD_RE})\s*$", before, re.IGNORECASE):
+            return True
+        if re.match(rf"\s*(?:{_CURRENCY_WORD_RE})", after, re.IGNORECASE):
+            return True
+        if _PER_AFTER_RE.match(after):
+            return True
+        if re.search(r"\b(?:at|for)\s+(?:of\s+)?$", before) and re.match(r"\s*(?:[,.;!?]|$)", after) \
+                and len(_ANY_NUMBER_RE.findall(text)) >= 2:
+            return True  # "10 ton at 15": the second figure after at/for is the rate
+        if _PRICE_CUE_RE.search(before[-18:]):
+            # "price 15", "budget 1.5 crore": but a unit right after ("rate 5 ton") makes it a quantity again
+            m_unit = unit_after.match(after)
+            word = (m_unit.group(0).strip(" .") if m_unit else "")
+            from services import unit_converter
+
+            if not (word and (unit_converter.base_unit(word) is not None or unit_converter.is_packaging_unit(word))):
+                return True
+    return False
+
+
+def states_total_price(message: str) -> bool:
+    """The message calls its amount a total ("total budget", "overall", "kul")."""
+    return bool(_TOTAL_CUE_RE.search(message or ""))
+
+
+_ATTR_SKIP_KEYS = frozenset({
+    "quantity", "quantity_unit", "unit", "price", "price_currency", "currency", "price_per_unit", "amount", "location",
+    "city", "state", "country", "deadline", "role", "name", "product", "category", "min_quantity", "max_quantity",
+    "moq", "hsn", "hsn_code", "capacity_unit",
+})
+
+
+def attribute_supported(value: Any, message: str) -> bool:
+    """A property value the message supports: its words (or digits) appear in the text, in any script."""
+    if has_indic_script(message):
+        return True
+    lowered = normalise_text(message)
+    if isinstance(value, bool):
+        return True  # a flag the model derived from a phrase; the key was checked separately
+    if isinstance(value, (int, float)):
+        return _number_grounded(value, message)
+    items = value if isinstance(value, list) else [value]
+    for item in items:
+        text = normalise_text(str(item))
+        if not text:
+            return False
+        if text in lowered:
+            continue
+        tokens = [t for t in re.findall(r"[^\W_]+", text) if len(t) > 1]
+        if not tokens:
+            return False
+        stems = {singularise(t) for t in re.findall(r"[^\W_]+", lowered)}
+        if not all(singularise(t) in stems or t in lowered for t in tokens):
+            return False
+    return True
+
+
 # --- individual validators ---------------------------------------------------
 
 def valid_currency(code: Any) -> Optional[str]:
@@ -162,12 +292,35 @@ def valid_currency(code: Any) -> Optional[str]:
     return upper
 
 
+# No real order is above a billion base units (kg, pieces, litres, metres): "99999999999999 kg" is a typo or a probe.
+MAX_SANE_BASE_QUANTITY = Decimal("1e9")
+
+
+def quantity_is_absurd(value: Any, unit: Optional[str] = None) -> bool:
+    """True when ``value`` of ``unit`` is above ``MAX_SANE_BASE_QUANTITY`` in base units."""
+    number = _to_decimal(value)
+    if number is None:
+        return False
+    base = unit_converter.base_unit(unit)
+    if base is not None:
+        number = number * base[0]
+    return number > MAX_SANE_BASE_QUANTITY
+
+
+def has_indic_script(text: str) -> bool:
+    """True when ``text`` has letters of an Indic script (Devanagari ... Malayalam, U+0900-U+0DFF).
+
+    Only then is the model's English name a translation that cannot be found literally in the message. A rupee
+    sign, an emoji or a curly quote is non-ASCII too, but says nothing about the language."""
+    return any(0x0900 <= ord(ch) <= 0x0DFF and ch.isalpha() for ch in text or "")
+
+
 def _tokens(text: str) -> set[str]:
     return {singularise(t) for t in re.findall(r"\w+", normalise_text(text)) if len(t) > 1}
 
 
 def _product_grounded(product: str, as_written: Optional[str], message: str) -> bool:
-    if any(ord(ch) > 127 for ch in message):
+    if has_indic_script(message):
         return True  # another script: the English name is a translation
     lowered = normalise_text(message)
     written = normalise_text(as_written or product)
@@ -202,6 +355,40 @@ def _as_float(value: Any) -> Optional[float]:
         return None
 
 
+_BRACKETED_RE = re.compile(r"\([^)]*\)|\[[^\]]*\]")
+
+
+def _sane_product(product: Optional[str]) -> Optional[str]:
+    """Drop bracketed notes and reject what is not a product name. Models sometimes
+    explain themselves inside the field ("ulli (likely a typo for ...)")."""
+    if not product:
+        return None
+    product = " ".join(_BRACKETED_RE.sub(" ", product).split())
+    if not product or len(product) > 60 or len(product.split()) > 6:
+        return None
+    return product
+
+
+_EVIDENCE_FUNCTION_WORDS = frozenset({
+    "for", "about", "of", "on", "in", "at", "and", "or", "the", "a", "an", "to", "with", "what", "how", "is", "are", "its",
+    "it", "this", "that", "these", "those", "tell", "me", "please", "also", "then", "so", "any", "some",
+})
+
+
+def _evidence_is_not_a_wish(evidence: str, raw: dict[str, Any]) -> bool:
+    """Role evidence must show the user wants to buy or sell. A question mark, or words that are only the product
+    ("for paracetamol tablets?"), show a question about goods: no role."""
+    text = normalise_text(evidence)
+    if text.endswith("?"):
+        return True
+    words = [w for w in re.findall(r"[^\W\d_]+", text) if w not in _EVIDENCE_FUNCTION_WORDS]
+    if not words:
+        return True
+    product_words = {singularise(w) for field in ("product", "product_as_written")
+                     for w in re.findall(r"[^\W\d_]+", normalise_text(str(raw.get(field) or "")))}
+    return bool(product_words) and all(singularise(w) in product_words for w in words)
+
+
 def ground(raw: Any, message: str) -> AIParse:
     """Validate a raw model dict against ``message`` and keep only supported fields."""
     parse = AIParse()
@@ -211,17 +398,24 @@ def ground(raw: Any, message: str) -> AIParse:
 
     role = _clean_str(raw.get("role"))
     evidence = _clean_str(raw.get("role_evidence"))
-    if role and role.lower() in ("buyer", "seller") and evidence and _evidence_grounded(evidence, lowered):
+    if role and role.lower() in ("buyer", "seller") and evidence and _evidence_grounded(evidence, lowered) \
+            and not _evidence_is_not_a_wish(evidence, raw):
         parse.role = RFQRole.BUYER if role.lower() == "buyer" else RFQRole.SELLER
         parse.role_evidence = normalise_text(evidence)
 
     parse.intent = _clean_str(raw.get("intent"))
 
-    product = _clean_str(raw.get("product"))
+    language = _clean_str(raw.get("language"))
+    if language and len(language) <= 20:
+        parse.language = language
+
+    product = _sane_product(_clean_str(raw.get("product")))
     as_written = _clean_str(raw.get("product_as_written"))
     if product and _product_grounded(product, as_written, message):
         parse.product = product
         parse.product_as_written = as_written
+        if isinstance(raw.get("product_is_generic"), bool):
+            parse.product_is_generic = raw["product_is_generic"]
 
     category = _clean_str(raw.get("category"))
     if category:
@@ -232,8 +426,10 @@ def ground(raw: Any, message: str) -> AIParse:
     if isinstance(raw_attrs, dict):
         for key, value in raw_attrs.items():
             norm_key = _attribute_key(key)
-            if not norm_key:
+            if not norm_key or norm_key in _ATTR_SKIP_KEYS:
                 continue
+            if not isinstance(value, bool) and not attribute_supported(value, message):
+                continue  # a property the message does not say is the model's guess
             if isinstance(value, bool):
                 attributes[norm_key] = value
             elif isinstance(value, (int, float)):
@@ -251,35 +447,55 @@ def ground(raw: Any, message: str) -> AIParse:
     negated = raw.get("negated_attributes")
     if isinstance(negated, list):
         parse.negated_attributes = [
-            n for n in (_attribute_key(x) for x in negated) if n
+            n for n in (_attribute_key(x) for x in negated)
+            if n and all(t in lowered or singularise(t) in _tokens(message) for t in n.split("_") if len(t) > 1)
         ]
 
     qty = _to_decimal(raw.get("quantity_value"))
-    if qty is not None and _number_grounded(qty, message):
+    if qty is not None and _number_grounded(qty, message) and not quantity_is_absurd(qty, _clean_str(raw.get("quantity_unit"))):
         parse.quantity_value = qty
         unit = _clean_str(raw.get("quantity_unit"))
         if unit:
             parse.quantity_unit = unit_converter.clean_unit(unit) or unit.lower()
 
     price = _to_decimal(raw.get("price_amount"))
-    if price is not None and _number_grounded(price, message):
+    if price is not None and _number_grounded(price, message) and price_supported(message, price):
         parse.price_amount = price
+        # the model reads whether the amount is a lump sum (any phrasing); a stated "per <unit>" settles it the other way
+        parse.price_is_total = bool(raw.get("price_is_total")) and not _clean_str(raw.get("price_per_unit"))
         parse.price_currency = valid_currency(raw.get("price_currency"))
         per_unit = _clean_str(raw.get("price_per_unit"))
         if per_unit:
             parse.price_per_unit = unit_converter.clean_unit(per_unit) or per_unit.lower()
 
     location = _clean_str(raw.get("location"))
-    if location and (normalise_text(location) in lowered or any(ord(c) > 127 for c in message)
+    if location and (normalise_text(location) in lowered or has_indic_script(message)
                      or find_location(location)):
         parse.location = location
 
     days = _as_float(raw.get("deadline_days"))
     if days is not None and 0 < days <= 3650 and (
-        _number_grounded(days, message) or re.search(r"\b(tomorrow|today|week|month|asap|urgent)", lowered)
-        or any(ord(c) > 127 for c in message)
+        _number_grounded(days, message) or re.search(r"\b(tomorrow|today|week|month|asap|urgent|kal|parso|hafte|hafta|mahin[ae]|turant|jaldi)", lowered)
+        or has_indic_script(message)
     ):
         parse.deadline_days = int(days)
+
+    items = raw.get("products")
+    if isinstance(items, list):
+        for item in items[:6]:
+            if not isinstance(item, dict):
+                continue
+            name = _sane_product(_clean_str(item.get("product")))
+            if not name or not _product_grounded(name, None, message):
+                continue
+            qty = _to_decimal(item.get("quantity_value"))
+            if qty is not None and not _number_grounded(qty, message):
+                qty = None
+            unit = _clean_str(item.get("quantity_unit"))
+            parse.products.append({
+                "product": name, "quantity_value": str(qty) if qty is not None else None,
+                "quantity_unit": (unit_converter.clean_unit(unit) or unit.lower()) if unit else None,
+            })
 
     terms = raw.get("unknown_terms")
     if isinstance(terms, list):
